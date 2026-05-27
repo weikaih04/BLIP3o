@@ -1,3 +1,19 @@
+# =============================================================================
+# ⚠️  REFERENCE ONLY — DO NOT CALL IN THE trellis2_blip3o (3D) PIPELINE.  ⚠️
+#
+# This file is the ORIGINAL BLIP3o-NEXT GRPO (RL) fine-tuning for 2D *image*
+# generation: Sana DiT + diffusers schedulers → PIL images, optimized with a
+# reward. It is NOT used for our 3D work.
+#
+# This repository does **3D generation** (TRELLIS.2 cascade: SS Flow + Shape
+# SLAT + Tex SLAT), replacing the Sana DiT/VAE. The active 3D model class is
+# `blip3oQwenForCausalLM` (blip3o_qwen.py); 3D train = blip3o/train/train.py,
+# 3D inference = tests/test_overfit_infer.py.
+#
+# `blip3oQwenForGRPOLM` below is kept ONLY as a reference for the original
+# image-gen RL logic. Nothing in the 3D path instantiates it. Do NOT import or
+# run it for our 3D work.
+# =============================================================================
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch

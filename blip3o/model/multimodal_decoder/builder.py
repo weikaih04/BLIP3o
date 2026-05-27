@@ -1,14 +1,113 @@
-from diffusers import AutoencoderDC, SanaTransformer2DModel
+"""Builders for the 3D-diffusion stack.
+
+trellis2_blip3o forks BLIP3o-NEXT and swaps Sana DiT+VAE → TRELLIS.2 modules:
+  - SS Flow (trainable, 1.3B sparse-structure DiT) — replaces Sana DiT
+  - Shape SLAT + Tex SLAT + SC-VAE decoders (frozen) — replace Sana VAE
+
+These builders are called by `blip3oMetaModel.__init__` and
+`blip3oMetaModel.initialize_vision_modules`.
+"""
+from __future__ import annotations
+
+import os
 import torch
+import torch.nn as nn
+
+import trellis2_blip3o._paths as _tr2_paths  # noqa: F401 — sets sys.path for trellis2 import
 
 
-def build_sana(vision_tower_cfg, **kwargs):
-    sana = SanaTransformer2DModel.from_pretrained(vision_tower_cfg.diffusion_name_or_path, subfolder="transformer", torch_dtype=torch.bfloat16)
-    return sana
+def _default_ss_flow_ckpt() -> str:
+    return os.path.join(
+        _tr2_paths.CHECKPOINTS_ROOT,
+        "TRELLIS.2-4B",
+        "ckpts",
+        "ss_flow_img_dit_1_3B_64_bf16",
+    )
 
 
-def build_vae(vision_tower_cfg, **kwargs):
-    vae = AutoencoderDC.from_pretrained(vision_tower_cfg.diffusion_name_or_path, subfolder="vae", torch_dtype=torch.bfloat16)
-    return vae
+def _default_shape_slat_ckpt() -> str:
+    # 512 LR variant — output 32^3 sparse, paired with '512' pipeline_type.
+    return os.path.join(
+        _tr2_paths.CHECKPOINTS_ROOT,
+        "TRELLIS.2-4B",
+        "ckpts",
+        "slat_flow_img2shape_dit_1_3B_512_bf16",
+    )
 
 
+def _default_tex_slat_ckpt() -> str:
+    # 512 LR variant — output 32^3 sparse, paired with '512' pipeline_type.
+    return os.path.join(
+        _tr2_paths.CHECKPOINTS_ROOT,
+        "TRELLIS.2-4B",
+        "ckpts",
+        "slat_flow_imgshape2tex_dit_1_3B_512_bf16",
+    )
+
+
+def _default_sc_vae_decoder_ckpt() -> str:
+    # SC-VAE shape decoder. Tex decoder available separately.
+    return os.path.join(
+        _tr2_paths.CHECKPOINTS_ROOT,
+        "TRELLIS.2-4B",
+        "ckpts",
+        "shape_dec_next_dc_f16c32_fp16",
+    )
+
+
+def _freeze(module: nn.Module) -> nn.Module:
+    for p in module.parameters():
+        p.requires_grad_(False)
+    module.eval()
+    return module
+
+
+def build_ss_flow(cfg, **kwargs) -> nn.Module:
+    """Build TRELLIS.2 SparseStructureFlowModel (trainable, 1.3B)."""
+    from trellis2 import models
+
+    ckpt = getattr(cfg, "trellis_ss_flow_ckpt", None) or _default_ss_flow_ckpt()
+    model = models.from_pretrained(ckpt)
+    return model.to(torch.bfloat16)
+
+
+def build_shape_slat_512(cfg, **kwargs) -> nn.Module:
+    """Build TRELLIS.2 Shape SLAT 512 (trainable, 1.3B). Sparse, output 32^3."""
+    from trellis2 import models
+
+    ckpt = getattr(cfg, "trellis_shape_slat_ckpt", None) or _default_shape_slat_ckpt()
+    model = models.from_pretrained(ckpt)
+    return model.to(torch.bfloat16)
+
+
+def build_tex_slat_512(cfg, **kwargs) -> nn.Module:
+    """Build TRELLIS.2 Tex SLAT 512 (trainable, 1.3B). Sparse, output 32^3."""
+    from trellis2 import models
+
+    ckpt = getattr(cfg, "trellis_tex_slat_ckpt", None) or _default_tex_slat_ckpt()
+    model = models.from_pretrained(ckpt)
+    return model.to(torch.bfloat16)
+
+
+def build_trellis_decoders(cfg, **kwargs) -> nn.ModuleDict:
+    """Build the frozen decoder bundle (Shape SLAT + Tex SLAT + SC-VAE decoder).
+
+    Wrapped in `nn.ModuleDict` for HF state_dict + .to(device) compatibility.
+    Used only at INFERENCE — training consumes cached `ss_latent.npz` so we
+    never call these forward during step().
+    """
+    from trellis2 import models
+
+    bundle = nn.ModuleDict()
+    for name, ckpt_attr, default_fn in [
+        ("shape_slat", "trellis_shape_slat_ckpt", _default_shape_slat_ckpt),
+        ("tex_slat", "trellis_tex_slat_ckpt", _default_tex_slat_ckpt),
+        ("sc_vae_decoder", "trellis_sc_vae_ckpt", _default_sc_vae_decoder_ckpt),
+    ]:
+        ckpt = getattr(cfg, ckpt_attr, None) or default_fn()
+        try:
+            bundle[name] = _freeze(models.from_pretrained(ckpt))
+        except Exception as e:
+            print(f"[build_trellis_decoders] WARN: {name} ckpt not loadable ({e}); skipping")
+
+    return bundle

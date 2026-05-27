@@ -7,8 +7,8 @@ from accelerate import Accelerator
 from accelerate.utils import GradientAccumulationPlugin, InitProcessGroupKwargs
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import Trainer
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS  # moved here in transformers>=4.52
 from transformers.trainer import (
-    ALL_LAYERNORM_LAYERS,
     get_parameter_names,
     has_length,
     is_accelerate_available,

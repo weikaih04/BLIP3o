@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Training outputs
+runs/
+test_outputs/
+wandb/
+
+# Large data / checkpoints — committed elsewhere (anchor at project root)
+/data/
+/checkpoints/
+
+# Local env
+.env
+.vscode/

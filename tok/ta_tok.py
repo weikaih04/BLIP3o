@@ -43,7 +43,13 @@ class TextAlignedTokenizer(nn.Module):
         self.bottleneck_dim = bottleneck['args']['bottleneck_dim']
 
         self.encoder_config = AutoConfig.from_pretrained(teacher)
-        self.encoder = AutoModel.from_config(self.encoder_config).vision_model         
+        # transformers>=4.5x: passing output_hidden_states=True as a call kwarg no longer
+        # reliably populates .hidden_states for some vision models — set it on the config
+        # at construction so the encoder always returns the hidden-state tuple.
+        if hasattr(self.encoder_config, "vision_config"):
+            self.encoder_config.vision_config.output_hidden_states = True
+        self.encoder_config.output_hidden_states = True
+        self.encoder = AutoModel.from_config(self.encoder_config).vision_model
         
         self.encoder_hidden_dim = self.encoder.config.hidden_size
 
@@ -85,8 +91,12 @@ class TextAlignedTokenizer(nn.Module):
         return next(self.parameters()).dtype
     
     @classmethod
-    def from_checkpoint(cls, ckpt, load_teacher=True, **kwargs):
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+    def from_checkpoint(cls, ckpt_path, load_teacher=True, **kwargs):
+        # PyTorch 2.6 changed `torch.load` default to weights_only=True, which
+        # rejects the EasyDict that this TA-Tok checkpoint pickles its config
+        # in. The checkpoint is a trusted upstream BLIP3o release, so we set
+        # weights_only=False explicitly.
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         ckpt_kwargs = ckpt["model"]["args"]
         model = cls(**kwargs, **ckpt_kwargs)
         sd = ckpt["model"]["sd"]
@@ -101,7 +111,26 @@ class TextAlignedTokenizer(nn.Module):
         x = self.scale_layer(x)
         if tuple(x.shape[-2:]) != (self.input_size, self.input_size):
             x = self.image_resize(x)
-        vq_feats = self.encoder(x, output_hidden_states=True).hidden_states[self.select_layer_id]
+        # transformers>=4.5x: SiglipVisionTransformer no longer returns the .hidden_states
+        # tuple (output has only last_hidden_state + pooler_output). Capture the
+        # select_layer_id hidden state via a forward hook on the matching encoder layer.
+        # hidden_states tuple = (embeddings, *[layer_i_out for i in range(n)]), len n+1;
+        # hidden_states[sel] is produced by encoder.layers[sel_abs-1] (sel_abs index into the tuple).
+        layers = self.encoder.encoder.layers
+        n = len(layers)
+        sel_abs = self.select_layer_id if self.select_layer_id >= 0 else (n + 1 + self.select_layer_id)
+        _cap = {}
+        if sel_abs == 0:  # embeddings output (rare); fall back to full forward + last_hidden_state path
+            vq_feats = self.encoder(x).last_hidden_state
+        else:
+            tgt = layers[sel_abs - 1]
+            _h = tgt.register_forward_hook(
+                lambda _m, _i, _o: _cap.__setitem__("h", _o[0] if isinstance(_o, tuple) else _o))
+            try:
+                self.encoder(x)
+            finally:
+                _h.remove()
+            vq_feats = _cap["h"]
 
         pool_scale = self.pool_scale
         pool_scale = kwargs.get("pool_scale", pool_scale)

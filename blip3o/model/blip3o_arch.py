@@ -13,10 +13,19 @@ from blip3o.constants import (
 )
 from blip3o.utils import rank0_print
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_decoder.builder import build_sana, build_vae
-from diffusers.models.normalization import RMSNorm
-from diffusers import AutoencoderDC, FlowMatchEulerDiscreteScheduler, SanaTransformer2DModel
-import math
+from .multimodal_decoder.builder import (
+    build_ss_flow,
+    build_shape_slat_512,
+    build_tex_slat_512,
+    build_trellis_decoders,
+)
+
+# trellis2_blip3o additions: replaces BLIP3o's Sana DiT/VAE with TRELLIS.2.
+from trellis2_blip3o.connector import TRELLIS2Connector
+
+# `TRELLIS_COND_DIM` is the cross-attention dim of the SS Flow DiT.
+TRELLIS_COND_DIM = 1024
+
 
 class blip3oMetaModel:
 
@@ -27,22 +36,15 @@ class blip3oMetaModel:
             delay_load = getattr(config, "delay_load", False)
             self.vision_tower = build_vision_tower(config, delay_load=delay_load)
 
-            self.sana = build_sana(config)
-            self.sana_vae = build_vae(config)
-            norm = RMSNorm(2304, eps=1e-5, elementwise_affine=True)
-
-            with torch.no_grad():
-                norm.weight.fill_(math.sqrt(5.5))
-            self.diffusion_connector = nn.Sequential(
-                nn.Linear(config.hidden_size, 2304),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(2304, 2304),
-                norm,
+            self.ss_flow = build_ss_flow(config)
+            # 512-mode cascade: Shape SLAT + Tex SLAT (both trainable, both LR variant).
+            self.shape_slat_512 = build_shape_slat_512(config)
+            self.tex_slat_512 = build_tex_slat_512(config)
+            self.trellis_decoders = build_trellis_decoders(config)
+            self.diffusion_connector = TRELLIS2Connector(
+                vlm_hidden_dim=config.hidden_size,
+                trellis_cond_dim=TRELLIS_COND_DIM,
             )
-            self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.diffusion_name_or_path, subfolder="scheduler")
-            
-            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.diffusion_name_or_path, subfolder="scheduler")
-            
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -51,21 +53,37 @@ class blip3oMetaModel:
         return vision_tower
 
 
-    def get_sana(self):
-        sana = getattr(self, 'sana', None)
-        if type(sana) is list:
-            sana = sana[0]
-        if sana is not None:
-            sana.to(self.device)
-        return sana
+    def get_ss_flow(self):
+        m = getattr(self, "ss_flow", None)
+        if type(m) is list:
+            m = m[0]
+        if m is not None:
+            m.to(self.device)
+        return m
 
-    def get_sana_vae(self):
-        sana_vae = getattr(self, 'sana_vae', None)
-        if type(sana_vae) is list:
-            sana_vae = sana_vae[0]
-        if sana_vae is not None:
-            sana_vae.to(self.device)
-        return sana_vae
+    def get_shape_slat_512(self):
+        m = getattr(self, "shape_slat_512", None)
+        if type(m) is list:
+            m = m[0]
+        if m is not None:
+            m.to(self.device)
+        return m
+
+    def get_tex_slat_512(self):
+        m = getattr(self, "tex_slat_512", None)
+        if type(m) is list:
+            m = m[0]
+        if m is not None:
+            m.to(self.device)
+        return m
+
+    def get_trellis_decoders(self):
+        m = getattr(self, "trellis_decoders", None)
+        if type(m) is list:
+            m = m[0]
+        if m is not None:
+            m.to(self.device)
+        return m
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -78,7 +96,7 @@ class blip3oMetaModel:
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
-            
+
             if fsdp is not None and len(fsdp) > 0:
                 self.vision_tower = [vision_tower]
             else:
@@ -91,53 +109,48 @@ class blip3oMetaModel:
             vision_tower.load_model()
 
 
-        if self.get_sana() is None:
-            sana = build_sana(model_args)
-            self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_args.diffusion_name_or_path, subfolder="scheduler"
-            )
-            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_args.diffusion_name_or_path, subfolder="scheduler")
-
+        if self.get_ss_flow() is None:
+            ss_flow = build_ss_flow(model_args)
             if fsdp is not None and len(fsdp) > 0:
-                self.sana = [sana]
+                self.ss_flow = [ss_flow]
             else:
-                self.sana = sana
-        else:
+                self.ss_flow = ss_flow
+
+        if self.get_shape_slat_512() is None:
+            shape_slat = build_shape_slat_512(model_args)
             if fsdp is not None and len(fsdp) > 0:
-                sana = self.sana[0]
+                self.shape_slat_512 = [shape_slat]
             else:
-                sana = self.sana
+                self.shape_slat_512 = shape_slat
 
-
-        if self.get_sana_vae() is None:
-            sana_vae = build_vae(model_args)
-
+        if self.get_tex_slat_512() is None:
+            tex_slat = build_tex_slat_512(model_args)
             if fsdp is not None and len(fsdp) > 0:
-                self.sana_vae = [sana_vae]
+                self.tex_slat_512 = [tex_slat]
             else:
-                self.sana_vae = sana_vae
-        else:
+                self.tex_slat_512 = tex_slat
+
+        if self.get_trellis_decoders() is None:
+            decoders = build_trellis_decoders(model_args)
             if fsdp is not None and len(fsdp) > 0:
-                sana_vae = self.sana_vae[0]
+                self.trellis_decoders = [decoders]
             else:
-                sana_vae = self.sana_vae
+                self.trellis_decoders = decoders
 
-
-        if getattr(self, 'diffusion_connector', None) is None:
-            norm = RMSNorm(2304, eps=1e-5, elementwise_affine=True)
-            with torch.no_grad():
-                norm.weight.fill_(math.sqrt(5.5))
-            self.diffusion_connector = nn.Sequential(
-                nn.Linear(self.config.hidden_size, 2304),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(2304, 2304),
-                norm,
+        if getattr(self, "diffusion_connector", None) is None:
+            self.diffusion_connector = TRELLIS2Connector(
+                vlm_hidden_dim=self.config.hidden_size,
+                trellis_cond_dim=TRELLIS_COND_DIM,
             )
         else:
             for p in self.diffusion_connector.parameters():
                 p.requires_grad = True
 
         self.config.use_mm_proj = True
-        self.config.mm_hidden_size = vision_tower.hidden_size
+        # Setup A may run with no vision tower (text-only conditioning).
+        self.config.mm_hidden_size = (
+            vision_tower.hidden_size if vision_tower is not None else self.config.hidden_size
+        )
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
@@ -355,6 +368,7 @@ class blip3oMetaForCausalLM(ABC):
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         total_num_new_tokens = 0
+        num_new_tokens = 0  # Setup A adds no tokens; keep defined for the `if num_new_tokens > 0` guard below
         vocab_size = len(tokenizer)
         if model_args.mm_use_im_start_end:
             num_new_tokens = tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)

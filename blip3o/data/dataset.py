@@ -344,10 +344,19 @@ class DataCollatorForSupervisedDataset(object):
 
             batch["images"] = images
 
-            target_images = [instance["target_image"][0] for instance in instances]
-            target_images = torch.stack(target_images, dim=0) if target_images else None
-            batch["target_images"] = target_images
+            # Upstream BLIP3o-NEXT path: 2D image gen target (Sana VAE latent).
+            # REFERENCE ONLY — our 3D pipeline does NOT use this; the 3D forward
+            # ignores batch["target_images"] (3D targets are target_ss_latent /
+            # target_shape_slat_512 / target_tex_slat_512 below).
+            if "target_image" in instances[0]:
+                target_images = [instance["target_image"][0] for instance in instances]
+                target_images = torch.stack(target_images, dim=0) if target_images else None
+                batch["target_images"] = target_images
 
+        # trellis2_blip3o addition: 3D SS Flow target latent (B, 8, 16, 16, 16).
+        if "target_ss_latent" in instances[0]:
+            ss = [instance["target_ss_latent"] for instance in instances]
+            batch["target_ss_latent"] = torch.stack(ss, dim=0)
 
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
@@ -357,12 +366,21 @@ def get_dataset_cls(name):
 
     if name == 'mix':
         dataset_cls = LazySupervisedMixDataset
+    elif name == 'tr2_3d':
+        # trellis2_blip3o: JSON-manifest dataset for unified 3D generation.
+        from trellis2_blip3o.dataset import TR2BLIP3oDataset
+        dataset_cls = TR2BLIP3oDataset
     else:
         raise ValueError(f'Unknown dataset class {name}')
     return dataset_cls
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    # trellis2_blip3o: route to our 3D-aware dataset+collator that emits target_ss_latent.
+    if getattr(data_args, "dataset_cls", "mix") == "tr2_3d":
+        from trellis2_blip3o.dataset import make_supervised_data_module as _tr2_dm
+        return _tr2_dm(tokenizer, data_args)
+
     dataset_cls = get_dataset_cls(data_args.dataset_cls)
     train_dataset = dataset_cls(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)

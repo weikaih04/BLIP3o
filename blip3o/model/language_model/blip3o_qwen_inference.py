@@ -1,3 +1,19 @@
+# =============================================================================
+# ⚠️  REFERENCE ONLY — DO NOT CALL IN THE trellis2_blip3o (3D) PIPELINE.  ⚠️
+#
+# This file is the ORIGINAL BLIP3o-NEXT 2D *image* generation/inference path:
+# Sana DiT + diffusers schedulers (DDPM/DDIM/LCM/FlowMatch/...) → PIL images.
+#
+# This repository does **3D generation**, NOT 2D image gen. The Sana DiT/VAE is
+# replaced by the TRELLIS.2 cascade (SS Flow + Shape SLAT + Tex SLAT). The active
+# model class for 3D is `blip3oQwenForCausalLM` (see blip3o_qwen.py); 3D training
+# is blip3o/train/train.py and 3D inference is tests/test_overfit_infer.py.
+#
+# `blip3oQwenForInferenceLM` below is kept ONLY as a reference for the original
+# image-gen sampling logic. Nothing in the 3D path instantiates it. Do NOT
+# import or run it for our 3D work — it samples 2D images and will produce
+# garbage / errors against the TRELLIS flows.
+# =============================================================================
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
