@@ -1,0 +1,65 @@
+# Mixture config — full multi-task: 3 × 3D + VQA + grounding + pure-text SFT.
+#
+# IMPORTANT: requires --freeze_vlm False on the trainer (the LM-loss tasks
+# need gradients through the backbone; otherwise their CE will compute but
+# not learn anything — model surfaces a warning on first hit).
+#
+# Manifest paths marked TODO must be filled in once those datasets are pulled.
+# Until then, comment out the corresponding task block to drop it from the mix.
+
+tasks:
+  # ── 3D generation (cross-attention flow path) ──
+  - name: text_to_3d
+    weight: 0.10
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      min_aesthetic: 4.5
+      require_caption: true
+
+  - name: image_to_3d
+    weight: 0.25
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+
+  - name: multi_image_to_3d
+    weight: 0.25
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      max_views: 4
+      min_aesthetic: 4.5
+
+  # ── Chat / LM-loss tasks (vlm.lm_head + CE; need freeze_vlm=False) ──
+  - name: vqa
+    weight: 0.20
+    args:
+      manifest: TODO/path/to/llava_instruct.jsonl      # TODO: provide chat-format JSONL
+      image_root: TODO/path/to/image_root              # optional; null if image paths absolute
+      require_image: true
+      max_image_tokens: 4096
+
+  - name: grounding
+    weight: 0.10
+    args:
+      manifest: TODO/path/to/refcoco_or_visualgrounding.jsonl
+      image_root: TODO/path/to/image_root
+      require_image: true
+      max_image_tokens: 4096
+
+  - name: text_sft
+    weight: 0.10
+    args:
+      manifest: TODO/path/to/text_sft.jsonl            # TULU / Magpie / etc.
+      require_image: false                             # pure NLP; no image processing
+
+sampling:
+  granularity: batch
+  # Temperature < 1 to suppress massive datasets (e.g. if LLaVA-Instruct >> 3D).
+  # Try 0.5 if any one task dominates by raw size; raise back toward 1.0
+  # once you've manually balanced weights.
+  temperature: 1.0

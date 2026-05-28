@@ -283,6 +283,11 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         neg_cond = flow_heads.null_cond_like(self.diffusion_connector, cond_hidden)
         return cond, neg_cond
 
+    # Tasks routed to the LM-loss path (vlm.lm_head + CE on `labels`). Add a task
+    # name here when registering a new chat-style task — that's the only model-
+    # side wiring needed.
+    _LM_TASKS = {"vqa", "grounding", "text_sft"}
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -299,11 +304,57 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # cached-cond fast path (deferred feature; v1 leaves these None → run VLM)
         cond_hidden: Optional[torch.Tensor] = None,
         cond_key_mask: Optional[torch.Tensor] = None,
+        # LM-task path (vqa / grounding / text_sft): CE loss on `labels`
+        labels: Optional[torch.LongTensor] = None,
+        # Task router stamp from MultiTaskCollator. None / "*_to_3d" → flow path.
+        _task: Optional[str] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        # ── LM-loss path ────────────────────────────────────────────────
+        # When the collator stamps a chat-task name, route to the VLM's own
+        # LM head + CE. This is what makes joint training with VQA / grounding /
+        # pure-text SFT possible without a separate trainer.
+        if _task in self._LM_TASKS:
+            if self.config.freeze_vlm and not getattr(self, "_lm_freeze_warned", False):
+                import warnings
+                warnings.warn(
+                    f"[TrellisNativeVLM] _task={_task!r} requires gradient through the VLM "
+                    "but config.freeze_vlm=True. The LM CE will compute but NOT update the "
+                    "backbone. Set --freeze_vlm False for joint LM-loss training."
+                )
+                self._lm_freeze_warned = True
+            if labels is None:
+                raise ValueError(
+                    f"TrellisNativeVLM.forward got _task={_task!r} but no `labels`. "
+                    "The chat collator must emit labels with -100 outside the answer span."
+                )
+            vlm_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=False,
+                return_dict=True,
+            )
+            if pixel_values is not None:
+                vlm_kwargs["pixel_values"] = pixel_values
+                vlm_kwargs["image_grid_thw"] = image_grid_thw
+            if pixel_values_videos is not None:
+                vlm_kwargs["pixel_values_videos"] = pixel_values_videos
+                vlm_kwargs["video_grid_thw"] = video_grid_thw
+            out = self.vlm(**vlm_kwargs)
+            loss = out.loss
+            rank0_print(f"[loss] task={_task} lm_ce={float(loss.detach()):.4f}")
+            return CausalLMOutputWithPast(loss=loss, logits=None)
+
+        # ── Flow / 3D path (default; covers task ∈ {text_to_3d, image_to_3d,
+        # multi_image_to_3d} OR _task=None / legacy) ─────────────────────
         if target_ss_latent is None:
-            raise ValueError("TrellisNativeVLM.forward requires target_ss_latent (training).")
+            raise ValueError(
+                "TrellisNativeVLM.forward requires target_ss_latent for the 3D-flow path. "
+                f"Got _task={_task!r} and no target_ss_latent — did the collator stamp the "
+                "right task name? (LM tasks: " + ", ".join(sorted(self._LM_TASKS)) + ")"
+            )
 
         # 1. cond: either run the VLM (v1) or use precomputed cached cond (deferred).
         depthwise = (getattr(self, "cond_fusion", "none") == "depthwise") and (cond_hidden is None)
@@ -362,6 +413,24 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
 
         stage_str = "  ".join(f"{k}={v:.4f}" for k, v in logs["stages"].items())
         rank0_print(f"[loss] total={loss.detach().float().item():.4f}  {stage_str}")
+
+        # Stash fine-grained diagnostics for the NativeTrainer to read & push to wandb
+        # (HF Trainer auto-logs only `loss`; here we expose per-stage + cond/target shapes).
+        diag = {f"loss_{k}": float(v) for k, v in logs["stages"].items()}
+        if cond_hidden is not None:
+            diag["cond_len"] = float(cond_hidden.shape[1])
+            with torch.no_grad():
+                diag["cond_norm_mean"] = float(cond_hidden.detach().float().norm(dim=-1).mean())
+        if cond_key_mask is not None:
+            diag["cond_valid_tokens"] = float(cond_key_mask.sum())
+        # target voxel counts (varies per-asset; useful to spot OOM-risk samples)
+        if target_ss_latent is not None and hasattr(target_ss_latent, "shape"):
+            # SS target is a dense 3D occupancy → count non-zero voxels
+            diag["ss_target_voxels"] = float((target_ss_latent != 0).sum())
+        for name, t in (("shape_slat", target_shape_slat_512), ("tex_slat", target_tex_slat_512)):
+            if t is not None and hasattr(t, "feats"):
+                diag[f"{name}_target_voxels"] = float(t.feats.shape[0])
+        self._last_diag = diag
 
         # No logits (no LM head / no CE) — loss-only output for HF Trainer.
         return CausalLMOutputWithPast(loss=loss, logits=None)

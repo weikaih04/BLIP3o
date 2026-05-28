@@ -80,9 +80,10 @@ def _apply_flow_freeze(model, mode: str):
 
 
 class NativeTrainer(Trainer):
-    """Trainer that also moves trellis2 SparseTensor SLAT targets to the device
-    (vanilla Trainer._prepare_inputs only moves torch.Tensors → SparseTensors
-    would otherwise stay on CPU and crash the cascade)."""
+    """Trainer that (1) moves trellis2 SparseTensor SLAT targets to the device — vanilla
+    Trainer._prepare_inputs only moves torch.Tensors, leaving SparseTensors on CPU and
+    crashing the cascade — and (2) emits per-stage / cond / voxel-count diagnostics from
+    model.forward into Trainer.log → wandb."""
 
     def _prepare_inputs(self, inputs):
         prepared = super()._prepare_inputs(inputs)
@@ -90,6 +91,32 @@ class NativeTrainer(Trainer):
             if hasattr(v, "feats") and hasattr(v, "to"):  # SparseTensor
                 prepared[k] = v.to(self.args.device)
         return prepared
+
+    @staticmethod
+    def _unwrap(m):
+        """Peel DeepSpeed/DDP/etc. wrappers off to reach the original TrellisNativeVLM."""
+        for _ in range(4):
+            inner = getattr(m, "module", None)
+            if inner is None:
+                break
+            m = inner
+        return m
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # HF 4.4x+ added num_items_in_batch; pass through if supported.
+        try:
+            out = super().compute_loss(model, inputs, return_outputs=True,
+                                       num_items_in_batch=num_items_in_batch)
+        except TypeError:
+            out = super().compute_loss(model, inputs, return_outputs=True)
+        loss, model_out = out if isinstance(out, tuple) else (out, None)
+
+        # Pull per-step diagnostics that the model stashed in forward; log on rank-0 only.
+        diag = getattr(self._unwrap(model), "_last_diag", None)
+        if diag and getattr(self.accelerator, "is_main_process", True):
+            self.log({f"train/{k}": v for k, v in diag.items()})
+
+        return (loss, model_out) if return_outputs else loss
 
 
 @dataclass
@@ -99,7 +126,7 @@ class NativeArgs:
     freeze_vlm: bool = field(default=True)
     build_slat: bool = field(default=False)   # v1: SS-only
     ss_only: bool = field(default=True)
-    num_cond_views: int = field(default=1)
+    num_cond_views: int = field(default=1)    # legacy schema only (multi_view_renders[:N])
     flow_weight: float = field(default=1.0)
     detach_cond: bool = field(default=False)
     cond_max_length: int = field(default=8192)
@@ -111,6 +138,20 @@ class NativeArgs:
     cond_fusion: str = field(default="none")
     fusion_layers: int = field(default=0)   # depthwise: # VLM layer outputs to fuse (0 = all)
     slat_resolution: int = field(default=512)   # 512 or 1024 (HR cascade — use ABO 1024 latents)
+    # ── Unified-schema knobs (only used when manifest rows contain `renders_dir`) ──
+    # Task distribution per __getitem__: T (text-only), I1 (single image), IM (multi-image).
+    # Empty/None → dataset default 'T:0.2,I1:0.4,IM:0.4'. Format: 'k:p,k:p,...'.
+    task_mix: str = field(default="T:0.2,I1:0.4,IM:0.4")
+    max_views: int = field(default=4)            # IM: n_views ~ U[2, max_views]
+    crop_to_object: bool = field(default=False)  # tight alpha-bbox crop on RGBA renders
+    min_aesthetic: Optional[float] = field(default=None)  # init-time filter
+    # ── Mixture mode (Phase-1/2 multi-task infra) ──
+    # When set, replaces --data_path. Wires up MixtureIterableDataset +
+    # MultiTaskCollator from yaml (see configs/mix_*.yaml). Task weights and
+    # per-task args live in the yaml; per-task class lives in
+    # trellis2_blip3o/data/tasks/. Adding a new task = new file + new yaml row.
+    mixture_config: Optional[str] = field(default=None)
+    mixture_seed: int = field(default=0)
 
 
 def main():
@@ -140,14 +181,44 @@ def main():
     print(f"[train_native] trainable {n_train/1e6:.1f}M / total {n_total/1e6:.1f}M  "
           f"(vlm frozen={cfg.freeze_vlm}, build_slat={cfg.build_slat})")
 
-    data_args = SimpleNamespace(
-        use_codebook=False, num_views=1, num_cond_views=native_args.num_cond_views,
-    )
-    train_ds = TR2NativeVLMDataset(
-        data_path=native_args.data_path, data_args=data_args, ss_only=native_args.ss_only,
-    )
     processor = AutoProcessor.from_pretrained(native_args.vlm_model)
-    collator = NativeVLMCollator(processor=processor)
+
+    # Choose data path:
+    #   --mixture_config (new, multi-task)   → MixtureIterableDataset + MultiTaskCollator
+    #   else (legacy, single-dataset)        → TR2NativeVLMDataset + NativeVLMCollator
+    if native_args.mixture_config:
+        from trellis2_blip3o.data import build_mixture
+        per_dev_bs = max(1, int(training_args.per_device_train_batch_size))
+        mix = build_mixture(
+            native_args.mixture_config,
+            processor=processor,
+            batch_size=per_dev_bs,
+            base_seed=native_args.mixture_seed,
+        )
+        print(f"[train_native] {mix.summary()}")
+        train_ds = mix.dataset
+        collator = mix.collator
+        # IterableDataset is incompatible with HF Trainer's epoch-based length.
+        # Driver must rely on --max_steps.
+        if not training_args.max_steps or training_args.max_steps <= 0:
+            raise ValueError(
+                "--mixture_config uses IterableDataset; --max_steps must be set "
+                "(epoch-based training is not meaningful in mixture mode)."
+            )
+    else:
+        data_args = SimpleNamespace(
+            use_codebook=False, num_views=1,
+            num_cond_views=native_args.num_cond_views,           # legacy
+            task_mix=native_args.task_mix,                       # unified
+            max_views=native_args.max_views,
+            slat_resolution=native_args.slat_resolution,
+            crop_to_object=native_args.crop_to_object,
+            min_aesthetic=native_args.min_aesthetic,
+        )
+        train_ds = TR2NativeVLMDataset(
+            data_path=native_args.data_path, data_args=data_args, ss_only=native_args.ss_only,
+        )
+        collator = NativeVLMCollator(processor=processor)
 
     trainer = NativeTrainer(
         model=model,
