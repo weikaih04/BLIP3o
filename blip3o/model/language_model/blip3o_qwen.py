@@ -30,7 +30,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from blip3o.model.blip3o_arch import blip3oMetaForCausalLM, blip3oMetaModel
 from blip3o.utils import rank0_print
 
-from trellis2_blip3o.loss import TRELLIS2FlowMatchingLoss
+from trellis2_blip3o import flow_heads
 
 
 class blip3oQwenConfig(Qwen3Config):
@@ -83,37 +83,6 @@ def _slice_cond_image_block(
     return out, mask
 
 
-def _mask_drop(latents: torch.Tensor, drop_prob: float = 0.1) -> torch.Tensor:
-    """Classifier-free-guidance dropout on cond (per-sample). Matches BLIP3o."""
-    if drop_prob <= 0:
-        return latents
-    mask = torch.bernoulli(
-        torch.zeros(latents.shape[0], device=latents.device, dtype=latents.dtype) + drop_prob
-    )
-    while len(mask.shape) < len(latents.shape):
-        mask = mask.unsqueeze(-1)
-    return latents * (1 - mask)
-
-
-def _parse_flow_stage_weights(spec: str) -> Dict[str, float]:
-    """Parse 'ss=1.0,shape_slat_512=1.0,tex_slat_512=1.0' → {'ss':1.0, ...}.
-
-    Used by the joint cascade loss formula:
-        L_total = L_ce + λ_flow · Σ ŵ_i · L_flow_i
-    where ŵ_i = w_i / Σ w_j (normalized weights, sum to 1).
-    """
-    out: Dict[str, float] = {}
-    for kv in spec.split(","):
-        kv = kv.strip()
-        if not kv:
-            continue
-        if "=" not in kv:
-            raise ValueError(f"flow_stage_weights entry must look like 'name=value', got {kv!r}")
-        k, v = kv.split("=", 1)
-        out[k.strip()] = float(v.strip())
-    return out
-
-
 class blip3oQwenForCausalLM(Qwen3ForCausalLM, blip3oMetaForCausalLM):
     config_class = blip3oQwenConfig
 
@@ -125,41 +94,16 @@ class blip3oQwenForCausalLM(Qwen3ForCausalLM, blip3oMetaForCausalLM):
         self.model = blip3oQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Per-stage flow loss helpers (built lazily after config flags are set).
-        # TRELLIS.2 trains each stage with a different t_schedule:
-        #   - SS Flow    → logitNormal(μ=1, σ=1)   (more late-noise emphasis)
-        #   - Shape SLAT → uniform                 (refines an already-decoded structure)
-        #   - Tex SLAT   → uniform                 (same as Shape SLAT)
-        # Using the wrong schedule per stage means the model samples timesteps
-        # from a distribution different from what the pretrained checkpoint
-        # saw during its original training → OOD finetune signal.
-        self._flow_loss_fn_ss: Optional[TRELLIS2FlowMatchingLoss] = None
-        self._flow_loss_fn_slat: Optional[TRELLIS2FlowMatchingLoss] = None
+        # Per-stage flow loss fns (SS=logitNormal, SLAT=uniform), built lazily via
+        # the shared flow_heads helper — SINGLE SOURCE OF TRUTH also used by
+        # trellis_native_vlm. (Verified numerically identical to the previous
+        # inline loop: tests/test_flow_heads_equiv.py.)
+        self._flow_fns = None
 
         self.post_init()
 
     def get_model(self):
         return self.model
-
-    def _get_flow_loss_fn_ss(self) -> TRELLIS2FlowMatchingLoss:
-        """Loss fn for SS Flow — TRELLIS.2 schedule: logitNormal(mean, std)."""
-        if self._flow_loss_fn_ss is None:
-            self._flow_loss_fn_ss = TRELLIS2FlowMatchingLoss(
-                t_schedule="logitNormal",
-                t_mean=getattr(self.config, "logitnorm_mean", 1.0),
-                t_std=getattr(self.config, "logitnorm_std", 1.0),
-                sigma_min=getattr(self.config, "flow_sigma_min", 1e-5),
-            )
-        return self._flow_loss_fn_ss
-
-    def _get_flow_loss_fn_slat(self) -> TRELLIS2FlowMatchingLoss:
-        """Loss fn for SLAT (Shape + Tex) — TRELLIS.2 schedule: uniform."""
-        if self._flow_loss_fn_slat is None:
-            self._flow_loss_fn_slat = TRELLIS2FlowMatchingLoss(
-                t_schedule="uniform",
-                sigma_min=getattr(self.config, "flow_sigma_min", 1e-5),
-            )
-        return self._flow_loss_fn_slat
 
     def forward(
         self,
@@ -255,122 +199,42 @@ class blip3oQwenForCausalLM(Qwen3ForCausalLM, blip3oMetaForCausalLM):
             else:
                 raise ValueError(f"Unknown cond_slice: {cond_slice}")
 
-            # Truncate to cond_max_length cap (sized for ~8-frame short video).
-            cond_max_length = getattr(self.config, "cond_max_length", 8192)
-            if cond_hidden.size(1) > cond_max_length:
-                cond_hidden = cond_hidden[:, :cond_max_length, :]
-                cond_key_mask = cond_key_mask[:, :cond_max_length]
-
-            # Detach blocks flow_loss gradient from flowing back into the VLM
-            # (Setup A / MolmoAct2 style: VLM only learns from text CE).
-            # Setup B/C keep joint grad (BLIP3o-NEXT style).
-            if getattr(self.config, "detach_cond", False):
-                cond_hidden = cond_hidden.detach()
-
-            cond = self.model.diffusion_connector(_mask_drop(cond_hidden))
-
-            # Reshape mask to sdpa-friendly (B, 1, 1, L_kv). True = attend.
-            sdpa_mask = cond_key_mask[:, None, None, :]
-
-            # ============================================================
-            # Joint 3-stage flow loss — shared cond_VLM across all stages.
-            # Per-stage flow_loss math is identical to TRELLIS.2 upstream
-            # (sample_t, diffuse, get_v, F.mse_loss — all imported from
-            # trellis2.trainers.flow_matching). What's new is the joint
-            # combination: one VLM forward → one cond → fed to 3 DiTs.
-            #
-            # IMPORTANT: Each stage uses its OWN t_schedule matching upstream:
-            #   SS Flow → logitNormal(1,1); SLAT stages → uniform.
-            # Using one shared schedule would put SLAT training off-distribution.
-            # ============================================================
-            loss_fn_ss   = self._get_flow_loss_fn_ss()
-            loss_fn_slat = self._get_flow_loss_fn_slat()
-            flow_losses: Dict[str, torch.Tensor] = {}
-            flow_logs_per_stage: Dict[str, Dict] = {}
-
-            # ----------------------------------------------------------------
-            # DTYPE NOTE:
-            # TRELLIS.2 datasets emit targets as float32 (their SparseStructure
-            # Latent / SLat / SLatPbr all use `.float()`), but our pretrained
-            # DiTs are bf16. We explicitly cast every target to `cond.dtype`
-            # (bf16) so the math works WITHOUT relying on autocast — this is
-            # symmetric with the SS Flow path which already did this.
-            #
-            # AUTOCAST IS STILL REQUIRED, though, because TRELLIS.2 internals
-            # (specifically `TimestepEmbedder.timestep_embedding` in
-            # sparse_structure_flow.py) hardcode `torch.arange(dtype=float32)`,
-            # producing an fp32 t_freq that the bf16 t-embedder MLP can only
-            # consume under amp. HF Trainer with `bf16=True` enables autocast
-            # automatically. If you call this forward from custom code, wrap
-            # the call site with `torch.autocast(device_type="cuda",
-            # dtype=torch.bfloat16)` or expect a Float/BFloat16 mismatch.
-            # ----------------------------------------------------------------
-
-            # ── Stage 1: SS Flow (dense, logitNormal t-schedule) ──
-            ss_flow = self.model.get_ss_flow()
-            ss_target = target_ss_latent.to(cond.dtype)
-            L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask)
-            flow_losses["ss"] = L_ss
-            flow_logs_per_stage["ss"] = log_ss
-
-            # ── Stage 2: Shape SLAT (sparse, uniform t-schedule) ──
-            if target_shape_slat_512 is not None:
-                shape_slat = self.model.get_shape_slat_512()
-                # SparseTensor uses .replace() to swap feats while keeping coords.
-                shape_target = target_shape_slat_512.replace(
-                    target_shape_slat_512.feats.to(cond.dtype)
-                )
-                L_shape, log_shape = loss_fn_slat(
-                    shape_slat, shape_target, cond, cond_mask=sdpa_mask
-                )
-                flow_losses["shape_slat_512"] = L_shape
-                flow_logs_per_stage["shape_slat_512"] = log_shape
-
-            # ── Stage 3: Tex SLAT (sparse, uniform t-schedule, with GT shape
-            #     SLAT teacher-forced as concat_cond — TRELLIS.2 Tex SLAT
-            #     input is channel-concat of (noisy_tex, shape_slat), 32+32=64). ──
-            if target_tex_slat_512 is not None and tex_concat_cond is not None:
-                tex_slat = self.model.get_tex_slat_512()
-                tex_target = target_tex_slat_512.replace(
-                    target_tex_slat_512.feats.to(cond.dtype)
-                )
-                tex_cc = tex_concat_cond.replace(
-                    tex_concat_cond.feats.to(cond.dtype)
-                )
-                L_tex, log_tex = loss_fn_slat(
-                    tex_slat, tex_target, cond,
-                    cond_mask=sdpa_mask,
-                    concat_cond=tex_cc,   # teacher-forced GT shape SLAT, bf16
-                )
-                flow_losses["tex_slat_512"] = L_tex
-                flow_logs_per_stage["tex_slat_512"] = log_tex
-
-            # ── Weighted-mean combination ──
-            # L_total = L_ce + λ_flow · Σ ŵ_i · L_flow_i
-            # Defaults: λ_flow=1.0, all w_i=1.0 → flow_combined = mean(L_flow_i),
-            # matching BLIP3o-NEXT precedent of 1:1 ratio between CE and flow.
-            stage_w_spec = getattr(
-                self.config, "flow_stage_weights",
-                "ss=1.0,shape_slat_512=1.0,tex_slat_512=1.0",
+            # 3-stage cascade flow loss via the SHARED helper (single source of
+            # truth, also used by trellis_native_vlm). Does truncate → detach →
+            # connector(mask_drop) → sdpa_mask → SS/Shape/Tex stages → weighted
+            # combine internally. Numerically identical to the previous inline
+            # loop (tests/test_flow_heads_equiv.py: diff=0). cond_slice above
+            # already produced (cond_hidden, cond_key_mask).
+            if self._flow_fns is None:
+                self._flow_fns = flow_heads.build_flow_loss_fns(self.config)
+            loss_fn_ss, loss_fn_slat = self._flow_fns
+            flow_loss, flow_logs = flow_heads.compute_cascade_flow_loss(
+                connector=self.model.diffusion_connector,
+                ss_flow=self.model.get_ss_flow(),
+                shape_slat=(self.model.get_shape_slat_512()
+                            if target_shape_slat_512 is not None else None),
+                tex_slat=(self.model.get_tex_slat_512()
+                          if (target_tex_slat_512 is not None and tex_concat_cond is not None) else None),
+                loss_fn_ss=loss_fn_ss, loss_fn_slat=loss_fn_slat,
+                cond_hidden=cond_hidden, cond_key_mask=cond_key_mask,
+                target_ss_latent=target_ss_latent,
+                target_shape_slat_512=target_shape_slat_512,
+                target_tex_slat_512=target_tex_slat_512,
+                tex_concat_cond=tex_concat_cond,
+                cond_max_length=getattr(self.config, "cond_max_length", 8192),
+                detach_cond=getattr(self.config, "detach_cond", False),
+                mask_drop_prob=0.1,
+                flow_stage_weights=getattr(self.config, "flow_stage_weights",
+                                           "ss=1.0,shape_slat_512=1.0,tex_slat_512=1.0"),
+                flow_weight=getattr(self.config, "flow_weight", 1.0),
             )
-            stage_weights_all = _parse_flow_stage_weights(stage_w_spec)
-            active_w = {k: stage_weights_all.get(k, 1.0) for k in flow_losses}
-            total_w = sum(active_w.values()) or 1.0
-            normalized_w = {k: w / total_w for k, w in active_w.items()}
-            flow_combined = sum(normalized_w[k] * v for k, v in flow_losses.items())
-
-            flow_weight = getattr(self.config, "flow_weight", 1.0)
-            if loss is None:
-                loss = flow_weight * flow_combined
-            else:
-                loss = loss + flow_weight * flow_combined
+            loss = flow_loss if loss is None else loss + flow_loss
 
             if torch.is_tensor(loss):
-                stage_str = "  ".join(
-                    f"{k}={flow_logs_per_stage[k]['flow_mse']:.4f}" for k in flow_logs_per_stage
-                )
+                stage_str = "  ".join(f"{k}={v:.4f}" for k, v in flow_logs["stages"].items())
                 rank0_print(
-                    f"[loss] total={loss.detach().float().item():.4f}  flow_combined={flow_combined.detach().float().item():.4f}  {stage_str}"
+                    f"[loss] total={loss.detach().float().item():.4f}  "
+                    f"flow_combined={flow_logs['flow_combined']:.4f}  {stage_str}"
                 )
 
         return CausalLMOutputWithPast(

@@ -89,6 +89,32 @@ def build_tex_slat_512(cfg, **kwargs) -> nn.Module:
     return model.to(torch.bfloat16)
 
 
+# === 1024 variants (HR cascade) — paired with 1024-encoder latents (64^3 sparse target) ===
+
+def _default_shape_slat_1024_ckpt() -> str:
+    return os.path.join(_tr2_paths.CHECKPOINTS_ROOT, "TRELLIS.2-4B", "ckpts",
+                        "slat_flow_img2shape_dit_1_3B_1024_bf16")
+
+
+def _default_tex_slat_1024_ckpt() -> str:
+    return os.path.join(_tr2_paths.CHECKPOINTS_ROOT, "TRELLIS.2-4B", "ckpts",
+                        "slat_flow_imgshape2tex_dit_1_3B_1024_bf16")
+
+
+def build_shape_slat_1024(cfg, **kwargs) -> nn.Module:
+    """Build TRELLIS.2 Shape SLAT 1024 (trainable, 1.3B). Sparse, output 64^3."""
+    from trellis2 import models
+    ckpt = getattr(cfg, "trellis_shape_slat_1024_ckpt", None) or _default_shape_slat_1024_ckpt()
+    return models.from_pretrained(ckpt).to(torch.bfloat16)
+
+
+def build_tex_slat_1024(cfg, **kwargs) -> nn.Module:
+    """Build TRELLIS.2 Tex SLAT 1024 (trainable, 1.3B). Sparse, output 64^3."""
+    from trellis2 import models
+    ckpt = getattr(cfg, "trellis_tex_slat_1024_ckpt", None) or _default_tex_slat_1024_ckpt()
+    return models.from_pretrained(ckpt).to(torch.bfloat16)
+
+
 def build_trellis_decoders(cfg, **kwargs) -> nn.ModuleDict:
     """Build the frozen decoder bundle (Shape SLAT + Tex SLAT + SC-VAE decoder).
 

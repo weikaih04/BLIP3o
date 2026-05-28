@@ -36,9 +36,15 @@ class LoRALinear(nn.Module):
         self.lora_drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x):
+        # x may be a plain Tensor (dense flow / attn via _linear(module, x.feats))
+        # OR a SparseTensor (the MLP is called directly on the SparseTensor). Compute
+        # the low-rank update in feature space and recombine accordingly.
         out = self.base(x)
-        upd = (self.lora_drop(x) @ self.lora_A.t()) @ self.lora_B.t()
-        return out + self.scaling * upd
+        feats = x.feats if hasattr(x, "feats") else x
+        upd = self.scaling * ((self.lora_drop(feats) @ self.lora_A.t()) @ self.lora_B.t())
+        if hasattr(out, "replace") and hasattr(out, "feats"):   # SparseTensor
+            return out.replace(out.feats + upd)
+        return out + upd
 
     @torch.no_grad()
     def merge(self) -> nn.Linear:
