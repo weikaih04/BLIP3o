@@ -23,14 +23,54 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Optional
 
+import time
+
 import transformers
 from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
+from transformers.trainer_callback import TrainerCallback
 
 import trellis2_blip3o._paths  # noqa: F401
 from trellis2_blip3o.dataset_native import TR2NativeVLMDataset, NativeVLMCollator
 from blip3o.model.language_model.trellis_native_vlm import (
     TrellisNativeVLMConfig, TrellisNativeVLMForConditionalGeneration,
 )
+
+
+class WandbFineGrainedCallback(TrainerCallback):
+    """Configure wandb panels at train start + emit per-step wall-clock to wandb.
+
+    - `define_metric` tells wandb how to aggregate each metric in the run-summary table
+      (min for losses, max for cond_len/voxels, last for grad_norm/lr). Without this every
+      summary defaults to "last" which is noisy for fluctuating per-stage losses.
+    - `time/step_sec` lets us see throughput trends + correlate spikes with voxel counts.
+    """
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+            wandb.define_metric("train/loss", summary="min")
+            wandb.define_metric("train/per_stage/*", summary="min")
+            wandb.define_metric("train/cond/*", summary="mean")
+            wandb.define_metric("train/target/*", summary="max")
+            wandb.define_metric("train/grad_norm", summary="last")
+            wandb.define_metric("train/learning_rate", summary="last")
+            wandb.define_metric("train/time/step_sec", summary="mean")
+        except Exception as e:
+            print(f"[WandbFineGrainedCallback] define_metric skipped: {e}")
+        self._t = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+            now = time.time()
+            wandb.log({"train/time/step_sec": now - self._t}, step=state.global_step, commit=False)
+            self._t = now
+        except Exception:
+            pass
 
 
 def _apply_flow_freeze(model, mode: str):
@@ -225,6 +265,7 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         data_collator=collator,
+        callbacks=[WandbFineGrainedCallback()],
     )
     trainer.train(resume_from_checkpoint=bool(list(__import__("pathlib").Path(training_args.output_dir).glob("checkpoint-*"))) or None)
     trainer.save_state()

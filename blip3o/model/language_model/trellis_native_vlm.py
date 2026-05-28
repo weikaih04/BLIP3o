@@ -414,22 +414,25 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         stage_str = "  ".join(f"{k}={v:.4f}" for k, v in logs["stages"].items())
         rank0_print(f"[loss] total={loss.detach().float().item():.4f}  {stage_str}")
 
-        # Stash fine-grained diagnostics for the NativeTrainer to read & push to wandb
-        # (HF Trainer auto-logs only `loss`; here we expose per-stage + cond/target shapes).
-        diag = {f"loss_{k}": float(v) for k, v in logs["stages"].items()}
+        # Stash fine-grained diagnostics for the NativeTrainer to read & push to wandb.
+        # HF Trainer auto-logs only `loss` total — here we expose per-stage + cond/target
+        # shapes. Keys use 3-level slash-nesting so wandb groups them into clean panels:
+        #   per_stage/* — flow losses (ss / shape / tex)
+        #   cond/*      — VLM output shape & norm
+        #   target/*    — sparse-target voxel counts (varies per-asset, signals OOM risk)
+        diag = {f"per_stage/loss_{k}": float(v) for k, v in logs["stages"].items()}
         if cond_hidden is not None:
-            diag["cond_len"] = float(cond_hidden.shape[1])
+            diag["cond/len"] = float(cond_hidden.shape[1])
             with torch.no_grad():
-                diag["cond_norm_mean"] = float(cond_hidden.detach().float().norm(dim=-1).mean())
+                diag["cond/norm_mean"] = float(cond_hidden.detach().float().norm(dim=-1).mean())
         if cond_key_mask is not None:
-            diag["cond_valid_tokens"] = float(cond_key_mask.sum())
-        # target voxel counts (varies per-asset; useful to spot OOM-risk samples)
+            diag["cond/valid_tokens"] = float(cond_key_mask.sum())
         if target_ss_latent is not None and hasattr(target_ss_latent, "shape"):
             # SS target is a dense 3D occupancy → count non-zero voxels
-            diag["ss_target_voxels"] = float((target_ss_latent != 0).sum())
+            diag["target/ss_voxels"] = float((target_ss_latent != 0).sum())
         for name, t in (("shape_slat", target_shape_slat_512), ("tex_slat", target_tex_slat_512)):
             if t is not None and hasattr(t, "feats"):
-                diag[f"{name}_target_voxels"] = float(t.feats.shape[0])
+                diag[f"target/{name}_voxels"] = float(t.feats.shape[0])
         self._last_diag = diag
 
         # No logits (no LM head / no CE) — loss-only output for HF Trainer.
