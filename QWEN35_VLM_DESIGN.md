@@ -42,10 +42,11 @@ Run: `CUDA_VISIBLE_DEVICES=0 <env>/bin/python tests/test_native_vlm.py all`
 
 **FULL CASCADE (SS + Shape + Tex together) trains** — `NativeTrainer._prepare_inputs` moves
 SparseTensor SLAT targets to GPU. **Under the repo NO-OFFLOAD policy** (see OPTIMIZATIONS.md
-§"No-offload policy"), cascade needs ≥4 GPUs with `configs/deepspeed_zero2.json`. The 1×80GB
-CPU-offload recipe used during initial verification is forbidden by `train_native.py`'s
-runtime guard (`_enforce_no_offload`). Cascade also currently has a sparse-tensor broadcast
-bug at BS>1 (see chat 2026-05-28) that needs fixing before cascade training is reliable.
+§"No-offload policy"), 512 stage needs ≥4 GPUs with `configs/deepspeed_zero2.json`. The
+1×80GB CPU-offload recipe used during initial verification is forbidden by `train_native.py`'s
+runtime guard (`_enforce_no_offload`). 512 stage also currently has a sparse-tensor broadcast
+bug at BS>1 (see chat 2026-05-28) that needs fixing before it's reliable. (Note: "cascade"
+in user vocabulary means 512 → 1024 ft progression — not coded yet.)
 
 **GENERATION works end-to-end** — `tests/generate_native.py`: front half = native VLM
 `encode_cond` + CFG-correct `cond_and_null` (neg=connector(0)); back half IDENTICAL to the
@@ -53,10 +54,11 @@ original `test_overfit_infer.py` (Trellis2ImageTo3DPipeline: SS → shape → te
 8-view render). Verified: fresh/untrained connector → EMPTY SS (0 voxels, expected); after a
 250-step in-memory SS overfit → NON-EMPTY (3220 voxels) → 1.18M-vert textured mesh + renders.
 Geometry still ROUGH/blocky (250 steps, SS-only, shape/tex frozen) — clean geometry needs
-more steps + full cascade + (per the discrete recipe) unfreezing flow cross+self-attn.
+more steps + 512 stage (SS + SLAT) + (per the discrete recipe) unfreezing flow cross+self-attn.
 
-Remaining (next): overfit-to-CONVERGENCE for clean geometry (more steps, cascade, unfreeze flow
-attn); multi-GPU; unfreeze VLM (D2); register AutoModel + composite save/load.
+Remaining (next): overfit-to-CONVERGENCE for clean geometry (more steps, 512 stage, unfreeze
+flow attn); multi-GPU; unfreeze VLM (D2); register AutoModel + composite save/load; eventually
+add real cascade (512 → 1024 ft) — not coded yet.
 
 ---
 

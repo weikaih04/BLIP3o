@@ -96,10 +96,9 @@ scripts, just pass `--optim adamw_torch_fused`.
 
 **Risk.** None known. fused AdamW has been stable in torch ≥ 2.0; we're on 2.6.
 
-**Why NOT fused everywhere via CPU-offloaded optim** — `cpu_adam` (DeepSpeed
-ZeRO-2 + offload) **does not benefit** from `fused=True` because the update
-runs on CPU, not CUDA. For cascade training (which we offload), this flag is a
-no-op; that's fine.
+**Why NOT fused everywhere via CPU-offloaded optim** — moot under the repo
+no-offload policy (see below): we don't run CPU-offloaded Adam anywhere, so
+`fused=True` is always on the GPU path.
 
 ---
 
@@ -195,8 +194,8 @@ or any `zero_optimization.offload_param.*` set; see `_enforce_no_offload` (~line
 **Why.** Offload trades **3-4× step time** for "fits". It masks real memory pressure
 and bottlenecks throughput on the CPU `optimizer.step()`. Concretely:
 
-- ZeRO-2 + CPU-offload cascade: ~13-20 s / step (measured in
-  [[project_overfit_train_resources]])
+- ZeRO-2 + CPU-offload 512 stage (SS + Shape SLAT 512 + Tex SLAT 512): ~13-20 s / step
+  (measured in [[project_overfit_train_resources]])
 - ZeRO-2 NO-offload on enough GPUs: same step would be ~3-5 s
 
 When a config doesn't fit, the right responses are:
@@ -213,14 +212,21 @@ reference) rejected.
 
 **Practical impact.**
 
+**Terminology** (matches user vocabulary, fixed 2026-05-28):
+- **ss** = SS flow only (513 M trainable)
+- **512** = SS + Shape SLAT 512 + Tex SLAT 512 (3.9 B trainable). *Not* "cascade".
+- **cascade** = 512 → 1024 ft progression. *Not coded yet.*
+
 | Workload | Recommended | NPROC | Without offload |
 |---|---|---|---|
-| SS-only frozen VLM (513 M trainable) | `configs/deepspeed_zero2.json` | 1+ | BS=4 fits 1 GPU (50 GB) |
-| Cascade frozen VLM (3.9 B trainable) | `configs/deepspeed_zero2.json` | ≥4 | BS=1 per GPU, ZeRO-2 splits opt state |
-| SS-only D2 unfrozen VLM (3.5 B trainable) | `configs/deepspeed_zero2.json` | 1+ | BS=1 fits 1 GPU (39 GB); BS=2 needs 2 GPU |
-| Cascade D2 unfrozen VLM (5.7 B trainable) | TBD | ≥8 | Likely needs ZeRO-3 (still no offload) |
+| ss frozen VLM (513 M trainable) | `configs/deepspeed_zero2.json` | 1+ | BS=4 fits 1 GPU (50 GB) |
+| **512 stage** frozen VLM (3.9 B trainable) | `configs/deepspeed_zero2.json` | ≥4 | BS=1 per GPU, ZeRO-2 splits opt state |
+| ss D2 unfrozen VLM (3.5 B trainable) | `configs/deepspeed_zero2.json` | 1+ | BS=1 fits 1 GPU (39 GB); BS=2 needs 2 GPU |
+| **512 stage** D2 unfrozen VLM (5.7 B trainable) | TBD | ≥8 | Likely needs ZeRO-3 (still no offload) |
+| true cascade (512 → 1024 ft) | not implemented | — | future work |
 
-The `train_native_q35.sh` script hard-errors if you ask for `cascade` with `NPROC<4`.
+The `train_native_q35.sh` script hard-errors if you ask for `MODE=512` with `NPROC<4`,
+and prints a redirect if you pass the legacy `MODE=cascade`.
 
 ---
 
@@ -243,8 +249,8 @@ The `train_native_q35.sh` script hard-errors if you ask for `cascade` with `NPRO
 everything. Just run:
 
 ```bash
-bash scripts/train_native_q35.sh ss     # SS-only, 1 GPU
-bash scripts/train_native_q35.sh cascade 2  # full cascade, 2 GPU, DS ZeRO-2 offload
+bash scripts/train_native_q35.sh ss          # SS flow only, 1 GPU
+bash scripts/train_native_q35.sh 512  4      # SS + SLAT 512 stage, 4 GPU (NPROC>=4 enforced)
 ```
 
 **Disable** (debugging / A/B):
@@ -261,7 +267,7 @@ bash scripts/train_native_q35.sh cascade 2  # full cascade, 2 GPU, DS ZeRO-2 off
 ```bash
 CUDA_VISIBLE_DEVICES=0 FUSED_ADAM=1 \
   $ENV/bin/python tests/profile_native_compile.py
-# Env vars: COMPILE_MODE, MODE (ss|cascade), FLOW_TUNE, FUSED_ADAM, STEPS
+# Env vars: COMPILE_MODE, MODE (ss|512), FLOW_TUNE, FUSED_ADAM, STEPS
 ```
 
 Output is a side-by-side table with **per-phase ms + Δ vs baseline**.
@@ -277,7 +283,7 @@ Output is a side-by-side table with **per-phase ms + Δ vs baseline**.
    (fixed shapes → CUDA graphs viable, +5-15 ms).
 3. Try `compile_mode=max-autotune` for long training runs (one-time +5 min
    compile cost amortized; +3-8 ms / step).
-4. Compile the SLAT flows when we move to cascade — but **first** verify Dynamo
+4. Compile the SLAT flows when we move to 512 stage — but **first** verify Dynamo
    doesn't break the sparse triton ops. If it does (likely), this is dead.
 5. VLM-hidden cache for single-asset / small-vocab task mixes. Will help
    overfit / sanity tests, less so for shuffled multi-task.

@@ -118,14 +118,34 @@ class _ThreeDTaskBase(Dataset):
     def __len__(self):
         return len(self.records)
 
-    # --- view sampling (mode-dependent, overridden per subclass) ---
+    # --- per-batch param hook (called by MixtureIterableDataset) ---
+    # When the mixture is about to emit `batch_size` items of this task, it calls
+    # `set_batch_params(rng)` once. For mode="IM" we lock n_views for the whole
+    # batch → ZERO intra-batch padding waste on vision tokens (a 2-view item next
+    # to a 4-view item would otherwise force the short one to pad to the long one).
+    # For "T" / "I1" there's no batch-level decision to make; the method is a no-op.
+    _batch_n_views: Optional[int] = None
+
+    def set_batch_params(self, rng) -> None:
+        if self.mode == "IM":
+            hi = max(3, self.max_views + 1)
+            self._batch_n_views = int(rng.integers(2, hi))
+
+    def clear_batch_params(self) -> None:
+        self._batch_n_views = None
+
+    # --- view sampling (mode-dependent) ---
     def _sample_n_views(self, rng) -> int:
         if self.mode == "T":
             return 0
         if self.mode == "I1":
             return 1
         if self.mode == "IM":
-            hi = max(3, self.max_views + 1)   # rng.integers high is exclusive
+            # Use batch-locked value when mixture set one; otherwise fall back to
+            # per-item random (e.g. when this dataset is iterated standalone).
+            if self._batch_n_views is not None:
+                return int(self._batch_n_views)
+            hi = max(3, self.max_views + 1)
             return int(rng.integers(2, hi))
         raise ValueError(f"unknown mode {self.mode!r}")
 

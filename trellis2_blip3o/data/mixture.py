@@ -71,6 +71,23 @@ class MixtureIterableDataset(IterableDataset):
     Items carry `_task: <name>` so the collator can route. Batch granularity is
     enforced here: we yield `batch_size` items from the SAME task before
     re-rolling, so each batch sees one task.
+
+    Two efficiency fixes baked in (see MULTI_TASK_DATA.md §Efficiency):
+      • **Rank-synced task choice**: the per-step task draw uses a seed that
+        does NOT include `rank`. All DDP/DeepSpeed ranks therefore pick the SAME
+        task on the SAME step → no straggler at the ZeRO reduce-scatter / DDP
+        all-reduce barrier. Within a task, the index sampler IS per-rank so
+        data parallel still gives each rank distinct items.
+      • **Per-batch task params**: if a task's Dataset exposes
+        `set_batch_params(rng) -> None`, we call it ONCE per batch before
+        yielding the `batch_size` items. This lets a task that has per-item
+        randomness (e.g. multi_image_to_3d's n_views ∈ [2, max_views]) fix the
+        param at batch level → zero intra-batch padding waste.
+
+    Worker safety: with `num_workers > 1` the DataLoader may interleave items
+    from different workers (different tasks) into one batch, breaking
+    homogeneity. We emit a warning at iter time and recommend num_workers ≤ 1.
+    (A pre-batched yield API + identity collator would lift this; see TODO.)
     """
 
     def __init__(
@@ -101,10 +118,30 @@ class MixtureIterableDataset(IterableDataset):
         worker_id = wi.id if wi is not None else 0
         num_workers = wi.num_workers if wi is not None else 1
         rank = int(os.environ.get("RANK", 0))
-        # Distinct stream per (rank, worker) so DataLoader workers don't double-sample.
-        seed = (self.base_seed * 1_000_003) ^ (rank * 9176) ^ (worker_id + 1)
-        rng = np.random.default_rng(seed)
-        per_task_rng = [np.random.default_rng(seed ^ (i * 7919 + 1)) for i in range(len(self.tasks))]
+
+        if num_workers > 1:
+            import warnings
+            warnings.warn(
+                "MixtureIterableDataset with num_workers > 1 may interleave items "
+                "from different workers (different tasks) into the same batch, "
+                "breaking the homogeneity the MultiTaskCollator assumes. "
+                "Use --dataloader_num_workers 0 or 1.",
+                stacklevel=2,
+            )
+
+        # Task-choice RNG: SHARED across ranks (rank NOT in seed). This is the key
+        # straggler fix: all ranks pick the same task on the same step → no waiting
+        # at the DeepSpeed/DDP reduce barrier when tasks have different step-times.
+        task_seed = (self.base_seed * 1_000_003) ^ (worker_id + 1)
+        task_rng = np.random.default_rng(task_seed)
+
+        # Within-task index RNG: PER-RANK (rank IS in seed). Each rank sees a
+        # different slice of each task's dataset → data parallel.
+        within_seed = (self.base_seed * 1_000_003) ^ (rank * 9176) ^ (worker_id + 1)
+        per_task_rng = [
+            np.random.default_rng(within_seed ^ (i * 7919 + 1))
+            for i in range(len(self.tasks))
+        ]
 
         # Per-task cyclic index streams (each shuffles within its own dataset every "epoch").
         def make_cycler(ti: int):
@@ -117,19 +154,35 @@ class MixtureIterableDataset(IterableDataset):
                     yield ds[int(j)]
         cyclers = [make_cycler(i) for i in range(len(self.tasks))]
 
-        # Worker-id stride: with num_workers workers, each yields every num_workers-th batch.
+        # Worker-id stride: with num_workers workers, each yields every num_workers-th
+        # batch. We "burn" the cycler items for skipped batches so that all workers
+        # remain consistent with the shared task_rng sequence.
         skip = worker_id
         while True:
-            t = int(rng.choice(len(self.tasks), p=self.probs))
+            t = int(task_rng.choice(len(self.tasks), p=self.probs))
             n_emit = self.batch_size if self.granularity == "batch" else 1
             if skip > 0:
-                # Burn this draw — another worker will service it.
                 for _ in range(n_emit):
                     next(cyclers[t])
                 skip = (skip - 1) % max(1, num_workers)
                 continue
-            for _ in range(n_emit):
-                yield next(cyclers[t])
+
+            # Per-batch param hook: tasks that need batch-level decisions (e.g.
+            # multi_image_to_3d picks n_views ONCE for the whole batch) implement
+            # set_batch_params(rng); we call it here BEFORE the n_emit loop so all
+            # items in this batch share that param.
+            ds = self.tasks[t]
+            setter = getattr(ds, "set_batch_params", None)
+            if callable(setter):
+                setter(task_rng)
+            try:
+                for _ in range(n_emit):
+                    yield next(cyclers[t])
+            finally:
+                # Reset, so the next task draw starts clean.
+                clearer = getattr(ds, "clear_batch_params", None)
+                if callable(clearer):
+                    clearer()
             skip = (num_workers - 1) if num_workers > 1 else 0
 
 
