@@ -60,7 +60,7 @@ class TR2BLIP3oDataset(Dataset):
     """JSON-manifest dataset for unified text-image → 3D generation.
 
     Args:
-        tokenizer: HF tokenizer (Qwen3-VL based).
+        tokenizer: HF tokenizer (Qwen3.5 based; DEPRECATED: was Qwen3-VL based).
         data_path: path to JSONL manifest.
         data_args: HF DataArguments-style namespace. Should expose:
             - is_multimodal: bool

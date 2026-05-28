@@ -247,25 +247,23 @@ class NativeVLMCollator:
     """
     processor: Any
     system_prompt: Optional[str] = None  # keep minimal / None (drop_idx deferred)
-    # Token-budget cap. Qwen vision tokens = pixels / (patch_size·merge_size)². This ratio is
-    # BACKBONE-SPECIFIC: Qwen2.5-VL patch14 → 784 px/tok; Qwen3-VL/Qwen3.5 patch16 → 1024 px/tok.
-    # We DERIVE it from the actual processor (_px_per_tok) so the cap is correct for any backbone
-    # — hardcoding 1024 would under-cap Qwen2.5-VL by ~31% (more tokens than intended).
-    # Single image → ≤ max_tokens_single (≈ DINOv3@1024 density). Multi-view → split token_budget
-    # across views so the TOTAL cond stays ≤ token_budget (= cond_max_length; beyond it the flow
-    # silently truncates → drops views). Per-call max_pixels is ignored by the processor, so we
-    # resize here. Only downscales (never upscales); keeps aspect ratio.
-    # Defaults: single-view ≤400 tok (≈ 640² for Qwen3-VL patch16 / ≈ 560² for Qwen2.5-VL
-    # patch14); multi-view TOTAL ≤1000 (auto split per-view = token_budget // N). Calibrated
-    # between Qwen-Image-Edit's 384²/~150-tok-per-view and the old 4096 cap (which made
-    # cross-attn 5-10x more expensive than needed). Override in __init__ if you need more.
+    # Token-budget cap. Qwen3.5 vision tokens = pixels / (patch_size·merge_size)²
+    # = pixels / (16·2)² = pixels / 1024.
+    # Single image → ≤ max_tokens_single. Multi-view → split token_budget across views so
+    # TOTAL cond ≤ token_budget (= cond_max_length; beyond it the flow silently truncates →
+    # drops views). max_pixels is ignored by the processor, so we resize here (downscale
+    # only; keep aspect ratio). Defaults: single-view ≤400 tok (≈ 640²), multi-view total
+    # ≤1000 (auto split per-view = token_budget // N). Override in __init__ if needed.
+    # DEPRECATED note: The _px_per_tok() helper STILL derives px/tok from the processor
+    # (so Qwen2.5-VL patch14 → 784 px/tok would also be correct if you load that backbone
+    # for inspection). But Qwen2.5-VL / Qwen3-VL are no longer a tested training path.
     max_tokens_single: int = 400
     token_budget: int = 1000
     _px_per_tok_fallback: int = 1024  # used only if the processor lacks patch_size/merge_size
 
     def _px_per_tok(self) -> int:
-        """Pixels per vision token = (patch_size·merge_size)², read from the ACTUAL processor
-        → backbone-correct (Qwen2.5-VL 14·2 → 784; Qwen3-VL/3.5 16·2 → 1024)."""
+        """Pixels per vision token = (patch_size·merge_size)², read from the ACTUAL processor.
+        Qwen3.5: 16·2 → 1024."""
         ip = self.processor.image_processor
         ps, ms = getattr(ip, "patch_size", None), getattr(ip, "merge_size", None)
         if isinstance(ps, int) and isinstance(ms, int):

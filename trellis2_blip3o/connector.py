@@ -30,7 +30,8 @@ class TRELLIS2Connector(nn.Module):
 
     Args:
         vlm_hidden_dim: VLM final-layer hidden size.
-                        BLIP3o-NEXT-Pretrain-3B = 2048;  Qwen3-VL-8B = 3584.
+                        Qwen3.5-2B = 2048 (current supported backbone).
+                        # DEPRECATED examples: BLIP3o-NEXT-Pretrain-3B = 2048; Qwen3-VL-8B = 3584.
         trellis_cond_dim: SS Flow cond_channels (1024 across TRELLIS.2-4B stages).
     """
 

@@ -3,7 +3,7 @@
 See QWEN35_VLM_DESIGN.md. Pipeline:
 
     text (+ optional image / multi-image / video)
-        → native VLM (Qwen3-VL-2B or Qwen3.5-2B; vision baked in)  [encode_cond]
+        → native VLM (Qwen3.5-2B; vision baked in)               [encode_cond]
         → hidden_states[-1]  (2048-d, full sequence)
         → TRELLIS2Connector (2048 → 1024, UNCHANGED; DINOv3 dist-match)
         → cross-attn into TRELLIS SS / Shape-SLAT / Tex-SLAT flows  (weights reused)
@@ -13,13 +13,13 @@ See QWEN35_VLM_DESIGN.md. Pipeline:
 Design choices (vs blip3oQwenForCausalLM):
   * Composition (HAS-A VLM), NOT inheritance from blip3oMeta (tangled w/ TA-Tok/codebook).
   * VLM is a frozen-or-trained *encoder* — no AR codebook generation, no CE.
-  * Backbone-agnostic: `config.vlm_model` selects Qwen3-VL-2B vs Qwen3.5-2B
-    (both LLM hidden = 2048, so the connector dim is unchanged for either).
   * Option α (keep TRELLIS cross-attn) — NOT a Qwen-Image-Edit MMDiT clone.
 
-STATUS: SKELETON, UNTESTED. Pending Phase-0 env (qwen3_5 needs new transformers).
-Inline TODO(phase0)/TODO(phaseN) mark the parts still to wire (save/load, processor
-lives in the Phase-3 collator, video kwargs, AutoModel registration).
+# DEPRECATED (2026-05-28): The code is **backbone-agnostic by design** (any HF
+# `AutoModelForImageTextToText` with hidden_size=2048 plugs in), but the only
+# TESTED / SUPPORTED backbone going forward is Qwen3.5-2B. Qwen3-VL-2B-Instruct
+# and Qwen2.5-VL-3B-Instruct were earlier A/B candidates and may still load,
+# but they are not a validated training path.
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class TrellisNativeVLMConfig(PretrainedConfig):
     def __init__(
         self,
         vlm_model: str = "Qwen/Qwen3.5-2B",
-        vlm_hidden_size: int = 2048,          # Qwen3-VL-2B & Qwen3.5-2B both = 2048
+        vlm_hidden_size: int = 2048,          # Qwen3.5-2B = 2048
         freeze_vlm: bool = True,              # v1 smoke-test: frozen (matches Qwen-Image-Edit)
         build_slat: bool = True,              # False ⇒ SS-only (skip shape/tex flows + decoders)
         slat_resolution: int = 512,           # 512 (paired w/ shape/tex_512 latents) or 1024 (HR cascade)
@@ -106,17 +106,16 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         super().__init__(config)
 
         # --- native VLM encoder (vision baked in) ---
-        # TODO(phase0): verify AutoModelForImageTextToText resolves model_type
-        #   'qwen3_5' (and 'qwen3_vl'); if the auto-mapping misses qwen3_5, import
-        #   the concrete class (Qwen3_5ForConditionalGeneration) instead.
         # TODO(save/load): loading pretrained weights in __init__ is a skeleton
         #   shortcut. For clean save_pretrained/from_pretrained of the WHOLE
         #   composite, switch to building the VLM from a nested vlm_config and
         #   loading the backbone separately (or override save/load to exclude the
         #   frozen VLM). Fine for v1 training (we only save connector+flows anyway).
         from transformers import AutoModelForImageTextToText  # local import: new-ish auto class
-        # `dtype=` (not the deprecated `torch_dtype=`) — works on transformers 4.57
-        # (Qwen3-VL) AND 5.2+ (Qwen3.5, where torch_dtype is removed).
+        # `dtype=` (not the deprecated `torch_dtype=`) — required by transformers 5.2+
+        # (the env `blip3o_trellis_qwen35` we run Qwen3.5 in). DEPRECATED backbones
+        # Qwen3-VL / Qwen2.5-VL still load via 4.57's older `torch_dtype` path if you
+        # accept the warning.
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             config.vlm_model, dtype=torch.bfloat16
         )
@@ -124,9 +123,8 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             self.vlm.requires_grad_(False)
             self.vlm.eval()
 
-        # Derive the LLM hidden dim from the loaded VLM (robust across backbones:
-        # Qwen3-VL-2B/Qwen3.5-2B = 2048, Qwen3-VL-4B = 2560, etc.) rather than
-        # trusting config.vlm_hidden_size. Falls back to the config value.
+        # Derive the LLM hidden dim from the loaded VLM (Qwen3.5-2B = 2048) rather
+        # than trusting config.vlm_hidden_size. Falls back to the config value.
         try:
             text_cfg = self.vlm.config.get_text_config()
         except Exception:

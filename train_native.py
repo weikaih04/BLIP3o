@@ -7,14 +7,19 @@ v1 default = SS-only (build_slat=False) + frozen VLM. SS target is a plain tenso
 vanilla Trainer._prepare_inputs moves it to GPU fine. (Cascade/SLAT needs a
 SparseTensor-aware _prepare_inputs — follow-up; see QWEN35_VLM_DESIGN.md.)
 
+Only Qwen3.5-2B is supported. Use env `blip3o_trellis_qwen35` (transformers 5.2.0).
+
 Launch (1 GPU):
   CUDA_VISIBLE_DEVICES=0 <env>/bin/python train_native.py \
-    --vlm_model Qwen/Qwen3-VL-2B-Instruct --data_path data/overfit/imgtext.jsonl \
-    --output_dir runs/native_q3vl_overfit --max_steps 200 --bf16 True \
+    --vlm_model Qwen/Qwen3.5-2B --data_path data/overfit/imgtext.jsonl \
+    --output_dir runs/native_q35_overfit --max_steps 200 --bf16 True \
     --per_device_train_batch_size 1 --learning_rate 1e-4 --logging_steps 10
 
 Multi-GPU: torchrun --nproc_per_node=N train_native.py ... --deepspeed configs/deepspeed_zero2.json
-Qwen3.5-2B: use the blip3o_trellis_qwen35 env + --vlm_model Qwen/Qwen3.5-2B.
+
+# DEPRECATED (2026-05-28): Qwen3-VL-2B-Instruct and Qwen2.5-VL-3B-Instruct backbones
+# are no longer supported. The model class remains backbone-agnostic so they CAN
+# still be loaded for inspection, but they aren't a tested training path.
 """
 from __future__ import annotations
 
@@ -161,7 +166,10 @@ class NativeTrainer(Trainer):
 
 @dataclass
 class NativeArgs:
-    vlm_model: str = field(default="Qwen/Qwen3-VL-2B-Instruct")
+    vlm_model: str = field(default="Qwen/Qwen3.5-2B")
+    # DEPRECATED backbones (kept loadable but no longer a tested training path):
+    #   "Qwen/Qwen3-VL-2B-Instruct"   — needs the `blip3o_trellis` env + transformers 4.57.6
+    #   "Qwen/Qwen2.5-VL-3B-Instruct" — needs the `blip3o_trellis` env + transformers 4.57.6
     data_path: str = field(default="data/overfit/imgtext.jsonl")
     freeze_vlm: bool = field(default=True)
     build_slat: bool = field(default=False)   # v1: SS-only

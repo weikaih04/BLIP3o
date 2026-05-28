@@ -1,5 +1,12 @@
 # Qwen3.5-2B Native-VLM Variant — Design Doc
 
+> **DEPRECATED sections (2026-05-28)**: Phase-2 ran a Qwen3-VL-2B vs Qwen3.5-2B
+> A/B. The result picked **Qwen3.5-2B** (Option α; see memory
+> `project_qwen35_vlm_variant.md`). All Qwen3-VL-2B and Qwen2.5-VL-3B references
+> below are kept for historical context, but only Qwen3.5-2B is supported going
+> forward. Code, scripts, and tests for the deprecated backbones are commented
+> out / labeled DEPRECATED in-place.
+
 Status: **Phase-1 implemented + smoke-tested (both backbones)**. Author-facing design
 note for a new conditioning backbone variant of the TRELLIS↔BLIP3o port.
 

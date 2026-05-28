@@ -298,7 +298,7 @@ def _px_per_tok(processor) -> int:
     ps, ms = getattr(ip, "patch_size", None), getattr(ip, "merge_size", None)
     if isinstance(ps, int) and isinstance(ms, int):
         return (ps * ms) ** 2
-    return 1024  # Qwen3-VL / Qwen3.5 default
+    return 1024  # Qwen3.5 default (patch_size=16, merge_size=2 → 1024)
 
 
 def _cap_image(img: Image.Image, max_px: int) -> Image.Image:
