@@ -116,20 +116,14 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # (the env `blip3o_trellis_qwen35` we run Qwen3.5 in). DEPRECATED backbones
         # Qwen3-VL / Qwen2.5-VL still load via 4.57's older `torch_dtype` path if you
         # accept the warning.
-        # Use flash_attention_2 for the 6/24 full-attention layers of Qwen3.5-2B
-        # (the other 18/24 linear-attn layers go through FLA Gated DeltaNet and are
-        # unaffected by this flag). Fall back to sdpa if flash_attn import fails.
-        try:
-            self.vlm = AutoModelForImageTextToText.from_pretrained(
-                config.vlm_model, dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-            )
-        except (ImportError, ValueError) as _e:
-            rank0_print(f"[TrellisNativeVLM] flash_attention_2 unavailable ({_e!r}); falling back to sdpa")
-            self.vlm = AutoModelForImageTextToText.from_pretrained(
-                config.vlm_model, dtype=torch.bfloat16,
-                attn_implementation="sdpa",
-            )
+        # VLM attn: keep sdpa (safe default). Earlier attempt at flash_attention_2 here
+        # coincided with NaN-from-step-4 in the first elastic cascade run; reverting to
+        # sdpa first before re-attempting (numerical instability of flash_attn_2 on
+        # Qwen3.5-2B's 6/24 full-attn layers under bf16 + variable cond_len is suspected).
+        self.vlm = AutoModelForImageTextToText.from_pretrained(
+            config.vlm_model, dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
         if config.freeze_vlm:
             self.vlm.requires_grad_(False)
             self.vlm.eval()
@@ -420,29 +414,17 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             if self.config.build_slat:
                 self.shape_router.clear(); self.tex_router.clear()
 
-        stage_str = "  ".join(f"{k}={v:.4f}" for k, v in logs["stages"].items())
-        rank0_print(f"[loss] total={loss.detach().float().item():.4f}  {stage_str}")
-
-        # Stash fine-grained diagnostics for the NativeTrainer to read & push to wandb.
-        # HF Trainer auto-logs only `loss` total — here we expose per-stage + cond/target
-        # shapes. Keys use 3-level slash-nesting so wandb groups them into clean panels:
-        #   per_stage/* — flow losses (ss / shape / tex)
-        #   cond/*      — VLM output shape & norm
-        #   target/*    — sparse-target voxel counts (varies per-asset, signals OOM risk)
-        diag = {f"per_stage/loss_{k}": float(v) for k, v in logs["stages"].items()}
-        if cond_hidden is not None:
-            diag["cond/len"] = float(cond_hidden.shape[1])
-            with torch.no_grad():
-                diag["cond/norm_mean"] = float(cond_hidden.detach().float().norm(dim=-1).mean())
-        if cond_key_mask is not None:
-            diag["cond/valid_tokens"] = float(cond_key_mask.sum())
-        if target_ss_latent is not None and hasattr(target_ss_latent, "shape"):
-            # SS target is a dense 3D occupancy → count non-zero voxels
-            diag["target/ss_voxels"] = float((target_ss_latent != 0).sum())
-        for name, t in (("shape_slat", target_shape_slat_512), ("tex_slat", target_tex_slat_512)):
-            if t is not None and hasattr(t, "feats"):
-                diag[f"target/{name}_voxels"] = float(t.feats.shape[0])
-        self._last_diag = diag
+        # Per-stage diagnostics for wandb: the ONLY useful breakdown is the per-component
+        # flow loss (ss / shape / tex), AVERAGED across all GPUs so it matches the aggregate
+        # train/loss — NOT rank-0's single-asset value (which is pure per-sample noise).
+        # Dropped: per-step voxel counts (don't track a trend) and cond shape stats (constant).
+        stage_keys = list(logs["stages"].keys())
+        stage_vals = torch.tensor([float(logs["stages"][k]) for k in stage_keys],
+                                  device=loss.device, dtype=torch.float32)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stage_vals, op=torch.distributed.ReduceOp.AVG)
+        self._last_diag = {f"per_stage/loss_{k}": float(stage_vals[i])
+                           for i, k in enumerate(stage_keys)}
 
         # No logits (no LM head / no CE) — loss-only output for HF Trainer.
         return CausalLMOutputWithPast(loss=loss, logits=None)

@@ -87,6 +87,17 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
         # --- legacy knobs (unchanged) ---
         self.num_cond_views = getattr(data_args, "num_cond_views", 1)
 
+        # SLAT voxel-count cap — matches TRELLIS official slat_flow_*_512 config
+        # (`max_tokens: 8192`). Oversized assets blow up sparse activation memory
+        # (activation ∝ voxel count); the elastic GC controller reacts AFTER the
+        # fact and one giant outlier can still OOM or skew its linear fit. We cap
+        # at the SOURCE like TRELLIS does. 0/None disables. Only meaningful when
+        # SLAT is actually loaded (ss_only=False); SS latent is a fixed 16³ dense
+        # tensor so it's never capped. Enforced in __getitem__ by RESAMPLING a
+        # different index (drop-style, not crop — preserves voxel layout).
+        self.max_slat_tokens = int(getattr(data_args, "max_slat_tokens", 8192) or 0)
+        self._cap_resample_tries = 0  # diagnostic counter
+
         # --- unified-schema knobs ---
         mix_spec = getattr(data_args, "task_mix", None) or "T:0.2,I1:0.4,IM:0.4"
         self.task_mix = _parse_task_mix(mix_spec)
@@ -112,10 +123,33 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
     # Schema dispatch
     # ------------------------------------------------------------------
     def __getitem__(self, i):
-        rec = self.records[i]
-        if "renders_dir" in rec:
-            return self._getitem_unified(rec, i)
-        return self._getitem_legacy(rec, i)
+        # Cap SLAT voxel count by resampling oversized assets to a different index
+        # (TRELLIS official drops them at init via a precomputed token column; we
+        # don't have that column, so we drop lazily on load). Bounded retries so a
+        # pathological manifest can't loop forever — falls through to return the
+        # last (oversized) sample rather than hang.
+        n = len(self.records)
+        for attempt in range(8):
+            rec = self.records[i]
+            data = (self._getitem_unified(rec, i) if "renders_dir" in rec
+                    else self._getitem_legacy(rec, i))
+            if self.ss_only or self.max_slat_tokens <= 0:
+                return data
+            ntok = self._slat_token_count(data)
+            if ntok <= self.max_slat_tokens:
+                return data
+            # Oversized → resample a different index deterministically-ish.
+            self._cap_resample_tries += 1
+            i = (i + 1 + attempt) % n
+        return data  # gave up after retries; let it through (elastic GC will cope)
+
+    @staticmethod
+    def _slat_token_count(data: Dict[str, Any]) -> int:
+        """Voxel/token count of the loaded SLAT target (shape SLAT coords). 0 if absent."""
+        shp = data.get("target_shape_slat_512_item")
+        if isinstance(shp, dict) and "coords" in shp:
+            return int(shp["coords"].shape[0])
+        return 0
 
     # ------------------------------------------------------------------
     # Unified schema — per-call task / view / caption sampling

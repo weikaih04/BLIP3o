@@ -149,16 +149,32 @@ class NativeTrainer(Trainer):
         return m
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # HF 4.4x+ added num_items_in_batch; pass through if supported.
-        try:
-            out = super().compute_loss(model, inputs, return_outputs=True,
-                                       num_items_in_batch=num_items_in_batch)
-        except TypeError:
-            out = super().compute_loss(model, inputs, return_outputs=True)
+        # Wrap forward in each elastic SLAT controller's record() context, matching TRELLIS
+        # official trainers/basic.py:run_step. record() resets `_last_input_size` per step so
+        # variable voxel counts across assets don't trip controller's same-size assertion
+        # (without this, step 2 with a different-sized asset raises ValueError).
+        from contextlib import ExitStack
+        base = self._unwrap(model)
+        ctxs = []
+        for name in ("shape_slat_512", "tex_slat_512"):
+            m = getattr(base, name, None)
+            ctrl = getattr(m, "_memory_controller", None) if m is not None else None
+            if ctrl is not None:
+                ctxs.append(ctrl.record())
+
+        with ExitStack() as stack:
+            for ctx in ctxs:
+                stack.enter_context(ctx)
+            # HF 4.4x+ added num_items_in_batch; pass through if supported.
+            try:
+                out = super().compute_loss(model, inputs, return_outputs=True,
+                                           num_items_in_batch=num_items_in_batch)
+            except TypeError:
+                out = super().compute_loss(model, inputs, return_outputs=True)
         loss, model_out = out if isinstance(out, tuple) else (out, None)
 
         # Pull per-step diagnostics that the model stashed in forward; log on rank-0 only.
-        diag = getattr(self._unwrap(model), "_last_diag", None)
+        diag = getattr(base, "_last_diag", None)
         if diag and getattr(self.accelerator, "is_main_process", True):
             self.log({f"train/{k}": v for k, v in diag.items()})
 
@@ -194,6 +210,11 @@ class NativeArgs:
     max_views: int = field(default=4)            # IM: n_views ~ U[2, max_views]
     crop_to_object: bool = field(default=False)  # tight alpha-bbox crop on RGBA renders
     min_aesthetic: Optional[float] = field(default=None)  # init-time filter
+    # SLAT voxel cap (matches TRELLIS official slat_flow_*_512 `max_tokens: 8192`).
+    # Oversized assets are resampled to a different index in __getitem__. 0 disables.
+    # Complements (does NOT replace) elastic SLAT GC: cap bounds the worst case at the
+    # SOURCE; elastic GC handles normal voxel-count variation within the cap.
+    max_slat_tokens: int = field(default=8192)
     # ── Mixture mode (Phase-1/2 multi-task infra) ──
     # When set, replaces --data_path. Wires up MixtureIterableDataset +
     # MultiTaskCollator from yaml (see configs/mix_*.yaml). Task weights and
@@ -211,6 +232,12 @@ class NativeArgs:
     compile_ss_flow: bool = field(default=True)
     compile_mode: str = field(default="default")   # default | reduce-overhead | max-autotune
     compile_dynamic: bool = field(default=True)
+    # Elastic GC for SLAT flows — matches TRELLIS official slat_flow_*_512 training config.
+    # A LinearMemoryController dynamically chooses how many blocks to checkpoint per step
+    # so peak memory stays near target_ratio of GPU capacity. Cheaper than full GC, and
+    # required to make BS>1 SLAT 512 fit on H100 (we saw OOM at BS=1 multi-asset w/o it).
+    elastic_slat: bool = field(default=True)
+    elastic_target_ratio: float = field(default=0.75)
 
 
 def _enforce_no_offload(ds_cfg):
@@ -284,6 +311,31 @@ def main():
         print(f"[train_native] torch.compile(ss_flow): mode={native_args.compile_mode!r} "
               f"dynamic={native_args.compile_dynamic}  (SLAT flows NOT compiled)")
 
+    # Sync to TRELLIS official SLAT 512 config — register a LinearMemoryController so
+    # each SLAT forward dynamically picks how many of the 30 blocks to checkpoint based
+    # on observed memory pressure (target_ratio=0.75). Drop-in: SLatFlowModel has the
+    # same body as ElasticSLatFlowModel, just missing the elastic mixin — rebind class.
+    # NOTE: One controller PER SLAT model. Sharing one across shape+tex breaks because
+    # the controller asserts `_last_input_size` matches across calls inside one forward;
+    # shape and tex voxel counts can differ → ValueError.
+    if native_args.elastic_slat and cfg.build_slat:
+        from trellis2.models.structured_latent_flow import ElasticSLatFlowModel
+        from trellis2.utils.elastic_utils import LinearMemoryController
+        for name in ("shape_slat_512", "tex_slat_512"):
+            m = getattr(model, name, None)
+            if m is None:
+                continue
+            m.__class__ = ElasticSLatFlowModel       # add the elastic forward path
+            m._memory_controller = None              # init mixin state (we bypassed __init__)
+            controller = LinearMemoryController(
+                buffer_size=1000, update_every=500,
+                target_ratio=native_args.elastic_target_ratio,
+                max_mem_ratio_start=0.5,
+            )
+            m.register_memory_controller(controller)
+        print(f"[train_native] elastic SLAT GC ON  target_ratio={native_args.elastic_target_ratio} "
+              f"max_mem_ratio_start=0.5  (one controller per SLAT, matches TRELLIS official)")
+
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"[train_native] trainable {n_train/1e6:.1f}M / total {n_total/1e6:.1f}M  "
@@ -322,6 +374,7 @@ def main():
             slat_resolution=native_args.slat_resolution,
             crop_to_object=native_args.crop_to_object,
             min_aesthetic=native_args.min_aesthetic,
+            max_slat_tokens=native_args.max_slat_tokens,
         )
         train_ds = TR2NativeVLMDataset(
             data_path=native_args.data_path, data_args=data_args, ss_only=native_args.ss_only,
