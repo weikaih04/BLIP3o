@@ -116,9 +116,20 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # (the env `blip3o_trellis_qwen35` we run Qwen3.5 in). DEPRECATED backbones
         # Qwen3-VL / Qwen2.5-VL still load via 4.57's older `torch_dtype` path if you
         # accept the warning.
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
-            config.vlm_model, dtype=torch.bfloat16
-        )
+        # Use flash_attention_2 for the 6/24 full-attention layers of Qwen3.5-2B
+        # (the other 18/24 linear-attn layers go through FLA Gated DeltaNet and are
+        # unaffected by this flag). Fall back to sdpa if flash_attn import fails.
+        try:
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                config.vlm_model, dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+            )
+        except (ImportError, ValueError) as _e:
+            rank0_print(f"[TrellisNativeVLM] flash_attention_2 unavailable ({_e!r}); falling back to sdpa")
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                config.vlm_model, dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
         if config.freeze_vlm:
             self.vlm.requires_grad_(False)
             self.vlm.eval()
