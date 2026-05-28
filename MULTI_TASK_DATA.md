@@ -366,7 +366,7 @@ Verified by `tests/test_mixture_efficiency.py::test_gap4_num_workers_warning`.
 
 ## 6. Known gaps / future work
 
-### 6.1 Per-task batch size (DEFERRED)
+### 6.1 Per-task batch size (DEFERRED — and probably not worth doing)
 
 The HF Trainer's `--per_device_train_batch_size` is a single global value.
 With NO-OFFLOAD memory policy (see `feedback_no_offload_policy.md`), BS is
@@ -380,10 +380,23 @@ tasks:
   - {name: text_sft,          weight: 0.10, per_device_batch_size: 16}
 ```
 
-Implementing this requires inverting the data-flow contract: `IterableDataset`
-yields **pre-collated batches** as single items, HF Trainer's `batch_size=1`,
-collator becomes identity. ~30 LOC change, planned with the upcoming rename
-refactor.
+**Not common practice**: LLaVA, Qwen-VL, InternVL, LLaMA-Factory, HF Trainer
+all use a single global BS and just eat the memory waste on small-task
+batches. Per-task BS shows up in Google-internal frameworks (T5x, Pax) and a
+few RL pipelines, but is rare in open-source VLM SFT. Reasons people avoid
+it: gradient-accumulation semantics get fuzzy, LR scheduling becomes
+task-dependent, loss reporting per step becomes ambiguous, and the
+complexity tax usually exceeds the throughput payoff.
+
+Realistic gain estimate for our config: **~10-20% wall-clock** on a typical
+mix (lower than the 1.7-2× we first guessed; small tasks are step-overhead-
+bound, not per-sample-bound). Not zero, but easy to lose to debugging time
+if you implement it wrong.
+
+Implementation, if you do go that way: invert the data-flow contract.
+`IterableDataset` yields **pre-collated batches** as single items, HF
+Trainer's `batch_size=1`, collator becomes identity. ~30 LOC change.
+Recommended only if profiling shows small-task steps are a real bottleneck.
 
 ### 6.2 Cost-balanced sampling (NOT IMPLEMENTED)
 
