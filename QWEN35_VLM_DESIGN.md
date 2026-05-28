@@ -41,11 +41,11 @@ Run: `CUDA_VISIBLE_DEVICES=0 <env>/bin/python tests/test_native_vlm.py all`
   Qwen3.5-2B 0.76→0.38 (`tests/overfit_native.py`). `train_native.py` also runs clean via HF Trainer.
 
 **FULL CASCADE (SS + Shape + Tex together) trains** — `NativeTrainer._prepare_inputs` moves
-SparseTensor SLAT targets to GPU; run `train_native.py --build_slat True --ss_only False
---deepspeed configs/deepspeed_zero2_offload.json`. Verified 1×80GB: 3879.9M trainable (all 3
-flows, VLM frozen), ~7s/step CPU-Adam, all 3 losses computed each step, exit 0, no OOM.
-SS-only was a DEFAULT, not a limit: full cascade just needs CPU-offload (3.9B trainable OOMs
-no-offload — matches the "optimizer MUST be CPU-offloaded" finding) + ninja on PATH for cpu_adam.
+SparseTensor SLAT targets to GPU. **Under the repo NO-OFFLOAD policy** (see OPTIMIZATIONS.md
+§"No-offload policy"), cascade needs ≥4 GPUs with `configs/deepspeed_zero2.json`. The 1×80GB
+CPU-offload recipe used during initial verification is forbidden by `train_native.py`'s
+runtime guard (`_enforce_no_offload`). Cascade also currently has a sparse-tensor broadcast
+bug at BS>1 (see chat 2026-05-28) that needs fixing before cascade training is reliable.
 
 **GENERATION works end-to-end** — `tests/generate_native.py`: front half = native VLM
 `encode_cond` + CFG-correct `cond_and_null` (neg=connector(0)); back half IDENTICAL to the
@@ -285,8 +285,10 @@ target_shape_slat_512, target_tex_slat_512, tex_concat_cond, ...)`:
 - `blip3o/train/train.py`: delete codebook/CE freeze branches; set `self.vlm.requires_grad_(train_vlm)`;
   connector always trainable; TRELLIS flows per existing `mm_flow_crossattn/selfattn/last40` flags
   (keep that machinery — it's how SS flow gets partially unfrozen).
-- D1: VLM frozen + (recommended) not in optimizer → big memory save. D2: VLM trainable, CPU-offload
-  optimizer (per [[project_overfit_train_resources]] — 2B joint train needs offload).
+- D1: VLM frozen + (recommended) not in optimizer → big memory save. D2: VLM trainable —
+  under the repo NO-OFFLOAD policy this requires ≥2 GPUs with ZeRO-2 (no CPU offload);
+  the 1×80GB unfreeze probe (`tests/test_fla_backward.py`) measures 39 GB peak at BS=1
+  so D2 fits 1 GPU at BS=1 (340 ms/step) but BS=2 requires DDP across 2 GPUs.
 
 ### Phase 3 — data / collator (REUSE the native processor — do NOT hand-roll)
 **Principle: use `AutoProcessor.from_pretrained(vlm_model)` (`Qwen3VLProcessor` /
@@ -318,8 +320,8 @@ Thin collator:
 ### Phase 4 — scripts + overfit validation
 - `scripts/train_q3vl_D2.sh`, `scripts/train_q35_D2.sh` — byte-identical except `--vlm_model`,
   `--detach_cond false`, `--train_vlm true`.
-- **Validate on single-asset overfit FIRST** (mirror existing overfit recipe: ZeRO-2 + CPU-offload
-  optimizer, small `save_steps`). Confirm clean geometry before scaling — same bar as
+- **Validate on single-asset overfit FIRST** (mirror existing overfit recipe: ZeRO-2 NO-offload,
+  small `save_steps`). Confirm clean geometry before scaling — same bar as
   [[project_image_overfit_ss_todo]].
 
 ### Phase 5 — inference
@@ -339,7 +341,8 @@ Thin collator:
 
 ### Top risks
 1. 🔴 env / transformers (Phase 0 gate).
-2. D2 memory: 2B VLM joint-trained ⇒ CPU-offload optimizer mandatory; D1 much cheaper.
+2. D2 memory: 2B VLM joint-trained ⇒ 39 GB / GPU at BS=1 (measured); fits 1 GPU but BS=2
+   needs DDP across 2 GPUs (NO offload allowed per repo policy). D1 much cheaper.
 3. Verify `hidden_states[-1]` is the 2048-d LLM hidden (not a vision-merger output) for BOTH backbones.
 4. Processor plumbing into the collator (image_grid_thw, padding) — main new-code surface.
 

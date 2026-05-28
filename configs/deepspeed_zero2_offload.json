@@ -1,4 +1,5 @@
 {
+  "_FORBIDDEN_BY_REPO_POLICY": "This config enables CPU offload. The repo's no-offload policy refuses to load any config with `offload_optimizer.device != 'none'` or `offload_param.*` — see train_native.py guard + OPTIMIZATIONS.md. File kept for reference / external tooling only; do NOT pass via --deepspeed.",
   "fp16": {
     "enabled": "auto"
   },

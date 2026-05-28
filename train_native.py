@@ -30,6 +30,7 @@ from typing import Optional
 
 import time
 
+import torch
 import transformers
 from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
 from transformers.trainer_callback import TrainerCallback
@@ -201,10 +202,56 @@ class NativeArgs:
     mixture_config: Optional[str] = field(default=None)
     mixture_seed: int = field(default=0)
 
+    # torch.compile on the dense SS flow. -18.8% step time at ~zero quality risk on
+    # tests/profile_native_compile.py (BASELINE 234ms → 190ms; backward -30%).
+    # ONLY ss_flow is compiled: VLM has FLA-custom-triton (Dynamo breaks), SLAT flows
+    # are sparse + custom-triton + elastic-gc (Dynamo breaks). Cascade mode leaves the
+    # SLAT flows uncompiled — the SS speedup still applies. Dynamic shapes are ON so
+    # varying cond_len (single-image vs multi-image batches) doesn't recompile.
+    compile_ss_flow: bool = field(default=True)
+    compile_mode: str = field(default="default")   # default | reduce-overhead | max-autotune
+    compile_dynamic: bool = field(default=True)
+
+
+def _enforce_no_offload(ds_cfg):
+    """Repo policy: NO DeepSpeed CPU/NVMe offload. Offload masks real memory pressure
+    by trading 3-4× step time for "fits". If your config doesn't fit, scale GPUs,
+    cut batch, or freeze more — don't reach for offload. See OPTIMIZATIONS.md."""
+    import json, pathlib
+    if ds_cfg is None: return
+    # HF Trainer accepts either a path (str / Path) or an already-parsed dict.
+    if isinstance(ds_cfg, (str, pathlib.Path)):
+        try:
+            with open(ds_cfg) as f: cfg_dict = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"--deepspeed config unreadable: {ds_cfg}: {e}")
+    elif isinstance(ds_cfg, dict):
+        cfg_dict = ds_cfg
+    else:
+        return
+    zo = (cfg_dict.get("zero_optimization") or {})
+    off_opt = zo.get("offload_optimizer") or {}
+    off_par = zo.get("offload_param") or {}
+    bad = []
+    if isinstance(off_opt, dict) and str(off_opt.get("device", "none")).lower() != "none":
+        bad.append(f"offload_optimizer.device={off_opt.get('device')!r}")
+    if isinstance(off_par, dict) and str(off_par.get("device", "none")).lower() != "none":
+        bad.append(f"offload_param.device={off_par.get('device')!r}")
+    if bad:
+        raise RuntimeError(
+            "REPO POLICY: NO OFFLOAD. The DeepSpeed config you passed enables: "
+            f"{', '.join(bad)}. Offload trades 3-4× step time for 'fits' and "
+            "masks real memory pressure. Use configs/deepspeed_zero2.json (no "
+            "offload) and scale GPUs / cut batch / freeze more if it OOMs. "
+            "See OPTIMIZATIONS.md §'No-offload policy'."
+        )
+
 
 def main():
     parser = HfArgumentParser((NativeArgs, TrainingArguments))
     native_args, training_args = parser.parse_args_into_dataclasses()
+    # Enforce the no-offload policy BEFORE any deepspeed init happens.
+    _enforce_no_offload(getattr(training_args, "deepspeed", None))
     # The dataset emits non-forward columns (caption/images/...); Trainer must NOT
     # strip them before the collator runs.
     training_args.remove_unused_columns = False
@@ -223,6 +270,19 @@ def main():
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)
     print(f"[train_native] flow_tune={native_args.flow_tune!r}")
+
+    # torch.compile must come AFTER _apply_flow_freeze (so Dynamo sees the final
+    # requires_grad layout) and BEFORE Trainer wraps the model with DeepSpeed/FSDP.
+    # SLAT flows are deliberately skipped — sparse + custom triton breaks Dynamo.
+    if native_args.compile_ss_flow:
+        model.ss_flow = torch.compile(
+            model.ss_flow,
+            mode=native_args.compile_mode,
+            dynamic=native_args.compile_dynamic,
+            fullgraph=False,   # cross_attn cond_mask path has data-dep branches
+        )
+        print(f"[train_native] torch.compile(ss_flow): mode={native_args.compile_mode!r} "
+              f"dynamic={native_args.compile_dynamic}  (SLAT flows NOT compiled)")
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
