@@ -414,17 +414,13 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             if self.config.build_slat:
                 self.shape_router.clear(); self.tex_router.clear()
 
-        # Per-stage diagnostics for wandb: the ONLY useful breakdown is the per-component
-        # flow loss (ss / shape / tex), AVERAGED across all GPUs so it matches the aggregate
-        # train/loss — NOT rank-0's single-asset value (which is pure per-sample noise).
-        # Dropped: per-step voxel counts (don't track a trend) and cond shape stats (constant).
-        stage_keys = list(logs["stages"].keys())
-        stage_vals = torch.tensor([float(logs["stages"][k]) for k in stage_keys],
-                                  device=loss.device, dtype=torch.float32)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(stage_vals, op=torch.distributed.ReduceOp.AVG)
-        self._last_diag = {f"per_stage/loss_{k}": float(stage_vals[i])
-                           for i, k in enumerate(stage_keys)}
+        # Stash THIS rank's per-component flow loss (ss / shape / tex) for this step. The
+        # NativeTrainer accumulates these over the logging window and all-reduces across GPUs
+        # at log() time, so wandb's per_stage/* matches train/loss exactly (same window-mean,
+        # same cross-GPU mean) instead of being a single rank-0 sample. Nothing else logged
+        # per-step (dropped voxel counts / cond-shape stats — no trend, just noise).
+        self._last_diag = {f"per_stage/loss_{k}": float(logs["stages"][k])
+                           for k in logs["stages"]}
 
         # No logits (no LM head / no CE) — loss-only output for HF Trainer.
         return CausalLMOutputWithPast(loss=loss, logits=None)

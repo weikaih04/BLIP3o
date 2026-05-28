@@ -23,6 +23,7 @@ Multi-GPU: torchrun --nproc_per_node=N train_native.py ... --deepspeed configs/d
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -34,6 +35,57 @@ import torch
 import transformers
 from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
 from transformers.trainer_callback import TrainerCallback
+
+
+class EMACallback(TrainerCallback):
+    """Exponential moving average of the TRAINABLE weights — matches TRELLIS official
+    (ema_rate=0.9999; the released TRELLIS ckpts ARE EMA weights, and they SAMPLE from EMA).
+    For multi-asset training EMA is the big lever: it averages out the per-batch gradient
+    swing across diverse shapes, which raw weights at low step counts can't (→ collapsed geom).
+
+    Saves the EMA shadow as a SEPARATE `ema.safetensors` per checkpoint (rank-0 only) instead
+    of swapping params at save time — far less fragile under DeepSpeed's consolidated save.
+    Inference overlays it on the base state dict (see tests/test_native_infer.py USE_EMA)."""
+
+    def __init__(self, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = None      # {param_name: fp32 tensor on device}
+        self._base = None
+
+    @staticmethod
+    def _unwrap(m):
+        for _ in range(4):
+            inner = getattr(m, "module", None)
+            if inner is None:
+                break
+            m = inner
+        return m
+
+    def _trainable(self):
+        return [(n, p) for n, p in self._base.named_parameters() if p.requires_grad]
+
+    def on_train_begin(self, args, state, control, model=None, **kw):
+        self._base = self._unwrap(model)
+        self.shadow = {n: p.detach().clone().float() for n, p in self._trainable()}
+        print(f"[EMA] tracking {len(self.shadow)} trainable tensors, decay={self.decay}")
+
+    def on_step_end(self, args, state, control, model=None, **kw):
+        if self.shadow is None:
+            return
+        d = self.decay
+        with torch.no_grad():
+            for n, p in self._trainable():
+                self.shadow[n].mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+
+    def on_save(self, args, state, control, **kw):
+        if self.shadow is None or not state.is_world_process_zero:
+            return
+        from safetensors.torch import save_file
+        ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.isdir(ckpt):
+            save_file({k: v.detach().cpu() for k, v in self.shadow.items()},
+                      os.path.join(ckpt, "ema.safetensors"))
+            print(f"[EMA] wrote ema.safetensors → {ckpt}")
 
 import trellis2_blip3o._paths  # noqa: F401
 from trellis2_blip3o.dataset_native import TR2NativeVLMDataset, NativeVLMCollator
@@ -155,12 +207,38 @@ class NativeTrainer(Trainer):
                 out = super().compute_loss(model, inputs, return_outputs=True)
         loss, model_out = out if isinstance(out, tuple) else (out, None)
 
-        # Pull per-step diagnostics that the model stashed in forward; log on rank-0 only.
+        # Accumulate THIS rank's per-stage flow losses over the logging window. We do NOT
+        # self.log() here (that logs at a wandb step behind Trainer's own logging step → wandb
+        # drops it). Instead log() below reduces the window + all-GPUs and merges into the same
+        # log call as train/loss, so per_stage/* shares train/loss's window-mean + cross-GPU
+        # mean semantics exactly (not a single rank-0 sample).
         diag = getattr(base, "_last_diag", None)
-        if diag and getattr(self.accelerator, "is_main_process", True):
-            self.log({f"train/{k}": v for k, v in diag.items()})
+        if diag:
+            if not hasattr(self, "_stage_sum"):
+                self._stage_sum, self._stage_n = {}, 0
+            for k, v in diag.items():
+                self._stage_sum[k] = self._stage_sum.get(k, 0.0) + v
+            self._stage_n += 1
 
         return (loss, model_out) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        # Merge windowed, cross-GPU-averaged per-stage losses into the train-loss log call so
+        # they ride the SAME monotonic wandb step (no drops) and match train/loss semantics.
+        if getattr(self, "_stage_n", 0) > 0 and "loss" in logs:
+            keys = sorted(self._stage_sum)
+            vec = torch.tensor([self._stage_sum[k] for k in keys],
+                               dtype=torch.float32, device=self.args.device)
+            n = self._stage_n
+            world = 1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(vec, op=torch.distributed.ReduceOp.SUM)
+                world = torch.distributed.get_world_size()
+            vec = vec / (n * world)   # mean over (window steps × GPUs), matching train/loss
+            for i, k in enumerate(keys):
+                logs.setdefault(k, float(vec[i]))
+            self._stage_sum, self._stage_n = {}, 0
+        return super().log(logs, *args, **kwargs)
 
 
 @dataclass
@@ -197,6 +275,9 @@ class NativeArgs:
     # Complements (does NOT replace) elastic SLAT GC: cap bounds the worst case at the
     # SOURCE; elastic GC handles normal voxel-count variation within the cap.
     max_slat_tokens: int = field(default=8192)
+    # EMA of trainable weights (TRELLIS official ema_rate=0.9999). 0 disables. Saved as a
+    # separate ema.safetensors per checkpoint; inference overlays it (USE_EMA=1).
+    ema_decay: float = field(default=0.9999)
     # ── Mixture mode (Phase-1/2 multi-task infra) ──
     # When set, replaces --data_path. Wires up MixtureIterableDataset +
     # MultiTaskCollator from yaml (see configs/mix_*.yaml). Task weights and
@@ -347,6 +428,16 @@ def main():
                 "--mixture_config uses IterableDataset; --max_steps must be set "
                 "(epoch-based training is not meaningful in mixture mode)."
             )
+        # CRITICAL: each rank must iterate its OWN dataloader. MixtureIterableDataset
+        # is already rank-aware (rank-synced task choice + per-rank within-task index),
+        # so accelerate must NOT dispatch-from-rank0-and-broadcast. Besides defeating
+        # the per-rank data-parallel sampling, broadcasting the batch fails outright on
+        # the `_task` str field (accelerate's _gpu_broadcast_one only handles tensors).
+        try:
+            training_args.accelerator_config.dispatch_batches = False
+        except Exception:
+            # Older HF: the flag lives directly on TrainingArguments.
+            training_args.dispatch_batches = False
     else:
         data_args = SimpleNamespace(
             use_codebook=False, num_views=1,
@@ -363,12 +454,15 @@ def main():
         )
         collator = NativeVLMCollator(processor=processor)
 
+    callbacks = [WandbFineGrainedCallback()]
+    if native_args.ema_decay and native_args.ema_decay > 0:
+        callbacks.append(EMACallback(decay=native_args.ema_decay))
     trainer = NativeTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         data_collator=collator,
-        callbacks=[WandbFineGrainedCallback()],
+        callbacks=callbacks,
     )
     trainer.train(resume_from_checkpoint=bool(list(__import__("pathlib").Path(training_args.output_dir).glob("checkpoint-*"))) or None)
     trainer.save_state()
