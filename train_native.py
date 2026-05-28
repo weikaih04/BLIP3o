@@ -43,13 +43,10 @@ from blip3o.model.language_model.trellis_native_vlm import (
 
 
 class WandbFineGrainedCallback(TrainerCallback):
-    """Configure wandb panels at train start + emit per-step wall-clock to wandb.
-
-    - `define_metric` tells wandb how to aggregate each metric in the run-summary table
-      (min for losses, max for cond_len/voxels, last for grad_norm/lr). Without this every
-      summary defaults to "last" which is noisy for fluctuating per-stage losses.
-    - `time/step_sec` lets us see throughput trends + correlate spikes with voxel counts.
-    """
+    """Set wandb run-summary aggregation for the metrics we log: train/loss and the per-stage
+    flow losses use `min` (best-so-far), lr/grad_norm use `last`. Everything goes through
+    Trainer.log() on the main step (see NativeTrainer.log), so we do NOT call wandb.log()
+    here — a separate per-step wandb.log() with its own step caused monotonic-step drops."""
 
     def on_train_begin(self, args, state, control, **kwargs):
         try:
@@ -58,25 +55,10 @@ class WandbFineGrainedCallback(TrainerCallback):
                 return
             wandb.define_metric("train/loss", summary="min")
             wandb.define_metric("train/per_stage/*", summary="min")
-            wandb.define_metric("train/cond/*", summary="mean")
-            wandb.define_metric("train/target/*", summary="max")
             wandb.define_metric("train/grad_norm", summary="last")
             wandb.define_metric("train/learning_rate", summary="last")
-            wandb.define_metric("train/time/step_sec", summary="mean")
         except Exception as e:
             print(f"[WandbFineGrainedCallback] define_metric skipped: {e}")
-        self._t = time.time()
-
-    def on_step_end(self, args, state, control, **kwargs):
-        try:
-            import wandb
-            if wandb.run is None:
-                return
-            now = time.time()
-            wandb.log({"train/time/step_sec": now - self._t}, step=state.global_step, commit=False)
-            self._t = now
-        except Exception:
-            pass
 
 
 def _apply_flow_freeze(model, mode: str):
