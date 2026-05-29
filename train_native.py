@@ -252,6 +252,10 @@ class NativeArgs:
     build_slat: bool = field(default=False)   # v1: SS-only
     ss_only: bool = field(default=True)
     num_cond_views: int = field(default=1)    # legacy schema only (multi_view_renders[:N])
+    # Randomly sample the cond view(s) per step from the asset's 16 renders (TRELLIS-style
+    # viewpoint augmentation → view-robust). Default True for training; inference scripts
+    # build the dataset without this so they stay deterministic on view 000.
+    random_cond_view: bool = field(default=True)
     flow_weight: float = field(default=1.0)
     detach_cond: bool = field(default=False)
     cond_max_length: int = field(default=8192)
@@ -442,6 +446,7 @@ def main():
         data_args = SimpleNamespace(
             use_codebook=False, num_views=1,
             num_cond_views=native_args.num_cond_views,           # legacy
+            random_cond_view=native_args.random_cond_view,       # viewpoint augmentation
             task_mix=native_args.task_mix,                       # unified
             max_views=native_args.max_views,
             slat_resolution=native_args.slat_resolution,

@@ -86,6 +86,11 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
 
         # --- legacy knobs (unchanged) ---
         self.num_cond_views = getattr(data_args, "num_cond_views", 1)
+        # View sampling: TRELLIS official randomly samples a cond view per step (viewpoint
+        # augmentation → view-robust model). When True, _getitem_legacy draws num_cond_views
+        # random views from the asset's 16 renders instead of always views[:N] (000.png).
+        # Training sets this True; inference leaves it False (deterministic view 000).
+        self.random_cond_view = bool(getattr(data_args, "random_cond_view", False))
 
         # SLAT voxel-count cap — matches TRELLIS official slat_flow_*_512 config
         # (`max_tokens: 8192`). Oversized assets blow up sparse activation memory
@@ -249,7 +254,12 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
         images: List[Image.Image] = []
         if rtype == "I_2_3D" and "image" in rec:
             views = rec.get("multi_view_renders") or [rec["image"]]
-            for p in views[: self.num_cond_views]:
+            if self.random_cond_view and len(views) > self.num_cond_views:
+                import random
+                chosen = random.sample(views, self.num_cond_views)   # viewpoint augmentation
+            else:
+                chosen = views[: self.num_cond_views]                # deterministic (view 000)
+            for p in chosen:
                 images.append(Image.open(p).convert("RGB"))
 
         data: Dict[str, Any] = {
