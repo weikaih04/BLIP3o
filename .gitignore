@@ -17,3 +17,10 @@ wandb/
 # Local env
 .env
 .vscode/
+
+_diag
+
+data_viewer/
+
+
+tests/

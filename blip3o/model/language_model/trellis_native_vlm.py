@@ -61,10 +61,30 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         detach_cond: bool = False,            # frozen ⇒ detach moot; kept for parity
         cond_max_length: int = 8192,
         mask_drop_prob: float = 0.1,
+        anchor_drop_prob: float = 0.0,        # v2: prob to drop ANCHOR-only (keep Qwen) on image tasks → forces Qwen learning (text→3D)
+        cfg_joint_drop_prob: float = 0.0,     # v2: prob to JOINT-drop anchor+Qwen (clean uncond) → TRELLIS-aligned CFG (image seed-stability)
         cond_fusion: str = "none",            # "none" (hidden[-1]) | "penultimate" ([-2]) | "depthwise"
         fusion_layers: int = 0,               # depthwise: # of VLM layer outputs to fuse (0 = all)
         flow_weight: float = 1.0,
         flow_stage_weights: str = "ss=1.0,shape_slat_512=1.0,tex_slat_512=1.0",
+        # DINOv3 conditioning alignment (REPA-inspired; see DINO_ALIGNMENT_DESIGN.md).
+        # OFF by default → does not affect existing runs. Image tasks only.
+        dino_align: bool = False,
+        dino_align_weight: float = 0.5,         # λ; REPA default, robust 0.25–1.0
+        dino_align_mode: str = "spatial",       # "spatial" (patch-wise) | "pooled"
+        dino_image_token_id: int = 248056,      # Qwen3.5 <|image_pad|>
+        dino_merge_size: int = 2,               # Qwen3.5 vision merge_size
+        # Dual-branch conditioning (Know3D-style additive; see DUAL_COND_DESIGN.md). When ON,
+        # the original TRELLIS DINOv3 cross-attn is kept as a geometry anchor (fed real DINOv3
+        # features) and a parallel zero-init-gated Qwen cross-attn is added. Replaces the
+        # dino_align crutch. OFF by default → existing runs unaffected.
+        dual_cond: bool = False,
+        dual_cond_max_views: int = 8,           # per-view embedding table size (multi-image)
+        dual_slat_qwen_stride: int = 2,         # Qwen branch on every-Nth SLAT block (2=half, fits 512)
+        dual_qwen_last_frac: float = 0.0,       # >0: inject Qwen ONLY on last frac of blocks (0.2=last20%); overrides stride, fits 16-GPU
+        dual_anchor_pool: int = 1,              # fixed avg-pool DINOv3 anchor grid by N (2=32×32→16×16)
+        dual_anchor_token_budget: int = 0,      # >0: adaptive — cap TOTAL anchor tokens (bounds worst-case)
+        dual_ss_checkpoint: bool = False,       # gradient-checkpoint the WHOLE SS block (not just dual) — SS isn't covered by elastic SLAT GC; needs compile OFF
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
         flow_sigma_min: float = 1e-5,
@@ -83,10 +103,24 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.detach_cond = detach_cond
         self.cond_max_length = cond_max_length
         self.mask_drop_prob = mask_drop_prob
+        self.anchor_drop_prob = anchor_drop_prob
+        self.cfg_joint_drop_prob = cfg_joint_drop_prob
         self.cond_fusion = cond_fusion
         self.fusion_layers = fusion_layers
         self.flow_weight = flow_weight
         self.flow_stage_weights = flow_stage_weights
+        self.dino_align = dino_align
+        self.dino_align_weight = dino_align_weight
+        self.dino_align_mode = dino_align_mode
+        self.dino_image_token_id = dino_image_token_id
+        self.dino_merge_size = dino_merge_size
+        self.dual_cond = dual_cond
+        self.dual_cond_max_views = dual_cond_max_views
+        self.dual_slat_qwen_stride = dual_slat_qwen_stride
+        self.dual_qwen_last_frac = dual_qwen_last_frac
+        self.dual_anchor_pool = dual_anchor_pool
+        self.dual_anchor_token_budget = dual_anchor_token_budget
+        self.dual_ss_checkpoint = dual_ss_checkpoint
         self.logitnorm_mean = logitnorm_mean
         self.logitnorm_std = logitnorm_std
         self.flow_sigma_min = flow_sigma_min
@@ -165,6 +199,71 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             vlm_hidden_dim=config.vlm_hidden_size,
             trellis_cond_dim=TRELLIS_COND_DIM,
         )
+
+        # --- DINOv3 conditioning aligner (REPA-inspired; image tasks only) ---
+        # Frozen DINOv3 + train-only projection head. OFF unless config.dino_align.
+        self.dino_aligner = None
+        if getattr(config, "dino_align", False):
+            from trellis2_blip3o.dino_align import DinoAligner
+            self.dino_aligner = DinoAligner(
+                cond_dim=TRELLIS_COND_DIM, mode=getattr(config, "dino_align_mode", "spatial"),
+            )
+
+        # --- dual-branch conditioning (Know3D-style; see DUAL_COND_DESIGN.md) ---
+        # Keep the original TRELLIS DINOv3 cross-attn as a geometry ANCHOR (fed real DINOv3
+        # features) + add a parallel zero-init-gated Qwen cross-attn per block. SS flow (dense)
+        # only for now; SLAT (sparse) is TODO. Mutually exclusive with depthwise routing.
+        self.dual_router = None
+        if getattr(config, "dual_cond", False):
+            from trellis2_blip3o.dual_cond import DualCondRouter, install_dual_routing
+            from trellis2_blip3o.dino_align import TRELLIS_DINOV3_NAME, DINOV3_IMAGE_SIZE
+            from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor  # type: ignore
+            self.dual_router = DualCondRouter(
+                max_views=int(config.dual_cond_max_views),
+                anchor_pool=int(getattr(config, "dual_anchor_pool", 1)),
+                anchor_token_budget=int(getattr(config, "dual_anchor_token_budget", 0)),
+            )
+            # SS: Qwen on every block (cheap, dense). SLAT: Qwen on every-other block
+            # (qwen_stride=2) — the SLAT Qwen cross-attn is the heavy part (doubles SLAT activation
+            # ~+19GB at 512); halving it keeps dual under the ~28GB headroom. anchor (DINOv3) is on
+            # ALL blocks regardless. stride configurable via dual_slat_qwen_stride.
+            _slat_stride = int(getattr(config, "dual_slat_qwen_stride", 2))
+            # PREFERRED: inject Qwen only on the last `dual_qwen_last_frac` fraction of EACH flow's
+            # blocks (e.g. 0.2 → last 20%). Aligns the heavy Qwen branch with the trainable tail
+            # (flow_tune last15/20) and cuts dual's +9.5GB by ~80% → fits 16-GPU/2-node. Applies
+            # uniformly to SS + both SLAT flows; overrides stride when >0.
+            _qlf = float(getattr(config, "dual_qwen_last_frac", 0.0))
+            install_dual_routing(self.ss_flow, self.dual_router, qwen_stride=1, qwen_last_frac=_qlf)
+            if config.build_slat:   # SLAT flows (sparse) share the same router (same H_dino/H_qwen)
+                install_dual_routing(self.shape_slat_512, self.dual_router, qwen_stride=_slat_stride, qwen_last_frac=_qlf)
+                install_dual_routing(self.tex_slat_512, self.dual_router, qwen_stride=_slat_stride, qwen_last_frac=_qlf)
+            if getattr(config, "dual_ss_checkpoint", False):
+                # gradient-checkpoint the WHOLE SS block (the elastic SLAT GC doesn't cover SS,
+                # which is otherwise compiled & fully live). Each block is now a DualCondInjectBlock
+                # wrapper; set its inner block's use_checkpoint. (Needs compile OFF to take effect.)
+                for b in self.ss_flow.blocks:
+                    inner = getattr(b, "block", b)
+                    if hasattr(inner, "use_checkpoint"):
+                        inner.use_checkpoint = True
+                rank0_print("[dual_cond] SS block gradient-checkpointing ON (whole block, not just dual branch)")
+            # Frozen DINOv3 (raw features = the anchor cond). Non-child plain object so it stays
+            # off the state_dict / DeepSpeed param partitioning (inference-only), like dino_align.
+            _dino = DinoV3FeatureExtractor(TRELLIS_DINOV3_NAME, image_size=DINOV3_IMAGE_SIZE)
+            _dino.model.eval()
+            for p in _dino.model.parameters():
+                p.requires_grad_(False)
+            # bf16: halves the frozen DINOv3 weights (~0.6GB) AND its forward activations. Safe —
+            # the earlier fp32-forcing (dino_align) was to avoid a bf16-input vs fp32-weight conv
+            # MISMATCH under autocast; making BOTH bf16 (weights here + input cast in _build_dino_anchor)
+            # + autocast OFF is consistent. Frozen inference-only → no training-instability concern.
+            _dino.model.to(torch.bfloat16)
+            object.__setattr__(self, "_dino_extractor", _dino)
+            _nb = len(self.ss_flow.blocks) + (
+                len(self.shape_slat_512.blocks) + len(self.tex_slat_512.blocks)
+                if config.build_slat else 0)
+            rank0_print(f"[dual_cond] anchor ON: DINOv3 cross-attn (frozen) + scalar-gated Qwen "
+                        f"branch on {'SS+SLAT' if config.build_slat else 'SS'} ({_nb} blocks total); "
+                        f"per-view embed ≤{config.dual_cond_max_views}")
 
         # --- per-stage flow loss fns (shared helper) ---
         self._loss_fn_ss, self._loss_fn_slat = flow_heads.build_flow_loss_fns(config)
@@ -291,6 +390,36 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
     # side wiring needed.
     _LM_TASKS = {"vqa", "grounding", "text_sft"}
 
+    def _build_dino_anchor(self, dino_images, B: int, dtype, device) -> torch.Tensor:
+        """Dual-branch DINOv3 anchor cond (B, N_anchor, 1024).
+
+        - text (no dino_images): a single zero token → the original cross-attn runs its
+          unconditional path; the Qwen branch carries everything.
+        - image / multi-image: run the frozen DINOv3 on the V conditioning views (dino_images
+          is flat (B*V,3,512,512) in cond-view order), reshape to per-view (B,N,1024), add the
+          learned per-view embedding, concat along tokens. Raw DINOv3 features (full token set,
+          incl. CLS/register) — exactly what the pretrained TRELLIS cross-attn was trained on.
+        """
+        DINO_DIM = 1024
+        if dino_images is None or dino_images.numel() == 0:
+            return torch.zeros(B, 1, DINO_DIM, dtype=dtype, device=device)
+        ext = self._dino_extractor
+        w = ext.model.embeddings.patch_embeddings.weight
+        if w.device != dino_images.device:           # lazy move (non-child object)
+            ext.model.to(dino_images.device)
+            w = ext.model.embeddings.patch_embeddings.weight
+        # frozen DINOv3 in its own dtype, autocast OFF (conv dtype safety — see dino_align).
+        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
+            feats = ext(dino_images.to(device=w.device, dtype=w.dtype))   # (B*V, N, 1024) fp32
+        M, N, _ = feats.shape
+        V = max(1, M // B)
+        feats = feats.reshape(B, V, N, -1)
+        per_view = [feats[:, v] for v in range(V)]   # V × (B, N, 1024)
+        # build_dino_anchor adds the TRAINABLE per-view embedding → keep OUTSIDE no_grad so it
+        # receives gradient (DINOv3 features are frozen constants; view_embed is the variable).
+        anchor = self.dual_router.build_dino_anchor(per_view)            # (B, V*N, 1024)
+        return anchor.to(dtype=dtype, device=device)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -304,9 +433,15 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         target_shape_slat_512: Optional[Any] = None,
         target_tex_slat_512: Optional[Any] = None,
         tex_concat_cond: Optional[Any] = None,
+        # DINOv3 alignment renders (collator emits when images present; aligner-gated)
+        dino_images: Optional[torch.Tensor] = None,
         # cached-cond fast path (deferred feature; v1 leaves these None → run VLM)
         cond_hidden: Optional[torch.Tensor] = None,
         cond_key_mask: Optional[torch.Tensor] = None,
+        # cond_keep_mask (collator): True = real CONTENT token (caption/image_pad); False = chat-
+        # template boilerplate (im_start/im_end/vision_*/role/think). ANDed into cond_key_mask so
+        # the flow cross-attn ignores boilerplate → cleaner cond (esp. text→3D).
+        cond_keep_mask: Optional[torch.Tensor] = None,
         # LM-task path (vqa / grounding / text_sft): CE loss on `labels`
         labels: Optional[torch.LongTensor] = None,
         # Task router stamp from MultiTaskCollator. None / "*_to_3d" → flow path.
@@ -388,6 +523,52 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 video_grid_thw=video_grid_thw,
             )
 
+        # drop chat-template boilerplate from the flow cond (keep caption + image patches only)
+        if cond_keep_mask is not None and cond_key_mask is not None:
+            cond_key_mask = cond_key_mask & cond_keep_mask.to(cond_key_mask.device, torch.bool)
+
+        # 1b. dual-branch: build the DINOv3 anchor (image/multi-image) or a null token (text)
+        # and stash it on the router so each SS block's ORIGINAL cross-attn gets DINOv3 while
+        # the cascade's connector(cond) rides through as the Qwen branch (see dual_cond.py).
+        if self.dual_router is not None:
+            anchor = self._build_dino_anchor(
+                dino_images, B=cond_hidden.shape[0],
+                dtype=cond_hidden.dtype, device=cond_hidden.device,
+            )
+            # v2 COORDINATED dual-cond CFG dropout (TRELLIS uses p_uncond=0.1; we have two conds
+            # so we sample ONE mode per step, homogeneous batch). Modes (image/multi-image task):
+            #   • JOINT drop  (prob cfg_joint_drop_prob): anchor→null AND qwen→null (mask_drop=1)
+            #       = clean unconditional → TRELLIS-aligned CFG (fixes image seed-variance).
+            #   • ANCHOR-only (prob anchor_drop_prob): anchor→null, qwen kept → forces the Qwen
+            #       branch to learn (fixes gate≈0 → text→3D).
+            #   • else: both on (normal conditioning).
+            # Text task (anchor already null): JOINT prob → drop qwen (its CFG uncond), else on.
+            # mask_drop=1.0 → mask_drop() zeros cond_hidden → connector(0) == the null_cond_like
+            # the inference CFG negative uses (consistent). Training-only.
+            if self.training:
+                _pj = float(getattr(self.config, "cfg_joint_drop_prob", 0.0))
+                _pa = float(getattr(self.config, "anchor_drop_prob", 0.0))
+                _is_img = dino_images is not None and dino_images.numel() > 0
+                _u = float(torch.rand(()))
+                if _is_img:
+                    if _u < _pj:                      # joint uncond
+                        anchor = torch.zeros(anchor.shape[0], 1, anchor.shape[-1],
+                                             dtype=anchor.dtype, device=anchor.device)
+                        _mask_drop = 1.0
+                    elif _u < _pj + _pa:              # anchor-only → force Qwen
+                        anchor = torch.zeros(anchor.shape[0], 1, anchor.shape[-1],
+                                             dtype=anchor.dtype, device=anchor.device)
+                        _mask_drop = 0.0
+                    else:                             # both on
+                        _mask_drop = 0.0
+                else:                                 # text: anchor already null
+                    _mask_drop = 1.0 if _u < _pj else 0.0
+            # text task (no image → null anchor): the Qwen branch is the SOLE cond, so blocks
+            # bypass the gate (gate=1). Keyed on dino_images, NOT on whether the anchor was
+            # CFG-dropped — an image task with a dropped anchor still uses the learned gate.
+            self.dual_router._text_mode = not (dino_images is not None and dino_images.numel() > 0)
+            self.dual_router.set_dino(anchor)
+
         # 2. cond → connector → 3-stage TRELLIS cascade flow loss (shared helper).
         loss, logs = flow_heads.compute_cascade_flow_loss(
             connector=self.diffusion_connector,
@@ -413,6 +594,33 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             self.ss_router.clear()
             if self.config.build_slat:
                 self.shape_router.clear(); self.tex_router.clear()
+        if self.dual_router is not None:   # release stashed DINOv3 anchor
+            self.dual_router.clear()
+
+        # 2b. DINOv3 conditioning alignment (REPA-inspired aux loss; image tasks only).
+        # Distill DINOv3(render) into the connector via a train-only projection head,
+        # so the frozen flow cross-attn gets in-distribution cond. text→3D has no
+        # image_pad tokens → the aligner returns 0 (pure flow gradient there). See
+        # DINO_ALIGNMENT_DESIGN.md.
+        # IMPORTANT: call the aligner on EVERY step when enabled — do NOT gate on
+        # `dino_images is not None`. The aligner internally returns _zero_touch (a
+        # 0-loss that still routes connector→head.forward) when there are no images.
+        # If we gated on dino_images, text steps would skip the dino path entirely →
+        # the head + dino-connector path leave the autograd graph → the graph STRUCTURE
+        # changes between image and text steps → DeepSpeed ZeRO-2 deadlocks at the
+        # gradient reduction on the image↔text transition (reproduced locally: image-only
+        # OK, text-only OK, MIXED hangs at step 2). Always-call keeps the graph consistent.
+        align_val = 0.0
+        if getattr(self, "dino_aligner", None) is not None and input_ids is not None:
+            cond_clean = self.diffusion_connector(cond_hidden)   # no mask_drop for alignment
+            L_align = self.dino_aligner(
+                cond=cond_clean, input_ids=input_ids,
+                image_grid_thw=image_grid_thw, dino_images=dino_images,  # may be None → _zero_touch
+                image_token_id=self.config.dino_image_token_id,
+                merge_size=self.config.dino_merge_size,
+            )
+            loss = loss + self.config.dino_align_weight * L_align
+            align_val = float(L_align.detach())
 
         # Stash THIS rank's per-component flow loss (ss / shape / tex) for this step. The
         # NativeTrainer accumulates these over the logging window and all-reduces across GPUs
@@ -421,6 +629,17 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # per-step (dropped voxel counts / cond-shape stats — no trend, just noise).
         self._last_diag = {f"per_stage/loss_{k}": float(logs["stages"][k])
                            for k in logs["stages"]}
+        if getattr(self, "dino_aligner", None) is not None:
+            self._last_diag["dino/align_loss"] = align_val
+        if self.dual_router is not None:
+            # mean |gate| across all dual-wrapped blocks (SS + SLAT) — anchor-lean diagnostic. Each
+            # block's gate is a scalar strength (0 at init; grows as the Qwen branch learns). Compare
+            # image vs text steps: low on image = leaning on the DINOv3 anchor; high on text = Qwen carries it.
+            flows = [self.ss_flow]
+            if self.config.build_slat:
+                flows += [self.shape_slat_512, self.tex_slat_512]
+            gates = [abs(getattr(b, "_last_gate", 0.0)) for f in flows for b in f.blocks]
+            self._last_diag["dual/gate_abs"] = float(sum(gates) / max(1, len(gates)))
 
         # No logits (no LM head / no CE) — loss-only output for HF Trainer.
         return CausalLMOutputWithPast(loss=loss, logits=None)

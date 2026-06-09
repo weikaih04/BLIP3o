@@ -71,6 +71,9 @@ class _ThreeDTaskBase(Dataset):
         min_aesthetic: Optional[float] = None,
         require_caption: Optional[bool] = None,   # default: True for T, False else
         ss_only: bool = False,
+        max_slat_tokens: int = 8192,   # cap shape/pbr voxel count (TRELLIS max_tokens=8192);
+                                        # oversized assets blow sparse activation memory → OOM.
+                                        # 0 disables. Enforced in _load_one by resampling.
     ):
         super().__init__()
         self.manifest_path = manifest
@@ -78,6 +81,7 @@ class _ThreeDTaskBase(Dataset):
         self.crop_to_object = bool(crop_to_object)
         self.max_views = int(max_views)
         self.ss_only = bool(ss_only)
+        self.max_slat_tokens = int(max_slat_tokens or 0)
         if require_caption is None:
             require_caption = (self.mode == "T")
         self.require_caption = bool(require_caption)
@@ -190,6 +194,14 @@ class _ThreeDTaskBase(Dataset):
         return {"x_0": pbr_z, "concat_cond": shape_z}
 
     # --- image loading + optional alpha crop ---
+    # Qwen's smart_resize divides by zero on a degenerate (0- or 1-px) image
+    # dimension, and crashes in the COLLATOR (processor), AFTER __getitem__'s
+    # resample guard — so a tiny/empty alpha crop would kill the whole run.
+    # We enforce a minimum image size here so the processor never sees a
+    # degenerate image. (Real culprit: assets whose render has a 1-px / empty
+    # alpha region → alpha-crop → 0×0 or 1×1.)
+    MIN_IMG_PX = 64
+
     def _load_views(self, renders_dir: str, view_ids: Sequence[int]) -> List[Image.Image]:
         out = []
         for v in view_ids:
@@ -204,7 +216,16 @@ class _ThreeDTaskBase(Dataset):
             img = Image.open(path)
             if self.crop_to_object and img.mode == "RGBA":
                 img = self._alpha_crop(img)
-            out.append(img.convert("RGB"))
+            img = img.convert("RGB")
+            # Safety: upscale any degenerate / tiny image to a processor-safe size
+            # (smart_resize needs ≥ one patch; a 1×1 crop → div-by-zero).
+            w, h = img.size
+            if w < self.MIN_IMG_PX or h < self.MIN_IMG_PX:
+                s = self.MIN_IMG_PX / max(1, min(w, h))
+                img = img.resize((max(self.MIN_IMG_PX, int(round(w * s))),
+                                  max(self.MIN_IMG_PX, int(round(h * s)))),
+                                 Image.LANCZOS)
+            out.append(img)
         return out
 
     @staticmethod
@@ -216,13 +237,36 @@ class _ThreeDTaskBase(Dataset):
         x0, x1 = int(xs.min()), int(xs.max())
         y0, y1 = int(ys.min()), int(ys.max())
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        h = max(x1 - x0, y1 - y0) / 2.0
-        return img.crop((int(cx - h), int(cy - h), int(cx + h), int(cy + h)))
+        # Half-size: never let a thin/single-pixel object collapse the box to 0.
+        h = max(x1 - x0, y1 - y0, 1) / 2.0
+        box = (int(cx - h), int(cy - h), int(cx + h), int(cy + h))
+        cropped = img.crop(box)
+        # crop() can still yield a tiny image; the _load_views min-size guard
+        # backstops it, but bail to the original if somehow empty.
+        return cropped if min(cropped.size) > 0 else img
 
     # ------------------------------------------------------------------
-    # __getitem__: emit raw caption + PIL images + 3D target tensors
+    # __getitem__: emit raw caption + PIL images + 3D target tensors.
+    #
+    # Resilient-load (matches TRELLIS official StandardDatasetBase.__getitem__):
+    # if an asset fails to load (missing/corrupt latent — e.g. a Phase-B encode
+    # gap that slipped past `--filter_trainable`, or a transient weka IO fault),
+    # resample a DIFFERENT index instead of crashing the whole run. Bounded tries
+    # so a pathological manifest can't loop forever.
     # ------------------------------------------------------------------
     def __getitem__(self, i: int) -> Dict[str, Any]:
+        n = len(self.records)
+        for attempt in range(8):
+            try:
+                return self._load_one(i)
+            except (FileNotFoundError, OSError, ValueError, KeyError) as e:
+                bad = self.records[i].get("sha256", i)
+                print(f"[{self.task_name}] load failed for {bad}: {e!r} — resampling")
+                i = int(np.random.default_rng().integers(0, n)) if n > 1 else i
+        # Last attempt unguarded → surface the real error if every resample failed.
+        return self._load_one(i)
+
+    def _load_one(self, i: int) -> Dict[str, Any]:
         rec = self.records[i]
         rng = np.random.default_rng()
 
@@ -250,7 +294,19 @@ class _ThreeDTaskBase(Dataset):
         }
         if not self.ss_only:
             if shape_path:
-                data["target_shape_slat_512_item"] = self._load_shape(shape_path)
+                shape_item = self._load_shape(shape_path)
+                # Voxel cap: oversized sparse SLAT spikes activation memory → OOM
+                # (TRELLIS caps at max_tokens=8192). Raise ValueError so __getitem__'s
+                # resample loop picks a different (smaller) asset rather than OOM-ing
+                # the whole 8-GPU run on one pathological sample.
+                if self.max_slat_tokens > 0:
+                    nvox = int(shape_item["coords"].shape[0])
+                    if nvox > self.max_slat_tokens:
+                        raise ValueError(
+                            f"shape SLAT voxels {nvox} > max_slat_tokens "
+                            f"{self.max_slat_tokens} (asset {rec.get('sha256','?')[:12]})"
+                        )
+                data["target_shape_slat_512_item"] = shape_item
             if pbr_path and shape_path:
                 data["target_tex_slat_512_item"] = self._load_tex(pbr_path, shape_path)
         return data
@@ -263,7 +319,7 @@ class _ThreeDTaskBase(Dataset):
     def collate_fn(batch, processor, *,
                    max_tokens_single: int = 4096,
                    token_budget: int = 8192) -> Dict[str, Any]:
-        texts, flat_images = [], []
+        texts, flat_images, dino_pil = [], [], []
         px_per_tok = _px_per_tok(processor)
 
         for inst in batch:
@@ -271,29 +327,76 @@ class _ThreeDTaskBase(Dataset):
             n = max(len(imgs), 1)
             per_tok = min(max_tokens_single, token_budget // n)
             max_px = per_tok * px_per_tok
-            imgs = [_cap_image(im, max_px) for im in imgs]
-            content: List[Dict[str, Any]] = [{"type": "image"} for _ in imgs]
+            capped = [_cap_image(im, max_px) for im in imgs]
+            content: List[Dict[str, Any]] = [{"type": "image"} for _ in capped]
             content.append({"type": "text", "text": inst["caption"]})
             messages = [{"role": "user", "content": content}]
+            # add_generation_prompt=False: we use the VLM hidden as CONDITIONING, not for text
+            # generation — so we do NOT want the assistant-turn start + Qwen3.5's empty
+            # <think></think> reasoning block that add_generation_prompt=True appends (7 tokens of
+            # pure boilerplate that dilute the cond, worst for text→3D where Qwen is the only cond).
             texts.append(processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True))
-            flat_images.extend(imgs)
+                messages, tokenize=False, add_generation_prompt=False))
+            flat_images.extend(capped)
+            # DINOv3 alignment (optional, consumed only if model.dino_align is on):
+            # the SAME conditioning views at DINOv3's 512px, in the SAME flat order
+            # as Qwen's images / image_grid_thw. Cheap to always emit.
+            dino_pil.extend(imgs)   # use originals (pre-cap); resized to 512 below
 
         proc_kwargs = dict(text=texts, padding=True, return_tensors="pt")
         if flat_images:
             proc_kwargs["images"] = flat_images
         enc = processor(**proc_kwargs)
 
+        # cond_keep_mask: which tokens the flow cross-attn should attend to as conditioning.
+        # = attention_mask (real tokens) MINUS the chat-template STRUCTURAL special tokens
+        # (<|im_start|>, <|im_end|>, <|vision_start|>, <|vision_end|>, role tokens, <think>/
+        # </think>). Those are constant boilerplate that dilute the cond. We KEEP <|image_pad|>
+        # (expands to image patches = real image content) and the caption text. Masked at the
+        # cross-attn level only → does NOT shift token positions / image_pad expansion.
+        tok = processor.tokenizer
+        # cache the boiler-id set on the tokenizer object (collate_fn is a @staticmethod, no self)
+        _boiler_ids = getattr(tok, "_boiler_ids_cache", None)
+        if _boiler_ids is None:
+            names = ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>",
+                     "<think>", "</think>"]
+            ids = set()
+            for nm in names:
+                tid = tok.convert_tokens_to_ids(nm)
+                if isinstance(tid, int) and tid is not None and tid >= 0:
+                    ids.add(tid)
+            # role-name tokens ("user"/"assistant") — they directly follow <|im_start|>
+            for nm in ("user", "assistant"):
+                for tid in tok(nm, add_special_tokens=False).input_ids:
+                    ids.add(tid)
+            _boiler_ids = ids
+            tok._boiler_ids_cache = ids
+        _boiler = torch.tensor(sorted(_boiler_ids), dtype=enc["input_ids"].dtype)
+        cond_keep = enc["attention_mask"].bool() & ~torch.isin(enc["input_ids"], _boiler)
+
         out: Dict[str, Any] = {
             "_task": batch[0]["_task"],
             "input_ids": enc["input_ids"],
             "attention_mask": enc["attention_mask"],
+            "cond_keep_mask": cond_keep,
             "target_ss_latent": torch.stack(
                 [inst["target_ss_latent"] for inst in batch], dim=0),
         }
         if "pixel_values" in enc:
             out["pixel_values"] = enc["pixel_values"]
             out["image_grid_thw"] = enc.get("image_grid_thw")
+            # DINOv3 images: (M,3,512,512) in [0,1], flat order matching image_grid_thw.
+            # (DinoV3FeatureExtractor applies its own ImageNet Normalize.)
+            if dino_pil:
+                import numpy as _np
+                dino_t = torch.stack([
+                    torch.from_numpy(
+                        _np.asarray(im.convert("RGB").resize((512, 512), Image.BILINEAR),
+                                    dtype="float32")
+                    ).permute(2, 0, 1) / 255.0
+                    for im in dino_pil
+                ], dim=0)
+                out["dino_images"] = dino_t
         if "pixel_values_videos" in enc:
             out["pixel_values_videos"] = enc["pixel_values_videos"]
             out["video_grid_thw"] = enc.get("video_grid_thw")

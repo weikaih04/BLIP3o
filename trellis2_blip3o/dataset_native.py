@@ -338,8 +338,10 @@ class NativeVLMCollator:
                 messages.append({"role": "system", "content": self.system_prompt})
             messages.append({"role": "user", "content": content})
             texts.append(
+                # add_generation_prompt=False: cond use, not generation — no assistant-turn /
+                # Qwen3.5 <think></think> boilerplate. MUST match training (threed.py collator).
                 self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=False
                 )
             )
             flat_images.extend(imgs)
@@ -362,9 +364,26 @@ class NativeVLMCollator:
                     f"cond_max_length will TRUNCATE (drops later views/content)."
                 )
 
+        # cond_keep_mask: drop chat-template boilerplate from the flow cond (match training).
+        tok = self.processor.tokenizer
+        if not hasattr(self, "_boiler_ids"):
+            ids = set()
+            for nm in ("<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>",
+                       "<think>", "</think>"):
+                tid = tok.convert_tokens_to_ids(nm)
+                if isinstance(tid, int) and tid is not None and tid >= 0:
+                    ids.add(tid)
+            for nm in ("system", "user", "assistant"):
+                for tid in tok(nm, add_special_tokens=False).input_ids:
+                    ids.add(tid)
+            self._boiler_ids = ids
+        _boiler = torch.tensor(sorted(self._boiler_ids), dtype=enc["input_ids"].dtype)
+        cond_keep = enc["attention_mask"].bool() & ~torch.isin(enc["input_ids"], _boiler)
+
         batch: Dict[str, Any] = {
             "input_ids": enc["input_ids"],
             "attention_mask": enc["attention_mask"],
+            "cond_keep_mask": cond_keep,
             "target_ss_latent": torch.stack(
                 [inst["target_ss_latent"] for inst in instances], dim=0
             ),

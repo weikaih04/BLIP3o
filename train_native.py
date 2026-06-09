@@ -109,6 +109,8 @@ class WandbFineGrainedCallback(TrainerCallback):
             wandb.define_metric("train/per_stage/*", summary="min")
             wandb.define_metric("train/grad_norm", summary="last")
             wandb.define_metric("train/learning_rate", summary="last")
+            wandb.define_metric("train/dino/align_loss", summary="last")
+            wandb.define_metric("train/dual/gate_abs", summary="last")   # mean |gate| — anchor-lean
         except Exception as e:
             print(f"[WandbFineGrainedCallback] define_metric skipped: {e}")
 
@@ -156,6 +158,14 @@ def _apply_flow_freeze(model, mode: str):
                         p.requires_grad_(True)
     for n, p in model.named_parameters():       # connector always trainable
         if "diffusion_connector" in n:
+            p.requires_grad_(True)
+    # Dual-branch params are NEW (Know3D Qwen cross-attn + zero-init gate + per-view embed) and
+    # must train regardless of flow_tune mode — else e.g. last{NN} would freeze the Qwen branch
+    # in early blocks (frozen by block index), leaving it stuck at zero-gate = dead. The original
+    # DINOv3 anchor cross-attn (now under '...blocks.i.block.cross_attn') is still governed by the
+    # normal partial-FT rules above.
+    for n, p in model.named_parameters():
+        if ("cross_attn_qwen" in n) or n.endswith(".gate") or ("norm_q" in n) or ("view_embed" in n):
             p.requires_grad_(True)
 
 
@@ -282,6 +292,27 @@ class NativeArgs:
     # EMA of trainable weights (TRELLIS official ema_rate=0.9999). 0 disables. Saved as a
     # separate ema.safetensors per checkpoint; inference overlays it (USE_EMA=1).
     ema_decay: float = field(default=0.9999)
+    # ── DINOv3 conditioning alignment (REPA-inspired; see DINO_ALIGNMENT_DESIGN.md) ──
+    # OFF by default. Distills DINOv3(render) into the connector via a train-only head;
+    # image tasks only (text→3D contributes 0). Targets floaters/rough local geometry.
+    dino_align: bool = field(default=False)
+    dino_align_weight: float = field(default=0.5)      # λ; REPA default
+    dino_align_mode: str = field(default="spatial")    # "spatial" (patch-wise) | "pooled"
+    # Dual-branch conditioning (Know3D-style; see DUAL_COND_DESIGN.md). Keeps the original
+    # TRELLIS DINOv3 cross-attn as an anchor + adds a zero-init-gated Qwen cross-attn. Replaces
+    # dino_align. Init from PRETRAINED TRELLIS (not a Qwen-drifted ckpt) — see the doc.
+    dual_cond: bool = field(default=False)
+    dual_cond_max_views: int = field(default=8)        # per-view embedding table size
+    dual_slat_qwen_stride: int = field(default=2)      # Qwen on every-Nth SLAT block (2=half → fits 512)
+    dual_qwen_last_frac: float = field(default=0.0)     # >0: inject Qwen ONLY on last frac of blocks (0.2=last20%) → fits 16-GPU; overrides stride
+    anchor_drop_prob: float = field(default=0.0)        # v2: prob drop ANCHOR-only (keep Qwen) → forces Qwen learning (text→3D)
+    cfg_joint_drop_prob: float = field(default=0.0)      # v2: prob JOINT-drop anchor+Qwen (clean uncond) → TRELLIS-aligned CFG (image seed-stability)
+    dual_anchor_pool: int = field(default=1)           # fixed avg-pool DINOv3 anchor grid by N
+    dual_anchor_token_budget: int = field(default=0)   # >0: adaptive cap on TOTAL anchor tokens
+    dual_ss_checkpoint: bool = field(default=False)    # gradient-checkpoint whole SS block (needs compile off)
+    # Warm-start connector+flow from a prior run's checkpoint dir (loads model.safetensors,
+    # strict=False, NO optimizer/step resume). For adding the dino head on trained weights.
+    init_from_checkpoint: str = field(default="")
     # ── Mixture mode (Phase-1/2 multi-task infra) ──
     # When set, replaces --data_path. Wires up MixtureIterableDataset +
     # MultiTaskCollator from yaml (see configs/mix_*.yaml). Task weights and
@@ -360,10 +391,41 @@ def main():
         cond_fusion=native_args.cond_fusion,
         fusion_layers=native_args.fusion_layers,
         slat_resolution=native_args.slat_resolution,
+        dino_align=native_args.dino_align,
+        dino_align_weight=native_args.dino_align_weight,
+        dino_align_mode=native_args.dino_align_mode,
+        dual_cond=native_args.dual_cond,
+        dual_cond_max_views=native_args.dual_cond_max_views,
+        dual_slat_qwen_stride=native_args.dual_slat_qwen_stride,
+        dual_qwen_last_frac=native_args.dual_qwen_last_frac,
+        anchor_drop_prob=native_args.anchor_drop_prob,
+        cfg_joint_drop_prob=native_args.cfg_joint_drop_prob,
+        dual_anchor_pool=native_args.dual_anchor_pool,
+        dual_anchor_token_budget=native_args.dual_anchor_token_budget,
+        dual_ss_checkpoint=native_args.dual_ss_checkpoint,
     )
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)
     print(f"[train_native] flow_tune={native_args.flow_tune!r}")
+
+    # --init_from_checkpoint: warm-start connector+flow weights from a prior run's
+    # model.safetensors, but DO NOT resume optimizer/step/EMA. Use this to add a NEW
+    # module (e.g. dino_align's projection head) on top of trained weights and start a
+    # fresh short run — resuming can't add params (optimizer-state mismatch). strict=False
+    # loads matching keys (connector/flow/vlm), leaves the new head at init. Strips a
+    # torch.compile '_orig_mod.' prefix if present (see project_compile_origmod_save_bug).
+    if native_args.init_from_checkpoint:
+        from safetensors.torch import load_file as _load_sft
+        import os as _os
+        sd_path = _os.path.join(native_args.init_from_checkpoint, "model.safetensors")
+        sd = _load_sft(sd_path)
+        if any("_orig_mod." in k for k in sd):
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        new_keys = [k for k in missing if "dino_aligner" in k]
+        print(f"[train_native] init_from_checkpoint={sd_path}: loaded "
+              f"{len(sd)} tensors; missing={len(missing)} (new head: {len(new_keys)}), "
+              f"unexpected={len(unexpected)}")
 
     # torch.compile must come AFTER _apply_flow_freeze (so Dynamo sees the final
     # requires_grad layout) and BEFORE Trainer wraps the model with DeepSpeed/FSDP.
