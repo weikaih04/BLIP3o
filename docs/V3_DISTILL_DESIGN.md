@@ -52,31 +52,41 @@ Mechanical notes:
 - **Token raise: 1024/view** via `target_tokens_per_view=1024` (knob already in `vlm_collate.py`;
   upscales 512² renders → 1024² → 32×32 Qwen grid = 1:1 with the DINOv3 teacher grid). mv4 ≈ 4k tok +
   text < 8192 flow cap. Validated 2026-06-10: the dual ckpt handled 4×1024-tok cond cleanly at inference.
-- **Multi-view teacher** = concat per-view DINOv3 (V×1029). PENDING the Step-1 pre-experiment (frozen
-  pretrained flow was never trained on multi-view concat cond) — if it fails, IM samples fall back to a
-  random single-view teacher; I1 unaffected.
+- **Teacher = single-view DINOv3 only** (S1 is I1-only; KD never coexists with IM/T — see §3). The
+  multi-view-concat-teacher question is moot for v3.
 - Init: flow = pretrained TRELLIS.2 (NOT a dual ckpt); connector = fresh.
 
-## 3. Phases (= UniVideo S1→S2, with the KD turbo in S1)
+## 3. Stages (= UniVideo S1→S2→S3; FINAL per weikaih 2026-06-10: S1/S2 are SINGLE-IMAGE-ONLY)
 
-| | trains | losses | teacher |
-|---|---|---|---|
-| **Phase A** | connector ONLY (flow ❄, Qwen ❄, DINOv3 ❄) | `L_flow + 1.0·L_v + 0.5·L_f` | the SAME frozen flow (2 passes, zero extra memory) |
-| **Phase B** | connector + flow last-N | `L_flow` (**KD off by default**, λ=0) | none in training; dino-teacher kept as EVAL |
+| | data | trains | losses | teacher |
+|---|---|---|---|---|
+| **Stage 1** (align) | **I1 only** | connector ONLY (flow ❄, Qwen ❄) | `L_flow + 1.0·L_v + 0.5·L_f` | SAME frozen flow + **single-view** DINOv3 (2 passes, zero extra memory) |
+| **Stage 2** (quality) | **I1 only** | connector + flow last-N | `L_flow` (KD off, λ=0) | none in training; dino-teacher = drift-monitor EVAL |
+| **Stage 3** (tasks) | I1 + IM + T mix | connector + flow last-N | `L_flow` | none — IM/T ride the already-aligned Qwen path |
 
-Why KD off in B (weikaih's call, agreed): A's problem is "connector can't speak the flow's language" →
-dense teacher signal; B's problem is "flow must adapt beyond mimicry" → KD would pin the student inside
-the teacher's shadow. Distill-then-finetune is the standard pattern; B without KD also needs **no frozen
-teacher copy** (Phase A shares the module; a separate ~8 GB copy is only needed if KD returns).
+**Why I1-only for S1/S2 (weikaih's call):** nail the core capability — Qwen single-image conditioning —
+in the cleanest possible setup first; add multi-view and text as task extensions afterwards.
+**Clean side-effect: the multi-view-teacher question VANISHES.** KD is only active in Stage 1, and Stage 1
+is I1-only → the teacher is always single-view DINOv3 (the stock flow's exact pretraining distribution,
+zero OOD risk). By the time IM enters (Stage 3) KD is off, so an IM teacher is never needed. The Step-1
+pre-experiment (4-view concat teacher on stock flow) is therefore MOOT for v3 — optional curiosity only.
+(Its single-view control already ran clean — warrior 1975 coords / 850k verts — which validated the
+manual teacher-cond plumbing itself.)
 
-Safety nets for B: (i) drift monitor — every N k steps render dino-teacher vs qwen-student side-by-side
-(eval-only); (ii) if drift appears, re-enable small λ (~0.1) as a regularizer — only THEN build the
-frozen-teacher-copy path; (iii) λ annealing (A→B linear decay) available as a middle ground. Plus the
-standing buffers: last-N-only unfreezing + EMA.
+Why KD off from Stage 2 on: S1's problem is "connector can't speak the flow's language" → dense teacher
+signal; S2's problem is "flow must adapt beyond mimicry" → KD would pin the student inside the teacher's
+shadow. Distill-then-finetune is the standard pattern; no KD ⇒ **no frozen teacher copy ever needed**
+(S1 shares the module; a separate ~8 GB copy only if KD is re-enabled on drift evidence).
 
-Expectation calibrated by literature: UniVideo ultimately fine-tunes its DiT (S2/S3) — **Phase B is
-likely needed.** Connector-only-forever precedents are only ELLA (large timestep-aware resampler) and
-PEA (6M+KD, semantics-only). Phase A's job: align the connector + measure how far KD stretches it.
+Safety nets for S2/S3: (i) drift monitor — every N k steps render dino-teacher vs qwen-student
+side-by-side (eval-only); (ii) on drift, re-enable small λ (~0.1) as a regularizer — only then build the
+frozen-teacher-copy path; (iii) λ annealing available as a middle ground. Plus last-N-only unfreezing + EMA.
+
+Expectation calibrated by literature: UniVideo ultimately fine-tunes its DiT — **Stage 2 is likely
+needed.** Connector-only-forever precedents are only ELLA (large timestep-aware resampler) and PEA
+(6M+KD, semantics-only). Stage 1's job: align the connector + measure how far KD stretches it.
+Text→3D note: deferred to S3 by design; the VLM is frozen throughout so no text understanding is lost —
+the connector picks up the text task in S3 on top of an already-aligned image mapping.
 
 ## 4. Paper grounding
 
