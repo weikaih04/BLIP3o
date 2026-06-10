@@ -85,6 +85,14 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         dual_anchor_pool: int = 1,              # fixed avg-pool DINOv3 anchor grid by N (2=32×32→16×16)
         dual_anchor_token_budget: int = 0,      # >0: adaptive — cap TOTAL anchor tokens (bounds worst-case)
         dual_ss_checkpoint: bool = False,       # gradient-checkpoint the WHOLE SS block (not just dual) — SS isn't covered by elastic SLAT GC; needs compile OFF
+        # V3 condition-swap distillation (docs/V3_DISTILL_DESIGN.md). Teacher = the SAME
+        # frozen flow fed single-view DINOv3 cond on the SAME (x_t, t); student =
+        # connector(Qwen). Adds kd_v (velocity MSE) + kd_f (block-feature relative MSE).
+        # Stage-1 (I1-only, connector-only) use; OFF by default → existing runs unaffected.
+        distill_dino: bool = False,
+        distill_v_weight: float = 1.0,
+        distill_f_weight: float = 0.5,
+        distill_f_blocks: str = "auto5",        # "autoK" = K evenly-spaced inner blocks | "3,9,15"
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
         flow_sigma_min: float = 1e-5,
@@ -121,6 +129,10 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.dual_anchor_pool = dual_anchor_pool
         self.dual_anchor_token_budget = dual_anchor_token_budget
         self.dual_ss_checkpoint = dual_ss_checkpoint
+        self.distill_dino = distill_dino
+        self.distill_v_weight = distill_v_weight
+        self.distill_f_weight = distill_f_weight
+        self.distill_f_blocks = distill_f_blocks
         self.logitnorm_mean = logitnorm_mean
         self.logitnorm_std = logitnorm_std
         self.flow_sigma_min = flow_sigma_min
@@ -264,6 +276,20 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             rank0_print(f"[dual_cond] anchor ON: DINOv3 cross-attn (frozen) + scalar-gated Qwen "
                         f"branch on {'SS+SLAT' if config.build_slat else 'SS'} ({_nb} blocks total); "
                         f"per-view embed ≤{config.dual_cond_max_views}")
+
+        # --- V3 distillation teacher input: frozen DINOv3 (shared with dual when both on) ---
+        if getattr(config, "distill_dino", False) and getattr(self, "_dino_extractor", None) is None:
+            from trellis2_blip3o.dino_align import TRELLIS_DINOV3_NAME, DINOV3_IMAGE_SIZE
+            from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor  # type: ignore
+            _dino = DinoV3FeatureExtractor(TRELLIS_DINOV3_NAME, image_size=DINOV3_IMAGE_SIZE)
+            _dino.model.eval()
+            for p in _dino.model.parameters():
+                p.requires_grad_(False)
+            _dino.model.to(torch.bfloat16)   # frozen inference-only; same rationale as dual above
+            object.__setattr__(self, "_dino_extractor", _dino)   # non-child → off state_dict/ZeRO
+            rank0_print(f"[distill] V3 condition-swap KD ON: teacher=frozen flow+DINOv3, "
+                        f"λ_v={config.distill_v_weight} λ_f={config.distill_f_weight} "
+                        f"blocks={config.distill_f_blocks}")
 
         # --- per-stage flow loss fns (shared helper) ---
         self._loss_fn_ss, self._loss_fn_slat = flow_heads.build_flow_loss_fns(config)
@@ -569,6 +595,27 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             self.dual_router._text_mode = not (dino_images is not None and dino_images.numel() > 0)
             self.dual_router.set_dino(anchor)
 
+        # 1c. V3 distillation teacher cond (docs/V3_DISTILL_DESIGN.md): frozen DINOv3 features
+        # of the SAME conditioning view → the SAME frozen flow inside the loss fn becomes the
+        # teacher. Stage-1 data is I1-only by design, so KD requires exactly 1 view/sample;
+        # multi-view batches skip KD (warn once). text batches (no dino_images) → no teacher.
+        teacher_cond = None
+        if (self.training and getattr(self.config, "distill_dino", False)
+                and dino_images is not None and dino_images.numel() > 0):
+            if dino_images.shape[0] == cond_hidden.shape[0]:      # 1 view per sample (I1)
+                _ext = self._dino_extractor
+                _w = _ext.model.embeddings.patch_embeddings.weight
+                if _w.device != dino_images.device:               # lazy move (non-child object)
+                    _ext.model.to(dino_images.device)
+                    _w = _ext.model.embeddings.patch_embeddings.weight
+                with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
+                    teacher_cond = _ext(dino_images.to(device=_w.device, dtype=_w.dtype))
+                teacher_cond = teacher_cond.to(cond_hidden.device)   # (B, 1029, 1024)
+            elif not getattr(self, "_warned_im_kd", False):
+                rank0_print("[distill] multi-view batch under distill_dino → KD skipped "
+                            "(Stage-1 is I1-only; IM belongs to Stage-3 where KD is off)")
+                self._warned_im_kd = True
+
         # 2. cond → connector → 3-stage TRELLIS cascade flow loss (shared helper).
         loss, logs = flow_heads.compute_cascade_flow_loss(
             connector=self.diffusion_connector,
@@ -588,6 +635,10 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             mask_drop_prob=_mask_drop,
             flow_stage_weights=self.config.flow_stage_weights,
             flow_weight=self.config.flow_weight,
+            teacher_cond=teacher_cond,
+            kd_v_weight=float(getattr(self.config, "distill_v_weight", 1.0)),
+            kd_f_weight=float(getattr(self.config, "distill_f_weight", 0.5)),
+            kd_f_blocks=str(getattr(self.config, "distill_f_blocks", "auto5")),
         )
 
         if depthwise:   # release stashed per-block conds
@@ -629,6 +680,12 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # per-step (dropped voxel counts / cond-shape stats — no trend, just noise).
         self._last_diag = {f"per_stage/loss_{k}": float(logs["stages"][k])
                            for k in logs["stages"]}
+        # V3 distill: kd curves = the direct "functional distance to the DINOv3-conditioned
+        # flow" per stage. Absent on KD-skipped steps (CFG-dropped / text / multi-view).
+        for _kd_key in ("kd_v", "kd_f"):
+            if _kd_key in logs:
+                for _stg, _val in logs[_kd_key].items():
+                    self._last_diag[f"distill/{_kd_key}_{_stg}"] = float(_val)
         if getattr(self, "dino_aligner", None) is not None:
             self._last_diag["dino/align_loss"] = align_val
         if self.dual_router is not None:

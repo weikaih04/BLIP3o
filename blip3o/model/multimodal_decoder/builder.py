@@ -14,31 +14,9 @@ import torch
 import torch.nn as nn
 
 import trellis2_blip3o._paths as _tr2_paths  # noqa: F401 — sets sys.path for trellis2 import
-
-
-def _to_bf16_keep_complex(model: nn.Module) -> nn.Module:
-    """`model.to(torch.bfloat16)` BUT preserve complex buffers.
-
-    The dense SS Flow registers `rope_phases` as a **complex64** RoPE buffer. A blunt
-    `model.to(bfloat16)` casts it to bf16, which silently DISCARDS the imaginary part
-    ("Casting complex values to real discards the imaginary part") — destroying the rotary
-    rotation → corrupted positions → attention diverges layer-by-layer → degraded geometry
-    (thin/hollow shapes shatter). Upstream TRELLIS avoids this by casting only `self.blocks`
-    (convert_module_to) and leaving rope_phases complex64. Mirror that: snapshot complex
-    buffers, do the bf16 cast, then restore them.
-    """
-    complex_bufs = {n: b.clone() for n, b in model.named_buffers() if b is not None and b.is_complex()}
-    model = model.to(torch.bfloat16)
-    for name, buf in complex_bufs.items():
-        mod = model
-        *path, leaf = name.split(".")
-        for p in path:
-            mod = getattr(mod, p)
-        # buffers registered via register_buffer live in _buffers; setattr re-registers correctly.
-        # `.to(bfloat16)` is dtype-only (no device move), so the cloned complex buf is already on
-        # the right device — re-attach it as-is, preserving complex64.
-        setattr(mod, leaf, buf)
-    return model
+# THE safe bf16 cast (preserves the SS flow's complex64 rope_phases buffer). Single
+# shared copy — moved to tr2_modules so training AND inference use the same guard.
+from trellis2_blip3o.tr2_modules import to_bf16_keep_complex as _to_bf16_keep_complex  # noqa: F401
 
 
 def _default_ss_flow_ckpt() -> str:

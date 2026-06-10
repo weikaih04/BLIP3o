@@ -30,6 +30,62 @@ def _freeze(module: nn.Module) -> nn.Module:
     return module
 
 
+def to_bf16_keep_complex(model: nn.Module) -> nn.Module:
+    """`model.to(torch.bfloat16)` BUT preserve complex buffers — THE one safe way to
+    bf16-cast a TRELLIS flow.
+
+    The dense SS flow registers `rope_phases` as a **complex64** RoPE buffer. A blunt
+    `model.to(bfloat16)` casts it to bf16, silently DISCARDING the imaginary part
+    (the rotation) → corrupted positions → attention diverges → degraded geometry
+    (thin/hollow shapes shatter). Stock TRELLIS never whole-model-casts (models stay
+    fp32; autocast handles speed; upstream's convert_module_to casts only `blocks`),
+    so the hazard is unique to our hard-cast. Sparse (SLAT) flows are immune — their
+    rope phases are computed per-forward from live coords, no persistent buffer.
+
+    Moved here from blip3o builder.py as the single shared copy."""
+    complex_bufs = {n: b.clone() for n, b in model.named_buffers()
+                    if b is not None and b.is_complex()}
+    model = model.to(torch.bfloat16)
+    for name, buf in complex_bufs.items():
+        mod = model
+        *path, leaf = name.split(".")
+        for p in path:
+            mod = getattr(mod, p)
+        # buffers live in _buffers; setattr re-registers correctly. `.to(bfloat16)` is
+        # dtype-only (no device move) so the cloned complex buf is already on-device.
+        setattr(mod, leaf, buf)
+    return model
+
+
+def ensure_complex_rope(flow: nn.Module, label: str = "flow") -> nn.Module:
+    """Verify — and if corrupted, REBUILD — the dense flow's complex64 `rope_phases`.
+
+    Call after ANY whole-model dtype cast / state_dict load as a structural guard
+    (replaces the old inference-side FIX_ROPE env workaround). No-op for sparse/APE
+    flows (no `rope_phases` buffer). The rebuild replicates SparseStructureFlowModel
+    .__init__ exactly (deterministic — no weights involved), so a rebuilt buffer is
+    bit-identical to a pristine one."""
+    rope = getattr(flow, "rope_phases", None)
+    if not isinstance(rope, torch.Tensor):
+        return flow                       # APE / sparse flow — nothing to check
+    if rope.is_complex():
+        return flow
+    import warnings
+    warnings.warn(
+        f"[ensure_complex_rope] {label}.rope_phases is {rope.dtype} — a whole-model "
+        f"dtype cast discarded the imaginary part. Rebuilding complex64 RoPE."
+    )
+    from trellis2.modules.attention import RotaryPositionEmbedder  # type: ignore  (same import as SS __init__)
+    dev = next(flow.parameters()).device
+    res = int(flow.resolution)
+    pos_embedder = RotaryPositionEmbedder(flow.model_channels // flow.num_heads, 3)
+    coords = torch.meshgrid(*[torch.arange(res) for _ in range(3)], indexing="ij")
+    coords = torch.stack(coords, dim=-1).reshape(-1, 3)
+    flow.rope_phases = pos_embedder(coords).to(dev)
+    assert flow.rope_phases.is_complex()
+    return flow
+
+
 def build_trellis_ss_flow(ckpt_path: Optional[str] = None, trainable: bool = True) -> nn.Module:
     """Load TRELLIS.2 SparseStructureFlowModel from local 4B ckpt.
 

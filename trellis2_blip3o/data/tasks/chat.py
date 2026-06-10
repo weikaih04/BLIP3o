@@ -44,6 +44,10 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from ..registry import register_task
+# Image-budget helpers: SHARED with the 3D collate path (was a third drifted copy —
+# single source of truth lives in trellis2_blip3o/vlm_collate.py).
+from ...vlm_collate import cap_image as _cap_image
+from ...vlm_collate import px_per_tok as _px_per_tok
 
 
 IGNORE_INDEX = -100
@@ -71,23 +75,6 @@ def _normalize_conversation(conv: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             content = content.replace("<image>", "").strip()
         out.append({"role": role, "content": content})
     return out
-
-
-def _cap_image(img: Image.Image, max_px: int) -> Image.Image:
-    w, h = img.size
-    if w * h <= max_px:
-        return img
-    s = (max_px / float(w * h)) ** 0.5
-    return img.resize((max(32, round(w * s)), max(32, round(h * s))), Image.LANCZOS)
-
-
-def _px_per_tok(processor) -> int:
-    ip = processor.image_processor if hasattr(processor, "image_processor") else None
-    ps = getattr(ip, "patch_size", None) if ip else None
-    ms = getattr(ip, "merge_size", None) if ip else None
-    if isinstance(ps, int) and isinstance(ms, int):
-        return (ps * ms) ** 2
-    return 1024
 
 
 # ────────────────────────────────────────────────────────────────────────────

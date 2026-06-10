@@ -98,15 +98,34 @@ def compute_cascade_flow_loss(
     mask_drop_prob: float = 0.1,
     flow_stage_weights: str = "ss=1.0,shape_slat_512=1.0,tex_slat_512=1.0",
     flow_weight: float = 1.0,
+    teacher_cond: Optional[torch.Tensor] = None,   # V3 distill: DINOv3 cond (B, N, 1024)
+    kd_v_weight: float = 1.0,
+    kd_f_weight: float = 0.5,
+    kd_f_blocks: str = "auto5",
 ) -> Tuple[torch.Tensor, Dict]:
     """VLM hidden → connector → TRELLIS cascade flow loss (SS + Shape + Tex).
 
     cond enters each flow DiT via cross-attention (cond as K/V), with `cond_key_mask`
     masking padded tokens — same path the pretrained TRELLIS cross-attn expects.
     Returns (flow_weight * weighted_mean(stage losses), logs).
+
+    V3 distillation (docs/V3_DISTILL_DESIGN.md): when `teacher_cond` is given, each
+    stage adds output- and feature-level KD vs the SAME frozen flow run on the SAME
+    (x_t, t) with the DINOv3 teacher cond. CFG-dropped batches skip KD (the uncond
+    direction is identical for both conds — no signal): we gate on "no sample in the
+    batch was dropped", exact at the BS=1 reality of 512 training.
     """
-    # 1. cap cond length (sized for ~8-frame short video).
+    # 1. cap cond length (sized for ~8-frame short video). LOUD, never silent: truncation
+    # drops the RIGHTMOST tokens — in multi-view batches that means whole later views
+    # vanish from the conditioning. The collator (vlm_collate) budgets BELOW this cap, so
+    # firing here means the two knobs have drifted — warn with the real numbers.
     if cond_hidden.size(1) > cond_max_length:
+        import warnings
+        warnings.warn(
+            f"[flow_heads] cond length {cond_hidden.size(1)} > cond_max_length "
+            f"{cond_max_length}: TRUNCATING (drops later views/content). Check the "
+            f"collator token_budget vs this cap."
+        )
         cond_hidden = cond_hidden[:, :cond_max_length, :]
         cond_key_mask = cond_key_mask[:, :cond_max_length]
 
@@ -115,22 +134,41 @@ def compute_cascade_flow_loss(
         cond_hidden = cond_hidden.detach()
 
     # 3. project to TRELLIS cond space (+ CFG dropout).
-    cond = connector(mask_drop(cond_hidden, mask_drop_prob))
+    if teacher_cond is None:
+        cond = connector(mask_drop(cond_hidden, mask_drop_prob))
+        kd_active = False
+    else:
+        # Distill path: replicate mask_drop but KEEP the per-sample drop mask so we
+        # can gate KD (dropped samples have no teacher signal — see docstring).
+        # Existing (non-distill) runs keep the original mask_drop call above, so their
+        # RNG stream / behavior is untouched.
+        B = cond_hidden.shape[0]
+        drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+        keep = (~drop).to(cond_hidden.dtype).view(B, *([1] * (cond_hidden.dim() - 1)))
+        cond = connector(cond_hidden * keep)
+        kd_active = not bool(drop.any())
     sdpa_mask = cond_key_mask[:, None, None, :]   # (B,1,1,T) True = attend
+
+    kd_kwargs = (
+        dict(teacher_cond=teacher_cond, kd_v_weight=kd_v_weight,
+             kd_f_weight=kd_f_weight, kd_f_blocks=kd_f_blocks)
+        if (teacher_cond is not None and kd_active) else {}
+    )
 
     flow_losses: Dict[str, torch.Tensor] = {}
     stage_logs: Dict[str, Dict] = {}
 
     # Stage 1: SS Flow (dense, logitNormal t-schedule).
     ss_target = target_ss_latent.to(cond.dtype)
-    L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask)
+    L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask, **kd_kwargs)
     flow_losses["ss"] = L_ss
     stage_logs["ss"] = log_ss
 
     # Stage 2: Shape SLAT (sparse, uniform t-schedule).
     if target_shape_slat_512 is not None and shape_slat is not None:
         shape_target = target_shape_slat_512.replace(target_shape_slat_512.feats.to(cond.dtype))
-        L_shape, log_shape = loss_fn_slat(shape_slat, shape_target, cond, cond_mask=sdpa_mask)
+        L_shape, log_shape = loss_fn_slat(
+            shape_slat, shape_target, cond, cond_mask=sdpa_mask, **kd_kwargs)
         flow_losses["shape_slat_512"] = L_shape
         stage_logs["shape_slat_512"] = log_shape
 
@@ -139,7 +177,7 @@ def compute_cascade_flow_loss(
         tex_target = target_tex_slat_512.replace(target_tex_slat_512.feats.to(cond.dtype))
         tex_cc = tex_concat_cond.replace(tex_concat_cond.feats.to(cond.dtype))
         L_tex, log_tex = loss_fn_slat(
-            tex_slat, tex_target, cond, cond_mask=sdpa_mask, concat_cond=tex_cc
+            tex_slat, tex_target, cond, cond_mask=sdpa_mask, concat_cond=tex_cc, **kd_kwargs
         )
         flow_losses["tex_slat_512"] = L_tex
         stage_logs["tex_slat_512"] = log_tex
@@ -155,4 +193,12 @@ def compute_cascade_flow_loss(
         "flow_combined": flow_combined.detach().float().item(),
         "stages": {k: stage_logs[k]["flow_mse"] for k in stage_logs},
     }
+    # V3 distill logs: train/distill/{v,f}_{stage} — kd_v/kd_f are the direct
+    # "functional distance to the DINOv3-conditioned flow" metrics.
+    kd_v_logs = {k: lg["kd_v"] for k, lg in stage_logs.items() if "kd_v" in lg}
+    kd_f_logs = {k: lg["kd_f"] for k, lg in stage_logs.items() if "kd_f" in lg}
+    if kd_v_logs:
+        logs["kd_v"] = kd_v_logs
+    if kd_f_logs:
+        logs["kd_f"] = kd_f_logs
     return flow_weight * flow_combined, logs

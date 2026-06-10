@@ -117,13 +117,19 @@ class WandbFineGrainedCallback(TrainerCallback):
 
 def _apply_flow_freeze(model, mode: str):
     """Partial-FT the 3 TRELLIS flows. connector stays trainable; VLM per cfg.freeze_vlm.
-    mode: 'full' | 'crossattn' | 'crossattn,selfattn' | 'last{NN}' (last NN% of blocks, incl MLP)."""
+    mode: 'full' | 'none' (connector-only — V3 Stage-1) | 'crossattn' |
+    'crossattn,selfattn' | 'last{NN}' (last NN% of blocks, incl MLP)."""
     import re
     parts = [p.strip() for p in mode.split(",") if p.strip()]
     tags = ("ss_flow", "shape_slat_512", "tex_slat_512")
     def is_flow(n): return any(t in n for t in tags)
     if mode == "full" or not parts:
         return  # flows already fully trainable
+    if mode == "none":   # V3 Stage-1: flows fully FROZEN; only connector (+VLM per freeze_vlm) trains
+        for n, p in model.named_parameters():
+            if is_flow(n):
+                p.requires_grad_(False)
+        return
     for n, p in model.named_parameters():       # freeze all flow params, then unfreeze selected
         if is_flow(n):
             p.requires_grad_(False)
@@ -310,6 +316,18 @@ class NativeArgs:
     dual_anchor_pool: int = field(default=1)           # fixed avg-pool DINOv3 anchor grid by N
     dual_anchor_token_budget: int = field(default=0)   # >0: adaptive cap on TOTAL anchor tokens
     dual_ss_checkpoint: bool = field(default=False)    # gradient-checkpoint whole SS block (needs compile off)
+    # ── V3 condition-swap distillation (docs/V3_DISTILL_DESIGN.md) ──
+    # Teacher = the SAME frozen flow + single-view DINOv3 cond on the SAME (x_t,t);
+    # student = connector(Qwen). L = L_flow + λ_v·‖v_s−v_t‖² + λ_f·Σ_l relMSE(block_l).
+    # Stage-1 = I1-only data + connector-only (flow frozen). OFF by default.
+    distill_dino: bool = field(default=False)
+    distill_v_weight: float = field(default=1.0)       # λ_v output-level KD
+    distill_f_weight: float = field(default=0.5)       # λ_f feature-level KD (relative MSE, O(1))
+    distill_f_blocks: str = field(default="auto5")     # "autoK" evenly-spaced inner blocks | "3,9,15"
+    # V3 token raise: upscale each cond view so its Qwen vision tokens reach this count
+    # (1024 = 32×32 grid, 1:1 with the DINOv3 teacher grid @512px). 0 = off (today's 256).
+    # Set process-wide via vlm_collate → applies to ALL 3D task collates uniformly.
+    target_tokens_per_view: int = field(default=0)
     # Warm-start connector+flow from a prior run's checkpoint dir (loads model.safetensors,
     # strict=False, NO optimizer/step resume). For adding the dino head on trained weights.
     init_from_checkpoint: str = field(default="")
@@ -403,10 +421,20 @@ def main():
         dual_anchor_pool=native_args.dual_anchor_pool,
         dual_anchor_token_budget=native_args.dual_anchor_token_budget,
         dual_ss_checkpoint=native_args.dual_ss_checkpoint,
+        distill_dino=native_args.distill_dino,
+        distill_v_weight=native_args.distill_v_weight,
+        distill_f_weight=native_args.distill_f_weight,
+        distill_f_blocks=native_args.distill_f_blocks,
     )
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)
     print(f"[train_native] flow_tune={native_args.flow_tune!r}")
+    # V3 token raise: one process-wide knob, consumed by vlm_collate (all 3D collates).
+    if native_args.target_tokens_per_view:
+        from trellis2_blip3o.vlm_collate import set_default_target_tokens_per_view
+        set_default_target_tokens_per_view(native_args.target_tokens_per_view)
+        print(f"[train_native] target_tokens_per_view={native_args.target_tokens_per_view} "
+              f"(views upscaled to a {int(native_args.target_tokens_per_view ** 0.5)}²-token grid)")
 
     # --init_from_checkpoint: warm-start connector+flow weights from a prior run's
     # model.safetensors, but DO NOT resume optimizer/step/EMA. Use this to add a NEW

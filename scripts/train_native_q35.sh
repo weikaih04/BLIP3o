@@ -10,7 +10,10 @@
 # disk for reference but is unusable through our trainer.
 # (Cf. OPTIMIZATIONS.md §"No-offload policy".)
 #
-# Usage: bash scripts/train_native_q35.sh [MODE=ss|512] [NPROC=?] [DATA_PATH=...]
+# Usage: bash scripts/train_native_q35.sh [MODE=ss|512] [NPROC=?] [DATA=...]
+#   DATA defaults to configs/mix_3d_only.yaml (real multi-task 3D mixture over
+#   ready_v1 80,076 assets). Pass a .yaml → mixture mode; pass a .jsonl →
+#   legacy single-manifest (e.g. data/overfit/imgtext.jsonl for overfit smoke).
 #
 # Terminology (matches user vocabulary, fixed 2026-05-28):
 #   ss         → SS flow only                          (513 M trainable)
@@ -19,27 +22,32 @@
 #                which is not coded yet (would need a 1024-ft entry mode here).
 #
 # Resource floors (no-offload policy, see OPTIMIZATIONS.md):
-#   ss   → any NPROC ≥ 1 OK
-#   512  → NPROC ≥ 4 required (script hard-errors below otherwise)
+#   ss   → any NPROC ≥ 1 OK, per-gpu BS=2
+#   512  → any NPROC ≥ 1 OK, per-gpu BS=2 (full cascade fits on 1×80G; the old
+#          ">=4 GPU" floor is obsolete as of 2026-05-30)
 set -euo pipefail
 MODE="${1:-ss}"
 NPROC="${2:-1}"
-DATA_PATH="${3:-data/overfit/imgtext.jsonl}"
+# 4th arg = data source. Default = the real multi-task 3D mixture over ready_v1
+# (80,076 512-trainable assets; 3 tasks text/image/multi_image_to_3d).
+#   - a path ending in .yaml  → --mixture_config (multi-task)
+#   - any other path          → --data_path (legacy single-manifest, e.g. overfit)
+DATA="${3:-configs/mix_3d_only.yaml}"
 cd "$(dirname "$0")/.."
 
 export PATH="$(dirname "$(command -v python)"):$PATH"
 
 case "$MODE" in
   ss)
-    BUILD_SLAT=False; SS_ONLY=True
+    # SS-only = 513M trainable. per-gpu BS=2 fits easily on 80G. Default 2.
+    BUILD_SLAT=False; SS_ONLY=True; PER_GPU_BS="${PER_GPU_BS:-2}"
     ;;
   512)
-    if [ "${NPROC}" -lt 4 ]; then
-      echo "[train_native_q35.sh] '512' stage (SS + SLAT 512) needs NPROC>=4 without offload (got ${NPROC})." >&2
-      echo "  Use 'ss' mode on smaller setups, or run 512 on >=4 GPUs." >&2
-      exit 1
-    fi
-    BUILD_SLAT=True; SS_ONLY=False
+    # Full 512 cascade (SS + Shape SLAT + Tex SLAT, 3.9B trainable) FITS ON 1 GPU
+    # at per-gpu BS=2, no offload (verified 2026-05-30 — the earlier ">=4 GPU"
+    # requirement is OBSOLETE; compile + fused AdamW + partial-FT cut the memory).
+    # Override with PER_GPU_BS env if you hit OOM on a smaller card.
+    BUILD_SLAT=True; SS_ONLY=False; PER_GPU_BS="${PER_GPU_BS:-2}"
     ;;
   cascade)
     echo "[train_native_q35.sh] MODE='cascade' was renamed to '512' on 2026-05-28 to match" >&2
@@ -54,18 +62,26 @@ case "$MODE" in
 esac
 DS=configs/deepspeed_zero2.json   # always no-offload; see policy above
 
+# Route the 4th arg: .yaml → mixture (multi-task), else → single manifest.
+case "$DATA" in
+  *.yaml|*.yml) DATA_FLAG="--mixture_config ${DATA}" ;;
+  *)            DATA_FLAG="--data_path ${DATA}" ;;
+esac
+
 torchrun --nproc_per_node="${NPROC}" train_native.py \
   --vlm_model "Qwen/Qwen3.5-2B" \
-  --data_path "${DATA_PATH}" \
+  ${DATA_FLAG} \
   --freeze_vlm True \
   --build_slat "${BUILD_SLAT}" \
   --ss_only "${SS_ONLY}" \
   --num_cond_views 1 \
   --output_dir "runs/native_q35_mode${MODE}" \
   --bf16 True \
-  --per_device_train_batch_size 1 \
+  --per_device_train_batch_size "${PER_GPU_BS}" \
   --gradient_accumulation_steps 1 \
   --learning_rate 1e-4 \
+  --weight_decay 0.01 \
+  --adam_beta2 0.95 \
   --max_steps 300 \
   --logging_steps 10 \
   --save_steps 100 \

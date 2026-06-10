@@ -33,6 +33,7 @@ from PIL import Image
 
 from . import _paths  # noqa: F401
 from .dataset import TR2BLIP3oDataset
+from .vlm_collate import MAX_TOKENS_SINGLE, TOKEN_BUDGET, collate_vlm_3d
 from trellis2.datasets.structured_latent import SLat            # type: ignore
 from trellis2.datasets.structured_latent_svpbr import SLatPbr   # type: ignore
 
@@ -109,6 +110,16 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
         self.max_views = int(getattr(data_args, "max_views", 4))
         self.slat_resolution = int(getattr(data_args, "slat_resolution", 512))
         self.crop_to_object = bool(getattr(data_args, "crop_to_object", False))
+
+        # LOUD config echo (rank0): every knob above is read via getattr(..., default) — a
+        # typo'd field name in the yaml/launcher would SILENTLY fall back to the default.
+        # Printing the resolved values is the only way such a typo is ever noticed.
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[TR2NativeVLMDataset] resolved config: num_cond_views={self.num_cond_views} "
+                  f"random_cond_view={self.random_cond_view} max_slat_tokens={self.max_slat_tokens} "
+                  f"task_mix={self.task_mix} max_views={self.max_views} "
+                  f"slat_resolution={self.slat_resolution} crop_to_object={self.crop_to_object} "
+                  f"ss_only={self.ss_only}", flush=True)
 
         # Optional aesthetic filter at init (unified records only carry a score;
         # TexVerse rows have None and are always kept).
@@ -232,7 +243,8 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
 
     @staticmethod
     def _alpha_crop(img: Image.Image) -> Image.Image:
-        """Square crop centered on alpha bbox — matches TRELLIS.2 ImageConditionedMixin."""
+        """Square crop centered on alpha bbox — matches TRELLIS.2 ImageConditionedMixin.
+        (Edge-case guards backported from data/tasks/threed.py so the two paths agree.)"""
         a = np.array(img.getchannel("A"))
         ys, xs = np.where(a > 0)
         if ys.size == 0:
@@ -240,9 +252,12 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
         x0, x1 = int(xs.min()), int(xs.max())
         y0, y1 = int(ys.min()), int(ys.max())
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        h = max(x1 - x0, y1 - y0) / 2.0
+        # Half-size: never let a thin/single-pixel object collapse the box to 0.
+        h = max(x1 - x0, y1 - y0, 1) / 2.0
         box = (int(cx - h), int(cy - h), int(cx + h), int(cy + h))
-        return img.crop(box)
+        cropped = img.crop(box)
+        # crop() can still yield a tiny/empty image — bail to the original if so.
+        return cropped if min(cropped.size) > 0 else img
 
     # ------------------------------------------------------------------
     # Legacy schema — unchanged behavior
@@ -284,127 +299,28 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
 
 @dataclass
 class NativeVLMCollator:
-    """Builds VLM inputs via the native AutoProcessor + stacks 3D targets.
+    """Thin wrapper over the UNIFIED collator (trellis2_blip3o/vlm_collate.py).
 
     `processor` = AutoProcessor.from_pretrained(vlm_model). Emits exactly the
     kwargs TrellisNativeVLM.forward expects.
+
+    HISTORY: this used to carry its own (drifted) copy of the collate body with
+    budgets 400/1000 while training (data/tasks/threed.py) ran 4096/8192 — a LIVE
+    train/infer mismatch (e.g. 1024² eval renders: training saw 1024 vision
+    tok/view, this collator capped the same image to 400). Both now delegate to
+    vlm_collate.collate_vlm_3d with ONE set of budgets (the training-side values).
     """
     processor: Any
     system_prompt: Optional[str] = None  # keep minimal / None (drop_idx deferred)
-    # Token-budget cap. Qwen3.5 vision tokens = pixels / (patch_size·merge_size)²
-    # = pixels / (16·2)² = pixels / 1024.
-    # Single image → ≤ max_tokens_single. Multi-view → split token_budget across views so
-    # TOTAL cond ≤ token_budget (= cond_max_length; beyond it the flow silently truncates →
-    # drops views). max_pixels is ignored by the processor, so we resize here (downscale
-    # only; keep aspect ratio). Defaults: single-view ≤400 tok (≈ 640²), multi-view total
-    # ≤1000 (auto split per-view = token_budget // N). Override in __init__ if needed.
-    # DEPRECATED note: The _px_per_tok() helper STILL derives px/tok from the processor
-    # (so Qwen2.5-VL patch14 → 784 px/tok would also be correct if you load that backbone
-    # for inspection). But Qwen2.5-VL / Qwen3-VL are no longer a tested training path.
-    max_tokens_single: int = 400
-    token_budget: int = 1000
-    _px_per_tok_fallback: int = 1024  # used only if the processor lacks patch_size/merge_size
-
-    def _px_per_tok(self) -> int:
-        """Pixels per vision token = (patch_size·merge_size)², read from the ACTUAL processor.
-        Qwen3.5: 16·2 → 1024."""
-        ip = self.processor.image_processor
-        ps, ms = getattr(ip, "patch_size", None), getattr(ip, "merge_size", None)
-        if isinstance(ps, int) and isinstance(ms, int):
-            return (ps * ms) ** 2
-        return self._px_per_tok_fallback
-
-    @staticmethod
-    def _cap_image(img: "Image.Image", max_px: int) -> "Image.Image":
-        w, h = img.size
-        if w * h <= max_px:
-            return img
-        s = (max_px / float(w * h)) ** 0.5
-        return img.resize((max(32, round(w * s)), max(32, round(h * s))), Image.LANCZOS)
+    max_tokens_single: int = MAX_TOKENS_SINGLE   # unified w/ training (was 400)
+    token_budget: int = TOKEN_BUDGET             # unified w/ training (was 1000)
+    target_tokens_per_view: Optional[int] = None  # v3 upscale knob; None → vlm_collate module default
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, Any]:
-        texts: List[str] = []
-        flat_images: List[Image.Image] = []
-        for inst in instances:
-            imgs = inst["images"]
-            n = max(len(imgs), 1)
-            per_tok = min(self.max_tokens_single, self.token_budget // n)  # split budget over views
-            max_px = per_tok * self._px_per_tok()  # backbone-correct px/token
-            imgs = [self._cap_image(im, max_px) for im in imgs]
-            content: List[Dict[str, Any]] = [{"type": "image"} for _ in imgs]
-            content.append({"type": "text", "text": inst["caption"]})
-            messages = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": content})
-            texts.append(
-                # add_generation_prompt=False: cond use, not generation — no assistant-turn /
-                # Qwen3.5 <think></think> boilerplate. MUST match training (threed.py collator).
-                self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False
-                )
-            )
-            flat_images.extend(imgs)
-
-        proc_kwargs = dict(text=texts, padding=True, return_tensors="pt")
-        if flat_images:
-            proc_kwargs["images"] = flat_images
-        enc = self.processor(**proc_kwargs)
-
-        # Safety net: if vision tokens still exceed the budget, the flow's cond_max_length
-        # truncation would silently drop content/views — warn loudly with the real count.
-        g = enc.get("image_grid_thw")
-        if g is not None:
-            ms = self.processor.image_processor.merge_size
-            vtok = int((g[:, 0] * g[:, 1] * g[:, 2]).sum().item() // (ms * ms))
-            if vtok > self.token_budget:
-                import warnings
-                warnings.warn(
-                    f"[NativeVLMCollator] vision tokens={vtok} > token_budget={self.token_budget}: "
-                    f"cond_max_length will TRUNCATE (drops later views/content)."
-                )
-
-        # cond_keep_mask: drop chat-template boilerplate from the flow cond (match training).
-        tok = self.processor.tokenizer
-        if not hasattr(self, "_boiler_ids"):
-            ids = set()
-            for nm in ("<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>",
-                       "<think>", "</think>"):
-                tid = tok.convert_tokens_to_ids(nm)
-                if isinstance(tid, int) and tid is not None and tid >= 0:
-                    ids.add(tid)
-            for nm in ("system", "user", "assistant"):
-                for tid in tok(nm, add_special_tokens=False).input_ids:
-                    ids.add(tid)
-            self._boiler_ids = ids
-        _boiler = torch.tensor(sorted(self._boiler_ids), dtype=enc["input_ids"].dtype)
-        cond_keep = enc["attention_mask"].bool() & ~torch.isin(enc["input_ids"], _boiler)
-
-        batch: Dict[str, Any] = {
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "cond_keep_mask": cond_keep,
-            "target_ss_latent": torch.stack(
-                [inst["target_ss_latent"] for inst in instances], dim=0
-            ),
-        }
-        if "pixel_values" in enc:
-            batch["pixel_values"] = enc["pixel_values"]
-            batch["image_grid_thw"] = enc.get("image_grid_thw")
-        if "pixel_values_videos" in enc:
-            batch["pixel_values_videos"] = enc["pixel_values_videos"]
-            batch["video_grid_thw"] = enc.get("video_grid_thw")
-
-        # Sparse SLAT targets (reuse TRELLIS collate_fn — identical to upstream).
-        if "target_shape_slat_512_item" in instances[0]:
-            shape_pack = SLat.collate_fn(
-                [inst["target_shape_slat_512_item"] for inst in instances]
-            )
-            batch["target_shape_slat_512"] = shape_pack["x_0"]
-        if "target_tex_slat_512_item" in instances[0]:
-            tex_pack = SLatPbr.collate_fn(
-                [inst["target_tex_slat_512_item"] for inst in instances]
-            )
-            batch["target_tex_slat_512"] = tex_pack["x_0"]
-            batch["tex_concat_cond"] = tex_pack["concat_cond"]
-        return batch
+        return collate_vlm_3d(
+            list(instances), self.processor,
+            max_tokens_single=self.max_tokens_single,
+            token_budget=self.token_budget,
+            target_tokens_per_view=self.target_tokens_per_view,
+            system_prompt=self.system_prompt,
+        )

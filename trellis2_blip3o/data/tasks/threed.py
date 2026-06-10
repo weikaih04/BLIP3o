@@ -28,6 +28,7 @@ from torch.utils.data import Dataset
 
 from ... import _paths  # noqa: F401 — ensures trellis2 + blip3o on sys.path
 from ..registry import register_task
+from ...vlm_collate import MAX_TOKENS_SINGLE, TOKEN_BUDGET, collate_vlm_3d
 
 from ...tr2_modules import (
     load_norm_stats,
@@ -317,119 +318,18 @@ class _ThreeDTaskBase(Dataset):
     # ------------------------------------------------------------------
     @staticmethod
     def collate_fn(batch, processor, *,
-                   max_tokens_single: int = 4096,
-                   token_budget: int = 8192) -> Dict[str, Any]:
-        texts, flat_images, dino_pil = [], [], []
-        px_per_tok = _px_per_tok(processor)
-
-        for inst in batch:
-            imgs = inst["images"]
-            n = max(len(imgs), 1)
-            per_tok = min(max_tokens_single, token_budget // n)
-            max_px = per_tok * px_per_tok
-            capped = [_cap_image(im, max_px) for im in imgs]
-            content: List[Dict[str, Any]] = [{"type": "image"} for _ in capped]
-            content.append({"type": "text", "text": inst["caption"]})
-            messages = [{"role": "user", "content": content}]
-            # add_generation_prompt=False: we use the VLM hidden as CONDITIONING, not for text
-            # generation — so we do NOT want the assistant-turn start + Qwen3.5's empty
-            # <think></think> reasoning block that add_generation_prompt=True appends (7 tokens of
-            # pure boilerplate that dilute the cond, worst for text→3D where Qwen is the only cond).
-            texts.append(processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False))
-            flat_images.extend(capped)
-            # DINOv3 alignment (optional, consumed only if model.dino_align is on):
-            # the SAME conditioning views at DINOv3's 512px, in the SAME flat order
-            # as Qwen's images / image_grid_thw. Cheap to always emit.
-            dino_pil.extend(imgs)   # use originals (pre-cap); resized to 512 below
-
-        proc_kwargs = dict(text=texts, padding=True, return_tensors="pt")
-        if flat_images:
-            proc_kwargs["images"] = flat_images
-        enc = processor(**proc_kwargs)
-
-        # cond_keep_mask: which tokens the flow cross-attn should attend to as conditioning.
-        # = attention_mask (real tokens) MINUS the chat-template STRUCTURAL special tokens
-        # (<|im_start|>, <|im_end|>, <|vision_start|>, <|vision_end|>, role tokens, <think>/
-        # </think>). Those are constant boilerplate that dilute the cond. We KEEP <|image_pad|>
-        # (expands to image patches = real image content) and the caption text. Masked at the
-        # cross-attn level only → does NOT shift token positions / image_pad expansion.
-        tok = processor.tokenizer
-        # cache the boiler-id set on the tokenizer object (collate_fn is a @staticmethod, no self)
-        _boiler_ids = getattr(tok, "_boiler_ids_cache", None)
-        if _boiler_ids is None:
-            names = ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>",
-                     "<think>", "</think>"]
-            ids = set()
-            for nm in names:
-                tid = tok.convert_tokens_to_ids(nm)
-                if isinstance(tid, int) and tid is not None and tid >= 0:
-                    ids.add(tid)
-            # role-name tokens ("user"/"assistant") — they directly follow <|im_start|>
-            for nm in ("user", "assistant"):
-                for tid in tok(nm, add_special_tokens=False).input_ids:
-                    ids.add(tid)
-            _boiler_ids = ids
-            tok._boiler_ids_cache = ids
-        _boiler = torch.tensor(sorted(_boiler_ids), dtype=enc["input_ids"].dtype)
-        cond_keep = enc["attention_mask"].bool() & ~torch.isin(enc["input_ids"], _boiler)
-
-        out: Dict[str, Any] = {
-            "_task": batch[0]["_task"],
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "cond_keep_mask": cond_keep,
-            "target_ss_latent": torch.stack(
-                [inst["target_ss_latent"] for inst in batch], dim=0),
-        }
-        if "pixel_values" in enc:
-            out["pixel_values"] = enc["pixel_values"]
-            out["image_grid_thw"] = enc.get("image_grid_thw")
-            # DINOv3 images: (M,3,512,512) in [0,1], flat order matching image_grid_thw.
-            # (DinoV3FeatureExtractor applies its own ImageNet Normalize.)
-            if dino_pil:
-                import numpy as _np
-                dino_t = torch.stack([
-                    torch.from_numpy(
-                        _np.asarray(im.convert("RGB").resize((512, 512), Image.BILINEAR),
-                                    dtype="float32")
-                    ).permute(2, 0, 1) / 255.0
-                    for im in dino_pil
-                ], dim=0)
-                out["dino_images"] = dino_t
-        if "pixel_values_videos" in enc:
-            out["pixel_values_videos"] = enc["pixel_values_videos"]
-            out["video_grid_thw"] = enc.get("video_grid_thw")
-
-        if "target_shape_slat_512_item" in batch[0]:
-            shape_pack = SLat.collate_fn(
-                [inst["target_shape_slat_512_item"] for inst in batch])
-            out["target_shape_slat_512"] = shape_pack["x_0"]
-        if "target_tex_slat_512_item" in batch[0]:
-            tex_pack = SLatPbr.collate_fn(
-                [inst["target_tex_slat_512_item"] for inst in batch])
-            out["target_tex_slat_512"] = tex_pack["x_0"]
-            out["tex_concat_cond"] = tex_pack["concat_cond"]
-        return out
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Helpers (processor introspection + image capping)
-# ────────────────────────────────────────────────────────────────────────────
-def _px_per_tok(processor) -> int:
-    ip = processor.image_processor
-    ps, ms = getattr(ip, "patch_size", None), getattr(ip, "merge_size", None)
-    if isinstance(ps, int) and isinstance(ms, int):
-        return (ps * ms) ** 2
-    return 1024  # Qwen3.5 default (patch_size=16, merge_size=2 → 1024)
-
-
-def _cap_image(img: Image.Image, max_px: int) -> Image.Image:
-    w, h = img.size
-    if w * h <= max_px:
-        return img
-    s = (max_px / float(w * h)) ** 0.5
-    return img.resize((max(32, round(w * s)), max(32, round(h * s))), Image.LANCZOS)
+                   max_tokens_single: int = MAX_TOKENS_SINGLE,
+                   token_budget: int = TOKEN_BUDGET,
+                   target_tokens_per_view: Optional[int] = None) -> Dict[str, Any]:
+        """Delegates to the UNIFIED collator (trellis2_blip3o/vlm_collate.py) — single
+        source of truth shared with the inference harness's NativeVLMCollator, so the
+        training and inference input pipelines cannot drift again."""
+        return collate_vlm_3d(
+            batch, processor,
+            max_tokens_single=max_tokens_single,
+            token_budget=token_budget,
+            target_tokens_per_view=target_tokens_per_view,
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
