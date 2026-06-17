@@ -324,10 +324,26 @@ class NativeArgs:
     distill_v_weight: float = field(default=1.0)       # λ_v output-level KD
     distill_f_weight: float = field(default=0.5)       # λ_f feature-level KD (relative MSE, O(1))
     distill_f_blocks: str = field(default="auto5")     # "autoK" evenly-spaced inner blocks | "3,9,15"
+    # Stage-1.5 CFG-AWARE KD: >0 → kd_v matches the GUIDED velocity v_u+s(v_c−v_u), s~U[lo,hi].
+    # Fixes the ×s amplification 'sand' (inference uses CFG; raw-v KD leaves the guided
+    # quantity unsupervised). null_grad=False = lite (student null pass no_grad, ≈+40% step).
+    distill_cfg_lo: float = field(default=3.0)
+    distill_cfg_hi: float = field(default=0.0)
+    distill_cfg_null_grad: bool = field(default=False)
     # V3 token raise: upscale each cond view so its Qwen vision tokens reach this count
     # (1024 = 32×32 grid, 1:1 with the DINOv3 teacher grid @512px). 0 = off (today's 256).
     # Set process-wide via vlm_collate → applies to ALL 3D task collates uniformly.
     target_tokens_per_view: int = field(default=0)
+    # ── VLM-hidden cache + stage-split (vlm_cache.py / docs Stage-2 infra) ──
+    # build_vlm=False: skip loading the 2B VLM (conds arrive precomputed via the
+    # dataset's cached_hidden_root — set THAT in the mixture yaml task args).
+    build_vlm: bool = field(default=True)
+    # Train only one cascade component per job (TRELLIS-style split): all|ss|shape|tex.
+    # Stages are GT-decoupled in training; each split job trains its own connector copy.
+    train_stages: str = field(default="all")
+    # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
+    fuse_dino: bool = field(default=False)
+    dino_drop_prob: float = field(default=0.1)
     # Warm-start connector+flow from a prior run's checkpoint dir (loads model.safetensors,
     # strict=False, NO optimizer/step resume). For adding the dino head on trained weights.
     init_from_checkpoint: str = field(default="")
@@ -425,6 +441,15 @@ def main():
         distill_v_weight=native_args.distill_v_weight,
         distill_f_weight=native_args.distill_f_weight,
         distill_f_blocks=native_args.distill_f_blocks,
+        distill_cfg_lo=native_args.distill_cfg_lo,
+        distill_cfg_hi=native_args.distill_cfg_hi,
+        distill_cfg_null_grad=native_args.distill_cfg_null_grad,
+        # vision-token contract → saved in ckpt config.json so inference auto-matches
+        target_tokens_per_view=native_args.target_tokens_per_view,
+        build_vlm=native_args.build_vlm,
+        train_stages=native_args.train_stages,
+        fuse_dino=native_args.fuse_dino,
+        dino_drop_prob=native_args.dino_drop_prob,
     )
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)

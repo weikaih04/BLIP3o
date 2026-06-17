@@ -124,6 +124,10 @@ class TRELLIS2FlowMatchingLoss:
         kd_v_weight: float = 1.0,
         kd_f_weight: float = 0.5,
         kd_f_blocks: str = "auto5",
+        kd_cfg_lo: float = 3.0,
+        kd_cfg_hi: float = 0.0,                       # >0 enables CFG-AWARE KD (s ~ U[lo, hi])
+        kd_cfg_null_grad: bool = False,               # full version: backprop through student null pass
+        student_null_cond: Optional[torch.Tensor] = None,  # connector(0-hidden); required if kd_cfg_hi>0
         **flow_kwargs,
     ) -> Tuple[torch.Tensor, Dict]:
         """Compute one-step flow MSE loss. Dispatches dense (SS Flow) vs sparse (SLAT).
@@ -143,6 +147,16 @@ class TRELLIS2FlowMatchingLoss:
                 no_grad pass of the SAME flow on the SAME (x_t, t) with this cond and adds
                 kd_v_weight·‖v_s − v_t‖² + kd_f_weight·Σ_l‖block_l^S − block_l^T‖².
                 Teacher cond is assumed unpadded (DINOv3 features → no mask).
+            kd_cfg_hi: >0 switches the velocity-KD target to the CFG-GUIDED velocity
+                (docs/V3_DISTILL_DESIGN.md, Stage-1.5). Per call, sample s ~ U[kd_cfg_lo,
+                kd_cfg_hi]; teacher adds a null pass (zeros cond — stock TRELLIS's uncond
+                convention) → v_t_g = v_u + s(v_c − v_u); student adds a null pass with
+                `student_null_cond` (= connector(0-hidden), the student's train-time uncond)
+                → v_s_g likewise; kd_v matches the GUIDED pair — the quantity inference
+                actually uses, fixing the ×s amplification of residual high-freq error
+                (root cause of the @1500 'sand'). kd_cfg_null_grad=False (lite) runs the
+                student null pass no_grad (≈+40% step); True (full) backprops it too,
+                additionally TRAINING the student's uncond direction (≈2× step).
 
         Returns:
             loss: scalar tensor (flow MSE [+ KD terms when teacher_cond given]).
@@ -180,24 +194,36 @@ class TRELLIS2FlowMatchingLoss:
             # ── V3 distillation: TEACHER pass FIRST (no_grad → its activations are freed
             # before the student pass allocates, so peak memory ≈ a single pass). Same
             # flow, same (x_t, t); only the cond differs (condition-swap self-distill).
+            cfg_aware = distill and kd_cfg_hi > 0
+            if cfg_aware:
+                assert student_null_cond is not None, "kd_cfg_hi>0 requires student_null_cond"
+                s_cfg = float(torch.empty(1).uniform_(kd_cfg_lo, kd_cfg_hi))
+
+            def _run(cond_t, hooked_tap=None):
+                """One flow pass with a dense cond tensor (no mask), fp32 output."""
+                if is_sparse:
+                    out = flow_model(x_t, t_in, [cond_t[b] for b in range(cond_t.shape[0])],
+                                     **flow_kwargs)
+                    return out.feats.float()
+                return flow_model(x_t, t_in, cond_t, cond_mask=None, **flow_kwargs).float()
+
             v_teacher = None
             teacher_feats: Dict[int, torch.Tensor] = {}
             if distill:
+                tc = teacher_cond.to(x_t_dtype)
                 tap_t = _BlockTap(flow_model.blocks, kd_idx, detach_fp32=True) if kd_idx else None
                 try:
                     with torch.no_grad():
-                        tc = teacher_cond.to(x_t_dtype)
-                        if is_sparse:
-                            tc_list = [tc[b] for b in range(tc.shape[0])]
-                            v_teacher = flow_model(x_t, t_in, tc_list, **flow_kwargs)
-                            v_teacher = v_teacher.feats.float()
-                        else:
-                            v_teacher = flow_model(x_t, t_in, tc, cond_mask=None, **flow_kwargs)
-                            v_teacher = v_teacher.float()
+                        v_t_c = _run(tc)              # teacher COND pass (hooked → L_f targets)
                 finally:
                     if tap_t is not None:
                         teacher_feats = tap_t.captured
                         tap_t.remove()
+                v_teacher = v_t_c
+                if cfg_aware:                          # teacher NULL pass (unhooked)
+                    with torch.no_grad():
+                        v_t_u = _run(torch.zeros_like(tc))
+                    v_teacher = v_t_u + s_cfg * (v_t_c - v_t_u)   # the GUIDED target
 
             # ── STUDENT pass (the original flow loss path, unchanged) ──
             tap_s = _BlockTap(flow_model.blocks, kd_idx, detach_fp32=False) if kd_idx else None
@@ -227,6 +253,17 @@ class TRELLIS2FlowMatchingLoss:
                 if tap_s is not None:
                     tap_s.remove()
 
+            # ── CFG-aware student NULL pass (unhooked; lite = no_grad) ──
+            v_student_kd = None
+            if cfg_aware:
+                sn = student_null_cond.to(x_t_dtype)
+                if kd_cfg_null_grad:
+                    v_s_u = _run(sn)
+                else:
+                    with torch.no_grad():
+                        v_s_u = _run(sn)
+                v_student_kd = v_s_u + s_cfg * (v_pred_f - v_s_u)   # student GUIDED velocity
+
         logs = {
             "flow_mse": loss.detach().float().item(),
             "t_mean": float(t.mean().item()),
@@ -235,9 +272,11 @@ class TRELLIS2FlowMatchingLoss:
         # ── KD terms (fp32, outside autocast — inputs already float) ──
         if distill:
             if kd_v_weight > 0 and v_teacher is not None:
-                kd_v = F.mse_loss(v_pred_f, v_teacher)
+                kd_v = F.mse_loss(v_student_kd if cfg_aware else v_pred_f, v_teacher)
                 loss = loss + kd_v_weight * kd_v
                 logs["kd_v"] = kd_v.detach().float().item()
+                if cfg_aware:
+                    logs["kd_cfg_s"] = s_cfg
             if kd_idx and teacher_feats:
                 # RELATIVE per-block MSE (÷ teacher mean-square): raw block activations
                 # have norms ~10-100× the velocity scale, which would let kd_f dominate

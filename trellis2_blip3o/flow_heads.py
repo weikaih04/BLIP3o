@@ -102,6 +102,20 @@ def compute_cascade_flow_loss(
     kd_v_weight: float = 1.0,
     kd_f_weight: float = 0.5,
     kd_f_blocks: str = "auto5",
+    kd_cfg_lo: float = 3.0,
+    kd_cfg_hi: float = 0.0,                        # >0 → CFG-AWARE KD (Stage-1.5); see loss.py
+    kd_cfg_null_grad: bool = False,
+    # ── fusion: raw DINOv3 tokens concatenated BEFORE the Qwen segment (single
+    # cross-attn, no new modules — docs/FUSION_DESIGN). DINO bypasses the connector:
+    # its 1024-d tokens are the native distribution the pretrained cross-attn was
+    # trained on. Segment order [DINO; Qwen] mirrors BOTH-CFG packed inference.
+    dino_hidden: Optional[torch.Tensor] = None,    # (B, N_d, 1024) frozen DINOv3 tokens
+    dino_key_mask: Optional[torch.Tensor] = None,  # (B, N_d) bool
+    dino_drop_prob: float = 0.0,                   # DINO-dropout curriculum (anti rich-get-richer):
+                                                   # per-sample, mask the WHOLE DINO segment OFF
+                                                   # (segment absent — the text→3D/no-DINO regime)
+    dino_view_ids: Optional[torch.Tensor] = None,  # (B, N_d) view ordinals (IM identity)
+    dino_view_embed: Optional[torch.Tensor] = None,  # (V_max, 1024) ZERO-INIT learned param
 ) -> Tuple[torch.Tensor, Dict]:
     """VLM hidden → connector → TRELLIS cascade flow loss (SS + Shape + Tex).
 
@@ -134,7 +148,34 @@ def compute_cascade_flow_loss(
         cond_hidden = cond_hidden.detach()
 
     # 3. project to TRELLIS cond space (+ CFG dropout).
-    if teacher_cond is None:
+    if dino_hidden is not None:
+        # ── fusion path. CFG dropout must hit BOTH segments with the SAME per-sample
+        # decision (uncond = [zeros(DINO); connector(0)], matching BOTH-CFG inference),
+        # so use an explicit drop mask instead of mask_drop's internal one.
+        assert teacher_cond is None, "fusion + KD not supported (KD path archived)"
+        B = cond_hidden.shape[0]
+        drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+        keep = (~drop).to(cond_hidden.dtype).view(B, 1, 1)
+        cond_q = connector(cond_hidden * keep)                       # (B, T_q, 1024)
+        dino_seg = dino_hidden.to(cond_q.dtype)                      # (B, N_d, 1024)
+        if dino_view_embed is not None and dino_view_ids is not None:
+            # multi-image identity: zero-init per-ordinal embedding (grad flows to the
+            # param; the frozen DINO tokens stay constants). Applied BEFORE the CFG
+            # zeroing so the uncond pass sees plain zeros, same as inference neg.
+            dino_seg = dino_seg + dino_view_embed[dino_view_ids].to(cond_q.dtype)
+        dino_seg = dino_seg * keep
+        dmask = dino_key_mask if dino_key_mask is not None else torch.ones(
+            dino_hidden.shape[:2], dtype=torch.bool, device=dino_hidden.device)
+        # DINO-dropout: per-sample segment ABSENT (keys masked off). Independent of the
+        # CFG drop — a CFG-dropped sample keeps its (zeroed) DINO keys visible, exactly
+        # like the packed inference neg pass.
+        if dino_drop_prob > 0:
+            ddrop = (torch.rand(B, device=dino_hidden.device) < dino_drop_prob)
+            dmask = dmask & ~ddrop[:, None]
+        cond = torch.cat([dino_seg, cond_q], dim=1)
+        cond_key_mask = torch.cat([dmask, cond_key_mask], dim=1)
+        kd_active = False
+    elif teacher_cond is None:
         cond = connector(mask_drop(cond_hidden, mask_drop_prob))
         kd_active = False
     else:
@@ -154,15 +195,24 @@ def compute_cascade_flow_loss(
              kd_f_weight=kd_f_weight, kd_f_blocks=kd_f_blocks)
         if (teacher_cond is not None and kd_active) else {}
     )
+    if kd_kwargs and kd_cfg_hi > 0:
+        # CFG-aware KD: the student's uncond = its train-time mask_drop convention,
+        # connector(0-hidden) — NOT zeros in cond space (see null_cond_like docstring).
+        kd_kwargs.update(
+            kd_cfg_lo=kd_cfg_lo, kd_cfg_hi=kd_cfg_hi, kd_cfg_null_grad=kd_cfg_null_grad,
+            student_null_cond=null_cond_like(connector, cond_hidden),
+        )
 
     flow_losses: Dict[str, torch.Tensor] = {}
     stage_logs: Dict[str, Dict] = {}
 
-    # Stage 1: SS Flow (dense, logitNormal t-schedule).
-    ss_target = target_ss_latent.to(cond.dtype)
-    L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask, **kd_kwargs)
-    flow_losses["ss"] = L_ss
-    stage_logs["ss"] = log_ss
+    # Stage 1: SS Flow (dense, logitNormal t-schedule). ss_flow=None → stage-split job
+    # (--train_stages shape|tex) that doesn't build/train SS.
+    if ss_flow is not None and target_ss_latent is not None:
+        ss_target = target_ss_latent.to(cond.dtype)
+        L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask, **kd_kwargs)
+        flow_losses["ss"] = L_ss
+        stage_logs["ss"] = log_ss
 
     # Stage 2: Shape SLAT (sparse, uniform t-schedule).
     if target_shape_slat_512 is not None and shape_slat is not None:
@@ -181,6 +231,10 @@ def compute_cascade_flow_loss(
         )
         flow_losses["tex_slat_512"] = L_tex
         stage_logs["tex_slat_512"] = log_tex
+
+    if not flow_losses:
+        raise ValueError("[flow_heads] no stage produced a loss — check train_stages vs "
+                         "provided targets (ss_flow/shape_slat/tex_slat all None or missing targets)")
 
     # 4. weighted-mean combination: L = flow_weight · Σ ŵ_i · L_i  (ŵ normalized).
     stage_weights_all = parse_flow_stage_weights(flow_stage_weights)

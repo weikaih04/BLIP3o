@@ -126,6 +126,42 @@ def collate_vlm_3d(
     delegate here, so the two paths cannot drift again."""
     if target_tokens_per_view is None:
         target_tokens_per_view = _DEFAULT_TARGET_TOKENS_PER_VIEW
+
+    # ── VLM-hidden cache fast path (vlm_cache.py): items carry precomputed cond —
+    # skip template/processor entirely; the model's forward(cond_hidden=...) skips
+    # the VLM. Targets are stacked identically to the live path below.
+    if "cond_hidden" in batch[0]:
+        from .vlm_cache import collate_cached
+        out: Dict[str, Any] = collate_cached(batch)
+        if "dino_hidden" in batch[0]:
+            # fusion: pad/stack the cached DINO segments via the same helper
+            dpack = collate_cached([{"cond_hidden": b["dino_hidden"],
+                                     "cond_keep_mask": b["dino_keep_mask"]} for b in batch])
+            out["dino_hidden"] = dpack["cond_hidden"]
+            out["dino_keep_mask"] = dpack["cond_keep_mask"]
+            # per-token view ordinals (IM view_embed); pad with 0 (padded keys are masked)
+            ids = [b.get("dino_view_ids") for b in batch]
+            if all(x is not None for x in ids):
+                T = out["dino_hidden"].shape[1]
+                vid = torch.zeros(len(ids), T, dtype=torch.long)
+                for i, x in enumerate(ids):
+                    vid[i, :x.shape[0]] = x
+                out["dino_view_ids"] = vid
+        if "_task" in batch[0]:
+            out["_task"] = batch[0]["_task"]
+        if "target_ss_latent" in batch[0]:
+            out["target_ss_latent"] = torch.stack(
+                [inst["target_ss_latent"] for inst in batch], dim=0)
+        if "target_shape_slat_512_item" in batch[0]:
+            out["target_shape_slat_512"] = SLat.collate_fn(
+                [inst["target_shape_slat_512_item"] for inst in batch])["x_0"]
+        if "target_tex_slat_512_item" in batch[0]:
+            tex_pack = SLatPbr.collate_fn(
+                [inst["target_tex_slat_512_item"] for inst in batch])
+            out["target_tex_slat_512"] = tex_pack["x_0"]
+            out["tex_concat_cond"] = tex_pack["concat_cond"]
+        return out
+
     texts: List[str] = []
     flat_images: List[Image.Image] = []
     dino_pil: List[Image.Image] = []

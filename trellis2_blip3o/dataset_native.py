@@ -183,13 +183,20 @@ class TR2NativeVLMDataset(TR2BLIP3oDataset):
         images: List[Image.Image] = []
         if task in ("I1", "IM"):
             n_avail = int(rec.get("n_views", 16))
-            if task == "I1":
-                n = 1
+            # IM_VIEWS env (eval diagnostics): force an EXACT view list so resolution /
+            # config arms compare on identical views. e.g. IM_VIEWS="0,4,8".
+            _force = os.environ.get("IM_VIEWS")
+            if _force and task == "IM":
+                view_ids = sorted(int(v) for v in _force.split(",") if v.strip())
+                view_ids = [v for v in view_ids if v < n_avail]
             else:
-                hi = max(3, self.max_views + 1)        # rng.integers high is exclusive
-                n = int(rng.integers(2, hi))
-            n = min(n, n_avail)
-            view_ids = sorted(int(v) for v in rng.choice(n_avail, size=n, replace=False))
+                if task == "I1":
+                    n = 1
+                else:
+                    hi = max(3, self.max_views + 1)        # rng.integers high is exclusive
+                    n = int(rng.integers(2, hi))
+                n = min(n, n_avail)
+                view_ids = sorted(int(v) for v in rng.choice(n_avail, size=n, replace=False))
             images = self._load_views(rec["renders_dir"], view_ids)
 
         res = self.slat_resolution

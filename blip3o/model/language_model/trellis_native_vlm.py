@@ -93,6 +93,32 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         distill_v_weight: float = 1.0,
         distill_f_weight: float = 0.5,
         distill_f_blocks: str = "auto5",        # "autoK" = K evenly-spaced inner blocks | "3,9,15"
+        # Stage-1.5 CFG-AWARE KD (fixes the ×s amplification 'sand'; see loss.py docstring).
+        # distill_cfg_hi>0 enables: kd_v matches the GUIDED velocity v_u+s(v_c−v_u),
+        # s ~ U[lo, hi] per step. null_grad=False = lite (student null pass no_grad).
+        distill_cfg_lo: float = 3.0,
+        distill_cfg_hi: float = 0.0,
+        distill_cfg_null_grad: bool = False,
+        # Vision-token contract: views are upscaled so each yields this many Qwen vision
+        # tokens (1024 = 32×32 grid = DINOv3-teacher parity). Stored IN the checkpoint so
+        # inference reads it from config and cannot silently mismatch training (the
+        # collator implements the resize; this field is the source of truth). 0 = native.
+        target_tokens_per_view: int = 0,
+        # VLM-hidden cache mode (vlm_cache.py): False skips loading the 2B VLM entirely —
+        # conds must arrive via forward(cond_hidden=...) from the precomputed cache.
+        build_vlm: bool = True,
+        # ── fusion: cond = [raw DINOv3 tokens; connector(Qwen hidden)] into the ONE
+        # pretrained cross-attn (no new modules). DINO arrives via forward(dino_hidden=...)
+        # (cached d-keys). dino_drop_prob = DINO-dropout curriculum (segment masked off
+        # per-sample, training only) — anti rich-get-richer, makes Qwen self-sufficient.
+        fuse_dino: bool = False,
+        dino_drop_prob: float = 0.1,
+        # IM multi-view identity for the DINO segment (Qwen segment self-identifies via
+        # template/M-RoPE). ZERO-INIT learned per-ordinal embedding added to the DINO
+        # tokens — starts as a no-op (I1-trained fusion ckpts unaffected), learns at S3.
+        dino_view_embed_max: int = 8,
+        # Stage-split training: build/train only one component per job (see __init__).
+        train_stages: str = "all",              # all | ss | shape | tex
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
         flow_sigma_min: float = 1e-5,
@@ -133,6 +159,15 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.distill_v_weight = distill_v_weight
         self.distill_f_weight = distill_f_weight
         self.distill_f_blocks = distill_f_blocks
+        self.distill_cfg_lo = distill_cfg_lo
+        self.distill_cfg_hi = distill_cfg_hi
+        self.distill_cfg_null_grad = distill_cfg_null_grad
+        self.target_tokens_per_view = target_tokens_per_view
+        self.build_vlm = build_vlm
+        self.train_stages = train_stages
+        self.fuse_dino = fuse_dino
+        self.dino_drop_prob = dino_drop_prob
+        self.dino_view_embed_max = dino_view_embed_max
         self.logitnorm_mean = logitnorm_mean
         self.logitnorm_std = logitnorm_std
         self.flow_sigma_min = flow_sigma_min
@@ -166,38 +201,56 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # coincided with NaN-from-step-4 in the first elastic cascade run; reverting to
         # sdpa first before re-attempting (numerical instability of flash_attn_2 on
         # Qwen3.5-2B's 6/24 full-attn layers under bf16 + variable cond_len is suspected).
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
-            config.vlm_model, dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        )
-        if config.freeze_vlm:
-            self.vlm.requires_grad_(False)
-            self.vlm.eval()
+        if getattr(config, "build_vlm", True):
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                config.vlm_model, dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+            if config.freeze_vlm:
+                self.vlm.requires_grad_(False)
+                self.vlm.eval()
+        else:
+            # VLM-hidden CACHE mode (vlm_cache.py): all conds arrive precomputed via the
+            # forward's cond_hidden fast path → skip loading the 2B VLM entirely
+            # (~5-6 GB GPU + load time saved → bigger batch). encode_cond is unusable.
+            self.vlm = None
+            rank0_print("[vlm_cache] build_vlm=False — VLM NOT loaded; conds must come "
+                        "from the cache (forward cond_hidden=...)")
 
         # Derive the LLM hidden dim from the loaded VLM (Qwen3.5-2B = 2048) rather
         # than trusting config.vlm_hidden_size. Falls back to the config value.
-        try:
-            text_cfg = self.vlm.config.get_text_config()
-        except Exception:
-            text_cfg = getattr(self.vlm.config, "text_config", self.vlm.config)
-        vlm_hidden = getattr(text_cfg, "hidden_size", None) or config.vlm_hidden_size
-        config.vlm_hidden_size = int(vlm_hidden)  # keep config in sync for save/reload
+        if self.vlm is not None:
+            try:
+                text_cfg = self.vlm.config.get_text_config()
+            except Exception:
+                text_cfg = getattr(self.vlm.config, "text_config", self.vlm.config)
+            vlm_hidden = getattr(text_cfg, "hidden_size", None) or config.vlm_hidden_size
+            config.vlm_hidden_size = int(vlm_hidden)  # keep config in sync for save/reload
 
         # --- TRELLIS cascade (these builders LOAD the pretrained TRELLIS ckpts) ---
-        self.ss_flow = build_ss_flow(config)            # trainable 1.3B SS Flow
-        if config.build_slat:
+        # Stage-split (--train_stages all|ss|shape|tex): build ONLY the flow(s) this job
+        # trains. Legal because the 3 stages are GT-decoupled in training (shape conditions
+        # GT coords, tex teacher-forces GT shape SLAT) — TRELLIS官方 trains them as separate
+        # runs too. A split job gets its own connector copy (per-stage connectors are a
+        # feature: more capacity, assembled at inference). flow_heads skips None flows.
+        _stages = str(getattr(config, "train_stages", "all"))
+        assert _stages in ("all", "ss", "shape", "tex"), f"bad train_stages={_stages!r}"
+        self.ss_flow = build_ss_flow(config) if _stages in ("all", "ss") else None
+        if config.build_slat and _stages in ("all", "shape", "tex"):
             # Attribute names keep the "_512" suffix for cross-file compatibility; the
             # underlying flow is the 1024 variant when slat_resolution=1024 (manifest
             # must point target_shape_slat_512/tex_slat_512 to the 1024 latent paths).
             _res = int(getattr(config, "slat_resolution", 512))
+            _b_shape = _stages in ("all", "shape")
+            _b_tex = _stages in ("all", "tex")
             if _res == 1024:
-                self.shape_slat_512 = build_shape_slat_1024(config)
-                self.tex_slat_512 = build_tex_slat_1024(config)
+                self.shape_slat_512 = build_shape_slat_1024(config) if _b_shape else None
+                self.tex_slat_512 = build_tex_slat_1024(config) if _b_tex else None
             else:
-                self.shape_slat_512 = build_shape_slat_512(config)
-                self.tex_slat_512 = build_tex_slat_512(config)
-            rank0_print(f"[slat] resolution={_res} → shape/tex flows = "
-                        + ("1024 variant" if _res == 1024 else "512 variant"))
+                self.shape_slat_512 = build_shape_slat_512(config) if _b_shape else None
+                self.tex_slat_512 = build_tex_slat_512(config) if _b_tex else None
+            rank0_print(f"[slat] resolution={_res} stages={_stages} → shape="
+                        f"{_b_shape} tex={_b_tex}")
             self.trellis_decoders = build_trellis_decoders(config)  # frozen, inference-only
         else:
             # SS-only training: skip the SLAT flows + decoders (lighter, faster).
@@ -211,6 +264,14 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             vlm_hidden_dim=config.vlm_hidden_size,
             trellis_cond_dim=TRELLIS_COND_DIM,
         )
+
+        # --- fusion: zero-init per-view-ordinal embedding for the DINO segment ---
+        # (multi-image identity; no-op at init so I1-trained fusion ckpts load cleanly)
+        self.dino_view_embed = None
+        if getattr(config, "fuse_dino", False):
+            self.dino_view_embed = torch.nn.Parameter(
+                torch.zeros(int(getattr(config, "dino_view_embed_max", 8)),
+                            TRELLIS_COND_DIM))
 
         # --- DINOv3 conditioning aligner (REPA-inspired; image tasks only) ---
         # Frozen DINOv3 + train-only projection head. OFF unless config.dino_align.
@@ -464,6 +525,11 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # cached-cond fast path (deferred feature; v1 leaves these None → run VLM)
         cond_hidden: Optional[torch.Tensor] = None,
         cond_key_mask: Optional[torch.Tensor] = None,
+        # fusion (config.fuse_dino): cached frozen-DINOv3 tokens, concatenated before
+        # the Qwen segment inside compute_cascade_flow_loss (single cross-attn).
+        dino_hidden: Optional[torch.Tensor] = None,
+        dino_keep_mask: Optional[torch.Tensor] = None,
+        dino_view_ids: Optional[torch.Tensor] = None,   # (B, N_d) view ordinals (IM)
         # cond_keep_mask (collator): True = real CONTENT token (caption/image_pad); False = chat-
         # template boilerplate (im_start/im_end/vision_*/role/think). ANDed into cond_key_mask so
         # the flow cross-attn ignores boilerplate → cleaner cond (esp. text→3D).
@@ -548,6 +614,25 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+        else:
+            # VLM-hidden CACHE fast path (vlm_cache.py): cond arrives precomputed.
+            # The cached keep_mask already encodes attention ∧ ¬boilerplate AND pads
+            # False → it IS the key mask. Cache stores fp16 → cast to the connector's
+            # compute dtype (bf16 under DeepSpeed) to avoid a mixed-dtype matmul.
+            _pdtype = next(self.diffusion_connector.parameters()).dtype
+            cond_hidden = cond_hidden.to(_pdtype)
+            if cond_key_mask is None and cond_keep_mask is not None:
+                cond_key_mask = cond_keep_mask.bool()
+                cond_keep_mask = None   # consumed (don't AND it twice below)
+            if dino_hidden is not None:
+                dino_hidden = dino_hidden.to(_pdtype)
+
+        # fusion contract: config.fuse_dino runs MUST receive the DINO segment on
+        # image tasks (silently training without it = the non-fusion model).
+        if getattr(self.config, "fuse_dino", False) and dino_hidden is None \
+                and _task not in self._LM_TASKS and _task != "text_to_3d":
+            raise ValueError("[fusion] config.fuse_dino=True but batch has no dino_hidden — "
+                             "dataset fuse_dino off or DINO cache entries missing")
 
         # drop chat-template boilerplate from the flow cond (keep caption + image patches only)
         if cond_keep_mask is not None and cond_key_mask is not None:
@@ -639,6 +724,20 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             kd_v_weight=float(getattr(self.config, "distill_v_weight", 1.0)),
             kd_f_weight=float(getattr(self.config, "distill_f_weight", 0.5)),
             kd_f_blocks=str(getattr(self.config, "distill_f_blocks", "auto5")),
+            kd_cfg_lo=float(getattr(self.config, "distill_cfg_lo", 3.0)),
+            kd_cfg_hi=float(getattr(self.config, "distill_cfg_hi", 0.0)),
+            kd_cfg_null_grad=bool(getattr(self.config, "distill_cfg_null_grad", False)),
+            # fusion is config-gated BOTH ways: config on + no dino_hidden raises above;
+            # dino_hidden present + config off is ignored here (not silently fused).
+            dino_hidden=dino_hidden if getattr(self.config, "fuse_dino", False) else None,
+            dino_key_mask=dino_keep_mask.bool()
+                if (dino_keep_mask is not None and getattr(self.config, "fuse_dino", False))
+                else None,
+            dino_drop_prob=float(getattr(self.config, "dino_drop_prob", 0.0))
+                if self.training else 0.0,
+            dino_view_ids=dino_view_ids if getattr(self.config, "fuse_dino", False) else None,
+            dino_view_embed=self.dino_view_embed
+                if getattr(self.config, "fuse_dino", False) else None,
         )
 
         if depthwise:   # release stashed per-block conds

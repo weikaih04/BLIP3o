@@ -75,8 +75,45 @@ class _ThreeDTaskBase(Dataset):
         max_slat_tokens: int = 8192,   # cap shape/pbr voxel count (TRELLIS max_tokens=8192);
                                         # oversized assets blow sparse activation memory → OOM.
                                         # 0 disables. Enforced in _load_one by resampling.
+        # VLM-hidden cache (vlm_cache.py): when set, I1/T items load precomputed
+        # cond_hidden npz instead of images (no PIL/processor/VLM at train time).
+        # IM is NOT per-view cacheable (joint attention) → forbidden here.
+        cached_hidden_root: Optional[str] = None,
+        # fusion: also emit cached DINOv3 tokens (d-keys, same root) for the same view.
+        fuse_dino: bool = False,
     ):
         super().__init__()
+        self.cached_hidden_root = cached_hidden_root or None
+        self.fuse_dino = bool(fuse_dino)
+        self._im_combo_sizes: list = []
+        if cached_hidden_root and self.mode == "IM":
+            # IM is cacheable ONLY via pinned combos (m-keys: joint VLM hidden per
+            # FIXED sha-seeded view set — free random combos are NOT cacheable since
+            # views attend jointly inside one VLM sequence).
+            from ...vlm_cache import check_meta
+            meta = check_meta(cached_hidden_root)
+            if not meta.get("im_combo_sizes"):
+                raise ValueError("[vlm_cache] IM needs pinned-combo m-entries — run "
+                                 "build_vlm_cache.py --mode combos first (free random "
+                                 "multi-view combos are not cacheable)")
+            self._im_combo_sizes = [int(s) for s in meta["im_combo_sizes"]]
+        if self.fuse_dino and not self.cached_hidden_root:
+            raise ValueError("[fusion] fuse_dino=True requires cached_hidden_root "
+                             "(DINO tokens are served from the cache, d-keys)")
+        self._cache_views = 0
+        if self.cached_hidden_root:
+            from ...vlm_cache import check_meta
+            meta = check_meta(self.cached_hidden_root)
+            # cache covers views [0, max_views) per asset — sample ONLY within coverage
+            self._cache_views = int(meta.get("max_views", 4))
+            if self.fuse_dino:
+                if "dino_model" not in meta:
+                    raise ValueError(f"[fusion] cache {self.cached_hidden_root} has no DINO "
+                                     "entries (_meta.json lacks dino_model) — run "
+                                     "scripts/build_dino_cache.py first")
+                # DINO coverage may be narrower than VLM coverage — sample within BOTH
+                self._cache_views = min(self._cache_views,
+                                        int(meta.get("dino_max_views", 4)))
         self.manifest_path = manifest
         self.slat_resolution = int(slat_resolution)
         self.crop_to_object = bool(crop_to_object)
@@ -274,6 +311,52 @@ class _ThreeDTaskBase(Dataset):
         caps: List[str] = [c for c in (rec.get("captions") or []) if c]
         caption = str(rng.choice(caps)) if (self.mode == "T" and caps) else ""
 
+        # ── VLM-hidden cache fast path: load precomputed cond instead of images ──
+        # (the collate routes batches with `cond_hidden` straight past the processor;
+        # the model's forward(cond_hidden=...) skips the VLM entirely.)
+        if self.cached_hidden_root:
+            from ...vlm_cache import load_entry, view_key, caption_key, dino_key, combo_key
+            sha = rec.get("sha256", f"idx_{i}")
+            if self.mode == "I1":
+                n_avail = min(int(rec.get("n_views", 16)), self._cache_views)
+                view = int(rng.integers(0, max(1, n_avail)))
+                key = view_key(view)
+            elif self.mode == "IM":
+                # honor the batch-locked view count (homogeneous batches): combo id is
+                # size-indexed (m00=2 views, m01=3, m02=4 by producer convention).
+                view = None
+                n = self._sample_n_views(rng)
+                n = max(min(n, max(self._im_combo_sizes)), min(self._im_combo_sizes))
+                key = combo_key(self._im_combo_sizes.index(n))
+            else:  # T — caption index keyed (cache built over the captions list order)
+                view = None
+                key = caption_key(int(rng.integers(0, max(1, len(caps)))))
+            entry = load_entry(self.cached_hidden_root, sha, key)  # FileNotFoundError → resample
+            data: Dict[str, Any] = {
+                "_task": self.task_name,
+                "id": sha,
+                "cond_hidden": entry["cond_hidden"],
+                "cond_keep_mask": entry["cond_keep_mask"],
+                "target_ss_latent": self._load_ss(rec["ss_latent_64"]),
+            }
+            if self.fuse_dino and self.mode in ("I1", "IM"):
+                if "dino_hidden" in entry:
+                    # merged v-entry (schema 2) or IM combo m-entry: DINO arrays inline
+                    data["dino_hidden"] = entry["dino_hidden"]
+                    data["dino_keep_mask"] = entry["dino_keep_mask"]
+                    data["dino_view_ids"] = entry.get(
+                        "dino_view_ids",
+                        torch.zeros(entry["dino_hidden"].shape[0], dtype=torch.long))
+                else:
+                    # legacy: DINO tokens in a separate d-key file (2nd open)
+                    dentry = load_entry(self.cached_hidden_root, sha, dino_key(view))
+                    data["dino_hidden"] = dentry["cond_hidden"]        # (N_d, 1024) fp16
+                    data["dino_keep_mask"] = dentry["cond_keep_mask"]  # (N_d,) bool
+                    data["dino_view_ids"] = torch.zeros(
+                        dentry["cond_hidden"].shape[0], dtype=torch.long)
+            self._attach_slat_targets(data, rec)
+            return data
+
         images: List[Image.Image] = []
         if self.mode in ("I1", "IM"):
             n_avail = int(rec.get("n_views", 16))
@@ -281,36 +364,39 @@ class _ThreeDTaskBase(Dataset):
             ids = sorted(int(v) for v in rng.choice(n_avail, size=n, replace=False))
             images = self._load_views(rec["renders_dir"], ids)
 
-        res = self.slat_resolution
-        shape_path = rec.get(f"shape_latent_{res}")
-        pbr_path   = rec.get(f"pbr_latent_{res}")
-        ss_path    = rec["ss_latent_64"]
-
         data: Dict[str, Any] = {
             "_task": self.task_name,
             "caption": caption,
             "images": images,
             "id": rec.get("sha256", f"idx_{i}"),
-            "target_ss_latent": self._load_ss(ss_path),
+            "target_ss_latent": self._load_ss(rec["ss_latent_64"]),
         }
-        if not self.ss_only:
-            if shape_path:
-                shape_item = self._load_shape(shape_path)
-                # Voxel cap: oversized sparse SLAT spikes activation memory → OOM
-                # (TRELLIS caps at max_tokens=8192). Raise ValueError so __getitem__'s
-                # resample loop picks a different (smaller) asset rather than OOM-ing
-                # the whole 8-GPU run on one pathological sample.
-                if self.max_slat_tokens > 0:
-                    nvox = int(shape_item["coords"].shape[0])
-                    if nvox > self.max_slat_tokens:
-                        raise ValueError(
-                            f"shape SLAT voxels {nvox} > max_slat_tokens "
-                            f"{self.max_slat_tokens} (asset {rec.get('sha256','?')[:12]})"
-                        )
-                data["target_shape_slat_512_item"] = shape_item
-            if pbr_path and shape_path:
-                data["target_tex_slat_512_item"] = self._load_tex(pbr_path, shape_path)
+        self._attach_slat_targets(data, rec)
         return data
+
+    def _attach_slat_targets(self, data: Dict[str, Any], rec: Dict[str, Any]) -> None:
+        """Shared by the live path and the vlm_cache fast path."""
+        if self.ss_only:
+            return
+        res = self.slat_resolution
+        shape_path = rec.get(f"shape_latent_{res}")
+        pbr_path = rec.get(f"pbr_latent_{res}")
+        if shape_path:
+            shape_item = self._load_shape(shape_path)
+            # Voxel cap: oversized sparse SLAT spikes activation memory → OOM
+            # (TRELLIS caps at max_tokens=8192). Raise ValueError so __getitem__'s
+            # resample loop picks a different (smaller) asset rather than OOM-ing
+            # the whole 8-GPU run on one pathological sample.
+            if self.max_slat_tokens > 0:
+                nvox = int(shape_item["coords"].shape[0])
+                if nvox > self.max_slat_tokens:
+                    raise ValueError(
+                        f"shape SLAT voxels {nvox} > max_slat_tokens "
+                        f"{self.max_slat_tokens} (asset {rec.get('sha256','?')[:12]})"
+                    )
+            data["target_shape_slat_512_item"] = shape_item
+        if pbr_path and shape_path:
+            data["target_tex_slat_512_item"] = self._load_tex(pbr_path, shape_path)
 
     # ------------------------------------------------------------------
     # Collator: chat-template → VLM inputs + stack 3D targets
