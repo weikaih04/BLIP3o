@@ -1,0 +1,18 @@
+tasks:
+  - name: text_to_3d
+    weight: 0.33
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      min_aesthetic: 4.5
+      require_caption: true
+  - name: image_to_3d
+    weight: 0.67
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+sampling:
+  granularity: batch
+  temperature: 1.0

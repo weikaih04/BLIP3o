@@ -1,0 +1,33 @@
+# Stage-3: multi-task 3D mixture over ready_v1 — I1 + IM(pinned combos) + T, all cached,
+# fusion cond [DINO; Qwen] on image tasks (T = Qwen-only, DINO segment naturally absent).
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/overfit/ready_v1_head100.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      cached_hidden_root: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/vlm_hidden_cache/qwen35-2b_tok1024_crop
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/overfit/ready_v1_head100.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      max_views: 4
+      cached_hidden_root: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/vlm_hidden_cache/qwen35-2b_tok1024_crop
+      fuse_dino: true
+  - name: text_to_3d
+    weight: 0.2
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/overfit/ready_v1_head100.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      cached_hidden_root: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/vlm_hidden_cache/qwen35-2b_tok1024_crop
+sampling:
+  granularity: batch
+  temperature: 1.0

@@ -1,0 +1,37 @@
+# Mixture config — 3 3D tasks, multi_image capped to max_views=2.
+# Identical to mix_3d_only.yaml EXCEPT multi_image_to_3d max_views 4→2.
+# Reason: the dual+512 16-GPU run survives ~740 steps then OOMs on the rare
+# worst-case asset = multi_image 4-view + big voxel (the joint views×voxels
+# spike). Controlled measurement (project_dual_train_run) confirmed
+# max_views 2 brings the worst asset under the ceiling and RUNS, with NO
+# asset drop (just fewer views per multi_image sample). Bounds the tail.
+
+tasks:
+  - name: text_to_3d
+    weight: 0.20
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      min_aesthetic: 4.5
+      require_caption: true           # T-task needs a caption to learn from
+
+  - name: image_to_3d
+    weight: 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true            # tight alpha bbox → matches TRELLIS recipe
+      min_aesthetic: 4.5
+
+  - name: multi_image_to_3d
+    weight: 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      max_views: 2                    # n ~ U[2, 2] = fixed 2 — bounds the worst-case spike
+      min_aesthetic: 4.5
+
+sampling:
+  granularity: batch                  # batch | item — see mixture.py docstring
+  temperature: 1.0                    # p ∝ w^(1/T); 1.0 = raw weights

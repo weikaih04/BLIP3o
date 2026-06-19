@@ -1,0 +1,33 @@
+# v2 mixture — up-weight text_to_3d to force the Qwen branch to learn (text→3D needs it).
+# v1 was text 0.20 / image 0.40 / multi 0.40 → Qwen gate stayed ≈0 (image leaned on the
+# always-on DINOv3 anchor). v2 pairs this with --anchor_drop_prob (CFG-drop the anchor on
+# image tasks) so the model is forced to use the Qwen branch even on image steps.
+tasks:
+  - name: text_to_3d
+    weight: 0.40                      # up from 0.20
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      min_aesthetic: 4.5
+      require_caption: true
+
+  - name: image_to_3d
+    weight: 0.30                      # down from 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+
+  - name: multi_image_to_3d
+    weight: 0.30                      # down from 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      max_views: 4
+      min_aesthetic: 4.5
+
+sampling:
+  granularity: batch
+  temperature: 1.0

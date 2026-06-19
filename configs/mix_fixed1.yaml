@@ -1,0 +1,11 @@
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/fixed1/one.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 0.0
+sampling:
+  granularity: batch
+  temperature: 1.0

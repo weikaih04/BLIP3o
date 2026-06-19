@@ -1,0 +1,38 @@
+# Mixture config — 3 3D tasks only (matches the original on-the-fly task_mix).
+# Use this for parity tests vs the legacy `TR2NativeVLMDataset(task_mix=...)` path.
+#
+# Launch:
+#   torchrun --nproc_per_node=N train_native.py \
+#     --mixture_config configs/mix_3d_only.yaml \
+#     --vlm_model Qwen/Qwen3.5-2B \
+#     --output_dir runs/mix3d  ...
+
+tasks:
+  - name: text_to_3d
+    weight: 0.20
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      min_aesthetic: 4.5
+      require_caption: true           # T-task needs a caption to learn from
+
+  - name: image_to_3d
+    weight: 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true            # tight alpha bbox → matches TRELLIS recipe
+      min_aesthetic: 4.5
+
+  - name: multi_image_to_3d
+    weight: 0.40
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      max_views: 2                    # n ~ U[2, 4] per __getitem__
+      min_aesthetic: 4.5
+
+sampling:
+  granularity: batch                  # batch | item — see mixture.py docstring
+  temperature: 1.0                    # p ∝ w^(1/T); 1.0 = raw weights

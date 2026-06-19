@@ -1,0 +1,13 @@
+# 30-step fusion smoke (head100, VLM+DINO entries pre-cached).
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/overfit/ready_v1_head100.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      cached_hidden_root: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/vlm_hidden_cache/qwen35-2b_tok1024_crop
+      fuse_dino: true
+sampling:
+  granularity: batch
+  temperature: 1.0

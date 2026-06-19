@@ -1,0 +1,12 @@
+tasks:
+  - name: multi_image_to_3d
+    weight: 1.0
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/trellis2_blip3o/data/fixed1/big.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 0.0
+      max_views: 4
+sampling:
+  granularity: batch
+  temperature: 1.0

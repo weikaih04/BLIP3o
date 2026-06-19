@@ -1,0 +1,17 @@
+# V3 Stage-1 mixture — SINGLE-IMAGE task ONLY (docs/V3_DISTILL_DESIGN.md §3).
+# Stage-1 nails Qwen single-image conditioning in the cleanest setup; the KD teacher
+# (single-view DINOv3) is exactly in-distribution for the frozen flow. IM/T tasks
+# join in Stage-3 (KD off there).
+
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /weka/oe-training-default/weikaih/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl
+      slat_resolution: 512
+      crop_to_object: true            # tight alpha bbox → matches TRELLIS recipe
+      min_aesthetic: 4.5
+
+sampling:
+  granularity: batch
+  temperature: 1.0
