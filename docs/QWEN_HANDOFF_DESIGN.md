@@ -262,3 +262,13 @@ now; Plan-2 (3D tokens into VLM) is the north star.
 
 Start = P1 (highest-leverage, cheapest, directly tests "can Qwen drive"). Do not begin until weikaih
 signs off (per the approve-design-before-implementing rule).
+
+---
+
+## 9. Update (2026-06-20): VLM-side 3D pretraining + per-layer KV
+A separate, complementary track lands in **`VLM_3D_PRETRAIN_DESIGN.md`** (MolmoAct2-inspired): make
+Qwen *3D-literate* via two new VLM-side stages — **VP1 (3D-understanding pretrain)** and **VP2
+(editing pretrain)** — and replace the read-once connector cross-attn with **per-layer KV
+conditioning** (the fix for the multi-view mushiness in RESULTS 2026-06-16). The discrete-token
+route there is the cheap (next-token, not flow-loss) way to make Qwen drive — directly relevant to
+this doc's "can Qwen drive alone?" question. Cheapest first step = per-layer KV with frozen Qwen.

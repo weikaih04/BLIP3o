@@ -190,4 +190,7 @@ needs free GPUs or a Beaker job (terminal-side auth).
 - Dual-cond wrappers: `trellis2_blip3o/dual_cond.py` (`DualCondInjectBlock` dense / `DualCondSparseInjectBlock` sparse; `_packed_cond` BOTH-CFG path)
 - Inference harness: `tests/test_native_infer.py` (BOTH-CFG default; `DINO_ONLY=1` / `LEGACY_SS=1` A/B)
 - Model: `blip3o/model/language_model/trellis_native_vlm.py` (dual_router, `set_dino`, connector)
+- **VLM-side 3D pretraining (VP1 3D-understanding + VP2 editing) — the Plan-2 enabler:**
+  `VLM_3D_PRETRAIN_DESIGN.md` (MolmoAct2-inspired: discrete 3D tokens + per-layer KV). P4 (SLAT→VLM
+  north star) is realized by VP2 there.
 - Results log: `RESULTS.md`
