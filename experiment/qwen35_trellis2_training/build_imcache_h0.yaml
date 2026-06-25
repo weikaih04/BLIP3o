@@ -1,0 +1,44 @@
+version: v2
+description: "molmo3-3d: build IM pinned-combo cache (m-keys): 80K x 3 combos (2,3,4 views, sha-seeded), joint VLM hidden + inline DINO segment + view ordinals, ONE npz per sample. ~240K entries. 8 shards."
+budget: ai2/oe-omai
+tasks:
+- name: molmo3-3d-imcache-readyv1-h0
+  image:
+    docker: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+  command: ['bash', '-c']
+  arguments:
+  - |
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export ATTN_BACKEND=sdpa
+    export TOKENIZERS_PARALLELISM=false
+    apt-get update && apt-get install -y libstdc++6 libgl1-mesa-glx libglib2.0-0 g++ git && \
+    source /weka/oe-training-default/jasonr/3d_box/miniconda3/bin/activate && \
+    conda activate blip3o_trellis_qwen35 && \
+    cd /weka/oe-training-default/jasonr/3d_box/world_explore/trellis2_blip3o && \
+    \
+    export HF_HOME=/weka/oe-training-default/jasonr/3d_box/claude_code/.cache/huggingface && \
+    for i in 0 1 2 3 4 5 6 7; do
+      CUDA_VISIBLE_DEVICES=$(($i - 0)) python scripts/build_vlm_cache.py \
+        --manifest /weka/oe-training-default/jasonr/3d_box/world_explore/data/trellis2/manifests/ready_v1/ready_v1.jsonl \
+        --out_root data/vlm_hidden_cache/qwen35-2b_tok1024_crop \
+        --target_tokens_per_view 1024 --crop_to_object 1 --mode combos --max_views 4 \
+        --min_aesthetic 4.5 \
+        --shard $i --num_shards 16 > /results/shard_$i.log 2>&1 &
+    done
+    wait
+    echo "ALL SHARDS DONE"; tail -2 /results/shard_*.log
+  result:
+    path: /results
+  datasets:
+    - mountPath: /weka/oe-training-default
+      source:
+        weka: oe-training-default
+  resources:
+    gpuCount: 8
+    sharedMemory: 500GiB
+  context:
+    priority: urgent
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]

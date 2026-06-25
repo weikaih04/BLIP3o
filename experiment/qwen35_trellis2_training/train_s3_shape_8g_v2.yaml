@@ -1,0 +1,80 @@
+version: v2
+description: "molmo3-3d: STAGE-3 multitask shape job — I1(0.5)+IM-pinned-combos(0.3)+T(0.2) all cached, fusion cond [DINO;Qwen] (T=Qwen-only), dino_drop 0.3, cond_max_length 10240 (4-view fusion=8225tok), init=fusion shape@3000, merged v+d npz (IO fix), eff BS 256, 3000 steps."
+budget: ai2/oe-omai
+tasks:
+- name: molmo3-3d-s3-shape-8g
+  image:
+    docker: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+  envVars:
+    - name: WEIKAI_UW_WANDB_KEY
+      secret: WEIKAI_UW_WANDB_KEY
+  command: ['bash', '-c']
+  arguments:
+  - |
+    EXP_NAME="molmo3_3d_s3_shape_8g"
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export ATTN_BACKEND=flash_attn
+    export TOKENIZERS_PARALLELISM=false
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+    export TORCH_EXTENSIONS_DIR=/weka/oe-training-default/jasonr/3d_box/claude_code/.cache/torch_extensions
+    export TRITON_LIBCUDA_PATH=/weka/oe-training-default/jasonr/3d_box/miniconda3/envs/blip3o_trellis_qwen35/targets/x86_64-linux/lib/stubs
+    apt-get update && apt-get install -y libstdc++6 libgl1-mesa-glx libglib2.0-0 g++ git && \
+    source /weka/oe-training-default/jasonr/3d_box/miniconda3/bin/activate && \
+    conda activate blip3o_trellis_qwen35 && \
+    cd /weka/oe-training-default/jasonr/3d_box/world_explore/trellis2_blip3o && \
+    \
+    \
+    \
+    export HF_HOME=/weka/oe-training-default/jasonr/3d_box/claude_code/.cache/huggingface && \
+    export WANDB_API_KEY=$WEIKAI_UW_WANDB_KEY && \
+    export WANDB_PROJECT="trellis2_blip3o" && \
+    export WANDB_NAME=$EXP_NAME && \
+    export WANDB_TAGS="molmo3_3d,s3,multitask,shape,fusion,i1_im_t,cached,last20" && \
+    python -m torch.distributed.run --nnodes=1 --nproc-per-node=8 --master_port=29452 \
+        train_native.py \
+        --vlm_model Qwen/Qwen3.5-2B \
+        --mixture_config configs/mix_s3_multitask.yaml \
+        --build_vlm False \
+        --fuse_dino True --dino_drop_prob 0.3 \
+        --cond_max_length 10240 \
+        --train_stages shape --build_slat True --ss_only False --compile_ss_flow False --elastic_slat True --elastic_target_ratio 0.1 \
+        --freeze_vlm True \
+        --flow_tune last20 \
+        --init_from_checkpoint /weka/oe-training-default/jasonr/3d_box/world_explore/experiment/qwen35_trellis2_training/runs/molmo3_3d_fusion_shape_8g/checkpoint-3000 \
+        --target_tokens_per_view 1024 \
+        --slat_resolution 512 \
+        --cond_fusion none \
+        --output_dir /weka/oe-training-default/jasonr/3d_box/world_explore/experiment/qwen35_trellis2_training/runs/$EXP_NAME \
+        --max_steps 3000 \
+        --bf16 True \
+        --per_device_train_batch_size 4 \
+        --gradient_accumulation_steps 8 \
+        --learning_rate 1e-4 \
+        --warmup_steps 100 \
+        --weight_decay 0.01 \
+        --adam_beta1 0.9 \
+        --adam_beta2 0.95 \
+        --max_grad_norm 1.0 \
+        --ema_decay 0.998 \
+        --logging_steps 5 \
+        --save_steps 500 \
+        --save_total_limit 4 \
+        --report_to wandb \
+        --deepspeed configs/deepspeed_zero2.json \
+        --ignore_data_skip True \
+        --dataloader_num_workers 4
+  result:
+    path: /results
+  datasets:
+    - mountPath: /weka/oe-training-default
+      source:
+        weka: oe-training-default
+  resources:
+    gpuCount: 8
+    sharedMemory: 1000GiB
+  context:
+    priority: urgent
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]

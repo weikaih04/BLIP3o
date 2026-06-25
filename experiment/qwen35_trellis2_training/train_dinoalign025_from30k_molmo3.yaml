@@ -1,0 +1,111 @@
+version: v2
+description: "molmo3-3d: DINOv3 align(0.25,spatial) from ckpt-30000, 5k-step A/B vs baseline"
+budget: ai2/oe-omai
+tasks:
+- name: molmo3-3d-dinoalign025-from30k
+  replicas: 1
+  image:
+    docker: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+  envVars:
+    - name: WEIKAI_UW_WANDB_KEY
+      secret: WEIKAI_UW_WANDB_KEY
+    # NCCL InfiniBand (kept for future multi-node; harmless on 1 node)
+    - name: NCCL_SOCKET_IFNAME
+      value: ib
+    - name: NCCL_IB_HCA
+      value: "^=mlx5_bond_0"
+    - name: NCCL_DEBUG
+      value: INFO
+  command: ['bash', '-c']
+  arguments:
+  - |
+    EXP_NAME="molmo3_3d_ready_v1_80k_512_mix3d_dinoalign025_1n"
+
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=America/Los_Angeles
+
+    # Memory + attention
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export ATTN_BACKEND=flash_attn
+    export TOKENIZERS_PARALLELISM=false
+
+    # NCCL
+    export NCCL_IB_DISABLE=0
+    export NCCL_TIMEOUT_MINUTES=60
+
+    # Triton cache MUST be node-local (/tmp), not shared weka — 8 ranks racing
+    # torch.compile to the same path corrupts the cache.
+    export TRITON_CACHE_DIR=/tmp/triton_cache
+    export TORCH_EXTENSIONS_DIR=/weka/oe-training-default/jasonr/3d_box/claude_code/.cache/torch_extensions
+    export TRITON_LIBCUDA_PATH=/weka/oe-training-default/jasonr/3d_box/miniconda3/envs/blip3o_trellis_qwen35/targets/x86_64-linux/lib/stubs
+
+    apt-get update && \
+    apt-get install -y libstdc++6 libgl1-mesa-glx libglib2.0-0 g++ git \
+        libibverbs1 libibverbs-dev librdmacm1 ibverbs-providers && \
+    source /weka/oe-training-default/jasonr/3d_box/miniconda3/bin/activate && \
+    conda activate blip3o_trellis_qwen35 && \
+    cd /weka/oe-training-default/jasonr/3d_box/world_explore/trellis2_blip3o && \
+    export HF_HOME=/weka/oe-training-default/jasonr/3d_box/claude_code/.cache/huggingface && \
+    export WANDB_API_KEY=$WEIKAI_UW_WANDB_KEY && \
+    export WANDB_PROJECT="trellis2_blip3o" && \
+    export WANDB_NAME=$EXP_NAME && \
+    export WANDB_TAGS="molmo3_3d,qwen35_2b,trellis2,512_cascade,ready_v1_80k,mix3d,last40,freeze_vlm,ema,trellis_aligned" && \
+    python -m torch.distributed.run \
+        --nnodes=1 \
+        --node-rank=$BEAKER_REPLICA_RANK \
+        --nproc-per-node=8 \
+        --rdzv_backend=static \
+        --rdzv_id=qwen35_trellis2_dinoalign025_1n \
+        --rdzv_conf="read_timeout=600" \
+        --rdzv_endpoint=$BEAKER_LEADER_REPLICA_HOSTNAME:29401 \
+        train_native.py \
+        --vlm_model Qwen/Qwen3.5-2B \
+        --mixture_config configs/mix_3d_only.yaml \
+        --build_slat True \
+        --ss_only False \
+        --freeze_vlm True \
+        --flow_tune last40 \
+        --slat_resolution 512 \
+        --cond_fusion none \
+        --compile_ss_flow False \
+        --compile_mode default \
+        --ddp_timeout 5400 \
+        --dino_align True \
+        --dino_align_weight 0.25 \
+        --dino_align_mode spatial \
+        --init_from_checkpoint /weka/oe-training-default/jasonr/3d_box/world_explore/experiment/qwen35_trellis2_training/runs/molmo3_3d_ready_v1_80k_512_mix3d_1n/checkpoint-30000 \
+        --output_dir /weka/oe-training-default/jasonr/3d_box/world_explore/experiment/qwen35_trellis2_training/runs/$EXP_NAME \
+        --max_steps 5000 \
+        --bf16 True \
+        --per_device_train_batch_size 1 \
+        --gradient_accumulation_steps 1 \
+        --learning_rate 1e-4 \
+        --warmup_steps 100 \
+        --weight_decay 0.01 \
+        --adam_beta1 0.9 \
+        --adam_beta2 0.95 \
+        --max_grad_norm 1.0 \
+        --ema_decay 0.9999 \
+        --logging_steps 10 \
+        --save_steps 1000 \
+        --save_total_limit 4 \
+        --report_to wandb \
+        --deepspeed configs/deepspeed_zero2.json \
+        --ignore_data_skip True \
+        --dataloader_num_workers 0
+  result:
+    path: /results
+  datasets:
+    - mountPath: /weka/oe-training-default
+      source:
+        weka: oe-training-default
+  resources:
+    gpuCount: 8
+    sharedMemory: 1000GiB
+  context:
+    priority: urgent
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true
+  leaderSelection: true
