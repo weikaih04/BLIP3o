@@ -354,6 +354,11 @@ class NativeArgs:
     # trellis2_blip3o/data/tasks/. Adding a new task = new file + new yaml row.
     mixture_config: Optional[str] = field(default=None)
     mixture_seed: int = field(default=0)
+    # MDS / MosaicML-Streaming source (scripts/build_mds.py shards on local NVMe). When set,
+    # use StreamingImageTo3D (node/rank-aware sharding + deterministic resume) instead of the
+    # manifest+mixture path. Single-task image_to_3d (S1/S2 I1 fusion).
+    mds_root: Optional[str] = field(default=None)
+    mds_cache_limit: Optional[str] = field(default=None)   # e.g. "600gb" to bound local cache
 
     # torch.compile on the dense SS flow. -18.8% step time at ~zero quality risk on
     # tests/profile_native_compile.py (BASELINE 234ms → 190ms; backward -30%).
@@ -528,9 +533,32 @@ def main():
     # Choose data path:
     #   --mixture_config (new, multi-task)   → MixtureIterableDataset + MultiTaskCollator
     #   else (legacy, single-dataset)        → TR2NativeVLMDataset + NativeVLMCollator
-    if native_args.mixture_config:
+    per_dev_bs = max(1, int(training_args.per_device_train_batch_size))
+    if native_args.mds_root:
+        # MDS path: StreamingDataset does its own node/rank-aware sharding + resume.
+        from trellis2_blip3o.data.streaming_task import StreamingImageTo3D
+        from trellis2_blip3o.data.mixture import MultiTaskCollator
+        train_ds = StreamingImageTo3D(
+            native_args.mds_root,
+            fuse_dino=native_args.fuse_dino,
+            ss_only=native_args.ss_only,
+            max_slat_tokens=native_args.max_slat_tokens,
+            shuffle=True, batch_size=per_dev_bs,
+            cache_limit=native_args.mds_cache_limit,
+        )
+        collator = MultiTaskCollator(processor=processor)
+        print(f"[train_native] MDS source {native_args.mds_root} "
+              f"({len(train_ds.ds)} samples, fuse_dino={native_args.fuse_dino}, ss_only={native_args.ss_only})")
+        if not training_args.max_steps or training_args.max_steps <= 0:
+            raise ValueError("--mds_root uses IterableDataset; --max_steps must be set.")
+        # StreamingDataset is already rank-aware → each rank iterates its own loader (same as
+        # the mixture path; accelerate must NOT dispatch-from-rank0-and-broadcast).
+        try:
+            training_args.accelerator_config.dispatch_batches = False
+        except Exception:
+            training_args.dispatch_batches = False
+    elif native_args.mixture_config:
         from trellis2_blip3o.data import build_mixture
-        per_dev_bs = max(1, int(training_args.per_device_train_batch_size))
         mix = build_mixture(
             native_args.mixture_config,
             processor=processor,

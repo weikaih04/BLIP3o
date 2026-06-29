@@ -81,10 +81,16 @@ class _ThreeDTaskBase(Dataset):
         cached_hidden_root: Optional[str] = None,
         # fusion: also emit cached DINOv3 tokens (d-keys, same root) for the same view.
         fuse_dino: bool = False,
+        # packed shards (scripts/pack_webdataset.py): when set, cond/ss/shape/pbr are
+        # read by os.pread from big .tar shards (typically on local NVMe) instead of
+        # per-sample small files on Lustre — kills the 8-rank small-file open contention.
+        packed_root: Optional[str] = None,
     ):
         super().__init__()
         self.cached_hidden_root = cached_hidden_root or None
         self.fuse_dino = bool(fuse_dino)
+        self.packed_root = packed_root or None
+        self._packed = None   # lazy PackedShardReader, built per worker on first read
         self._im_combo_sizes: list = []
         if cached_hidden_root and self.mode == "IM":
             # IM is cacheable ONLY via pinned combos (m-keys: joint VLM hidden per
@@ -144,11 +150,20 @@ class _ThreeDTaskBase(Dataset):
             ]
         if self.require_caption:
             records = [r for r in records if r.get("captions")]
+        # node-local restriction: with packed shards staged on this node's NVMe, keep ONLY
+        # records whose sha is present locally (so multi-node runs train on disjoint slices,
+        # and we drop the handful of assets that never got a cond-cache entry). NO Lustre
+        # fallback to other nodes' data.
+        n_pre_pack = len(records)
+        if self.packed_root:
+            local = self._reader().shas()
+            records = [r for r in records if r.get("sha256") in local]
         self.records = records
         print(
             f"[{self.task_name or self.__class__.__name__}] {manifest}: "
             f"{before} → {len(self.records)} after filters "
-            f"(min_aesthetic={min_aesthetic}, require_caption={self.require_caption})"
+            f"(min_aesthetic={min_aesthetic}, require_caption={self.require_caption}"
+            + (f", packed-local {n_pre_pack}→{len(records)}" if self.packed_root else "") + ")"
         )
 
         # ── TRELLIS norm stats (read once, identical to upstream training) ──
@@ -192,24 +207,56 @@ class _ThreeDTaskBase(Dataset):
         raise ValueError(f"unknown mode {self.mode!r}")
 
     # --- 3D target loaders (mirror upstream get_instance exactly) ---
-    def _load_ss(self, path: str) -> torch.Tensor:
-        a = np.load(path)
+    # ── packed-shard read backend (os.pread from big NVMe .tar; else the file path) ──
+    def _reader(self):
+        if self._packed is None:
+            from ..packed_reader import PackedShardReader
+            self._packed = PackedShardReader(self.packed_root)
+        return self._packed
+
+    def _src(self, sha: Optional[str], ext: str, path: str):
+        """np.load source: packed BytesIO (packed_root set & sha/ext present) else `path`."""
+        if self.packed_root and sha and self._reader().has(sha, ext):
+            import io
+            return io.BytesIO(self._reader().read(sha, ext))
+        return path
+
+    def _load_cond(self, sha: str, key: str):
+        """cond entry (Qwen hidden + inline DINO). Packed v00 when available, else file.
+        Replicates vlm_cache.load_entry's field mapping exactly."""
+        from ...vlm_cache import load_entry, view_key
+        if self.packed_root and sha and key == view_key(0) and self._reader().has(sha, "cond"):
+            import io
+            a = np.load(io.BytesIO(self._reader().read(sha, "cond")))
+            out = {"cond_hidden": torch.from_numpy(a["hidden"]),
+                   "cond_keep_mask": torch.from_numpy(a["keep_mask"])}
+            if "dino_hidden" in a.files:
+                out["dino_hidden"] = torch.from_numpy(a["dino_hidden"])
+                out["dino_keep_mask"] = torch.from_numpy(a["dino_keep_mask"])
+            for k in ("views", "dino_view_ids"):
+                if k in a.files:
+                    out[k] = torch.from_numpy(a[k])
+            return out
+        return load_entry(self.cached_hidden_root, sha, key)
+
+    def _load_ss(self, path: str, sha: Optional[str] = None) -> torch.Tensor:
+        a = np.load(self._src(sha, "ss", path))
         npz_key = "z" if "z" in a.files else "latent"
         z = torch.tensor(a[npz_key]).float()
         if self.ss_norm is not None:
             z = (z - self.ss_norm["mean"]) / self.ss_norm["std"]
         return z
 
-    def _load_shape(self, path: str) -> Dict[str, torch.Tensor]:
-        a = np.load(path)
+    def _load_shape(self, path: str, sha: Optional[str] = None) -> Dict[str, torch.Tensor]:
+        a = np.load(self._src(sha, "shape", path))
         coords = torch.tensor(a["coords"]).int()
         feats = torch.tensor(a["feats"]).float()
         if self.shape_norm is not None:
             feats = (feats - self.shape_norm["mean"]) / self.shape_norm["std"]
         return {"coords": coords, "feats": feats}
 
-    def _load_tex(self, tex_path: str, shape_path: str) -> Dict[str, SparseTensor]:
-        data = np.load(tex_path)
+    def _load_tex(self, tex_path: str, shape_path: str, sha: Optional[str] = None) -> Dict[str, SparseTensor]:
+        data = np.load(self._src(sha, "pbr", tex_path))
         coords = torch.tensor(data["coords"]).int()
         coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1)
         feats = torch.tensor(data["feats"]).float()
@@ -217,7 +264,7 @@ class _ThreeDTaskBase(Dataset):
             feats = (feats - self.tex_pbr_norm["mean"]) / self.tex_pbr_norm["std"]
         pbr_z = SparseTensor(feats, coords)
 
-        data = np.load(shape_path)
+        data = np.load(self._src(sha, "shape", shape_path))
         coords = torch.tensor(data["coords"]).int()
         coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1)
         feats = torch.tensor(data["feats"]).float()
@@ -297,7 +344,13 @@ class _ThreeDTaskBase(Dataset):
         for attempt in range(8):
             try:
                 return self._load_one(i)
-            except (FileNotFoundError, OSError, ValueError, KeyError) as e:
+            # Resample on ANY per-sample load failure. Truncated/partial npz (rclone
+            # pulls leave some files incomplete; filter_trainable only stat'd existence,
+            # not integrity) raise EOFError / zipfile.BadZipFile / zlib.error — none of
+            # which are OSError — so a single corrupt file would otherwise kill the whole
+            # DDP run (observed: rank-5 EOFError in _load_shape, job 16197). A genuine
+            # systematic bug still surfaces via the unguarded final attempt below.
+            except Exception as e:
                 bad = self.records[i].get("sha256", i)
                 print(f"[{self.task_name}] load failed for {bad}: {e!r} — resampling")
                 i = int(np.random.default_rng().integers(0, n)) if n > 1 else i
@@ -331,13 +384,13 @@ class _ThreeDTaskBase(Dataset):
             else:  # T — caption index keyed (cache built over the captions list order)
                 view = None
                 key = caption_key(int(rng.integers(0, max(1, len(caps)))))
-            entry = load_entry(self.cached_hidden_root, sha, key)  # FileNotFoundError → resample
+            entry = self._load_cond(sha, key)  # packed v00 if available; FileNotFoundError → resample
             data: Dict[str, Any] = {
                 "_task": self.task_name,
                 "id": sha,
                 "cond_hidden": entry["cond_hidden"],
                 "cond_keep_mask": entry["cond_keep_mask"],
-                "target_ss_latent": self._load_ss(rec["ss_latent_64"]),
+                "target_ss_latent": self._load_ss(rec["ss_latent_64"], rec.get("sha256")),
             }
             if self.fuse_dino and self.mode in ("I1", "IM"):
                 if "dino_hidden" in entry:
@@ -369,7 +422,7 @@ class _ThreeDTaskBase(Dataset):
             "caption": caption,
             "images": images,
             "id": rec.get("sha256", f"idx_{i}"),
-            "target_ss_latent": self._load_ss(rec["ss_latent_64"]),
+            "target_ss_latent": self._load_ss(rec["ss_latent_64"], rec.get("sha256")),
         }
         self._attach_slat_targets(data, rec)
         return data
@@ -378,11 +431,12 @@ class _ThreeDTaskBase(Dataset):
         """Shared by the live path and the vlm_cache fast path."""
         if self.ss_only:
             return
+        sha = rec.get("sha256")
         res = self.slat_resolution
         shape_path = rec.get(f"shape_latent_{res}")
         pbr_path = rec.get(f"pbr_latent_{res}")
         if shape_path:
-            shape_item = self._load_shape(shape_path)
+            shape_item = self._load_shape(shape_path, sha)
             # Voxel cap: oversized sparse SLAT spikes activation memory → OOM
             # (TRELLIS caps at max_tokens=8192). Raise ValueError so __getitem__'s
             # resample loop picks a different (smaller) asset rather than OOM-ing
@@ -396,7 +450,7 @@ class _ThreeDTaskBase(Dataset):
                     )
             data["target_shape_slat_512_item"] = shape_item
         if pbr_path and shape_path:
-            data["target_tex_slat_512_item"] = self._load_tex(pbr_path, shape_path)
+            data["target_tex_slat_512_item"] = self._load_tex(pbr_path, shape_path, sha)
 
     # ------------------------------------------------------------------
     # Collator: chat-template → VLM inputs + stack 3D targets

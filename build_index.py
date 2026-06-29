@@ -36,7 +36,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-DATA_ROOT = Path("/weka/oe-training-default/weikaih/world_explore/data/trellis2")
+DATA_ROOT = Path(os.environ.get(
+    "TRELLIS2_DATA_ROOT",
+    "/weka/oe-training-default/weikaih/world_explore/data/trellis2"))
 DEFAULT_MANIFEST = DATA_ROOT / "manifests/ready_v1/MANIFEST.csv"
 
 # Directory names (match HANDOFF.md §1 + actual on-disk layout)

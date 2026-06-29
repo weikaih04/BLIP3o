@@ -155,7 +155,11 @@ def collate_vlm_3d(
         if "target_shape_slat_512_item" in batch[0]:
             out["target_shape_slat_512"] = SLat.collate_fn(
                 [inst["target_shape_slat_512_item"] for inst in batch])["x_0"]
-        if "target_tex_slat_512_item" in batch[0]:
+        # tex target only when EVERY item has it (ready_v2 has pbr for ~64% of assets — a
+        # mixed pbr/no-pbr batch would KeyError on batch[0]-keyed collation; old all-pbr
+        # manifests are unaffected). Shape/ss stages ignore tex anyway; the tex stage must
+        # train on pbr-only data so every batch is homogeneous.
+        if all("target_tex_slat_512_item" in inst for inst in batch):
             tex_pack = SLatPbr.collate_fn(
                 [inst["target_tex_slat_512_item"] for inst in batch])
             out["target_tex_slat_512"] = tex_pack["x_0"]
