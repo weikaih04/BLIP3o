@@ -1,0 +1,16 @@
+# LOCAL (fsx) variant of mix_i1_only.yaml — Stage-1 connector warm-up data.
+# Same as the ground-truth mix_i1_only.yaml but points at the LOCAL ready_v2 manifest
+# (built by build_index.py from /fsx/sfr/weikaih/3dgen/data/trellis2, paths inside the
+# jsonl are already local absolute). Live VLM (no cache) → needs renders + GT latents.
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v2/ready_v2.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+
+sampling:
+  granularity: batch
+  temperature: 1.0

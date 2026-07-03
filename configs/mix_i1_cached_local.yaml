@@ -1,0 +1,18 @@
+# LOCAL (fsx) cached Stage-1 data — connector warm-up on CACHED Qwen cond (NO fusion).
+# Same assets as mix_i1_only_local.yaml but cond is read from the offline v-cache
+# (build_vlm=False at train time → no live 2B VLM). fuse_dino NOT set → Qwen-only cond,
+# equivalent to GT Stage-1 (cond_fusion none, no DINO). GT latent targets still come from
+# the manifest paths. Cache built by scripts/build_cache_local.sbatch (max_views=1).
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v2/ready_v2.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/qwen35-2b_tok1024_crop_mv1
+
+sampling:
+  granularity: batch
+  temperature: 1.0

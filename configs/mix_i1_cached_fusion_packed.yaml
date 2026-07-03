@@ -1,0 +1,19 @@
+# PACKED fusion config for ②③ — same as mix_i1_cached_fusion_local.yaml but cond/ss/shape/pbr
+# are read by os.pread from WebDataset .tar shards (packed_root, typically rsync'd to local
+# NVMe at train start) instead of per-sample small files on Lustre → kills the 8-rank
+# small-file open contention (the multi-GPU step-time penalty). Samples not present in the
+# shards transparently fall back to the Lustre cache paths below.
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v2/ready_v2.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/qwen35-2b_tok1024_crop_mv1
+      fuse_dino: true
+      packed_root: /opt/dlami/nvme/weikaih_wds   # NVMe stage dir (rsync target); see stage_shards_to_nvme.sh
+sampling:
+  granularity: batch
+  temperature: 1.0
