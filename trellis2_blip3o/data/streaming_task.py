@@ -24,17 +24,38 @@ from trellis2.modules.sparse import SparseTensor  # type: ignore
 class StreamingImageTo3D(IterableDataset):
     task_name = "image_to_3d"
 
-    def __init__(self, mds_root: str, *, fuse_dino: bool = True, ss_only: bool = False,
+    def __init__(self, mds_root: Optional[str] = None, *, shard_dirs: Optional[list] = None,
+                 fuse_dino: bool = True, ss_only: bool = False,
                  max_slat_tokens: int = 8192, shuffle: bool = True, batch_size: int = 1,
                  shuffle_seed: int = 9176, cache_limit: Optional[str] = None):
         super().__init__()
-        from streaming import StreamingDataset
+        from streaming import StreamingDataset, Stream
         self.fuse_dino = bool(fuse_dino)
         self.ss_only = bool(ss_only)
         self.max_slat_tokens = int(max_slat_tokens or 0)
-        # node/rank-aware sharding + shuffle + resume are handled internally by StreamingDataset.
-        self.ds = StreamingDataset(local=mds_root, shuffle=shuffle, batch_size=batch_size,
-                                   shuffle_seed=shuffle_seed, cache_limit=cache_limit)
+        if shard_dirs:
+            # NODE-SHARDED mode: this node holds only its owned shards locally (the MDS is too big
+            # for /fsx to persist + replicating the full set to every node wastes build time/disk).
+            # StreamingDataset's default partition spans the GLOBAL world (all 32 ranks); with only
+            # 1/N present locally that silently drops (N-1)/N of the data. Fix: make StreamingDataset
+            # shard NODE-LOCALLY — its 1/N split across this node's own ranks only. streaming reads
+            # rank/world from ENV via streaming.base.distributed (NOT torch.distributed), so we
+            # monkeypatch those three getters to node-local values. torch.distributed (DDP, already
+            # initialized with the global world) is untouched; across nodes the disjoint shards tile
+            # the full dataset. (8 local ranks × N nodes = global world → full coverage, no overlap.)
+            import streaming.base.distributed as _sd
+            _lws = _sd.get_local_world_size()      # ranks on THIS node (e.g. 8)
+            _lr = _sd.get_local_rank()             # this rank within the node (0..lws-1)
+            _sd.get_rank = lambda: _lr             # node-local rank
+            _sd.get_world_size = lambda: _lws      # node-local world == one node
+            # get_local_world_size stays == _lws  → World.detect ⇒ num_nodes=1, ranks_per_node=_lws
+            streams = [Stream(local=d) for d in shard_dirs]
+            self.ds = StreamingDataset(streams=streams, shuffle=shuffle, batch_size=batch_size,
+                                       shuffle_seed=shuffle_seed, cache_limit=cache_limit)
+        else:
+            # FULL mode: every node has the whole MDS; StreamingDataset does global node/rank sharding.
+            self.ds = StreamingDataset(local=mds_root, shuffle=shuffle, batch_size=batch_size,
+                                       shuffle_seed=shuffle_seed, cache_limit=cache_limit)
         self.ss_norm        = load_norm_stats(SS_FLOW_CONFIG_PATH, "normalization")
         self.shape_norm     = load_norm_stats(SHAPE_SLAT_CONFIG_PATH, "normalization")
         self.tex_pbr_norm   = load_norm_stats(TEX_SLAT_CONFIG_PATH, "pbr_slat_normalization")
@@ -100,8 +121,20 @@ class StreamingImageTo3D(IterableDataset):
         return data
 
     def __iter__(self):
+        import zipfile
+        n_skip = 0
         for s in self.ds:
+            # Build (decode) inside the try; yield OUTSIDE it. If we yield inside the try, an
+            # exception raised by the CONSUMER (training loop) propagates back through the yield
+            # and would be silently swallowed as a "skip" — hiding real downstream errors.
             try:
-                yield self._build(s)
-            except ValueError:
-                continue                                # oversized SLAT → skip, take next
+                item = self._build(s)
+            except (ValueError, EOFError, OSError, KeyError, zipfile.BadZipFile) as e:
+                # oversized SLAT (ValueError) OR a truncated/corrupt npz in the source data
+                # ("No data left in file" EOFError, BadZipFile, ...) → skip, take next. Each rank
+                # skips independently; DDP stays in step (1 fwd/bwd per step regardless of which sample).
+                n_skip += 1
+                if n_skip <= 5 or n_skip % 200 == 0:
+                    print(f"[StreamingImageTo3D] skip #{n_skip} ({type(e).__name__}: {str(e)[:80]})", flush=True)
+                continue
+            yield item

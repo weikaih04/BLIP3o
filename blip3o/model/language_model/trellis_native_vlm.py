@@ -380,6 +380,17 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                         f"(SS {len(self.ss_flow.blocks)} blocks"
                         + (f", Shape/Tex too" if config.build_slat else "") + ")")
 
+        # optional: torch.compile the DENSE SS-flow blocks (regional, compiled once & reused).
+        # Fuses the LayerNorm fp32 round-trips + modulate/gate elementwise (~130 ms/step of
+        # cast+elementwise) → ~1.34x lossless on SS (loss Δ ~4e-4). SLAT flows can't compile
+        # (sparse dynamic shapes). Enable with env COMPILE_SS=1.
+        import os as _os
+        if _os.environ.get("COMPILE_SS", "0") == "1" and self.ss_flow is not None and hasattr(self.ss_flow, "blocks"):
+            import torch._dynamo as _dyn; _dyn.config.cache_size_limit = 64
+            for _i in range(len(self.ss_flow.blocks)):
+                self.ss_flow.blocks[_i] = torch.compile(self.ss_flow.blocks[_i], dynamic=True)
+            rank0_print(f"[compile-ss] torch.compile on {len(self.ss_flow.blocks)} SS blocks")
+
     # HF's `--gradient_checkpointing True` only enables GC on the VLM. The TRELLIS flow
     # blocks have their OWN `use_checkpoint` (default False) — without this propagation,
     # the flow activations dominate memory and OOM at higher latent resolution (1024).

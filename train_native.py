@@ -359,6 +359,11 @@ class NativeArgs:
     # manifest+mixture path. Single-task image_to_3d (S1/S2 I1 fusion).
     mds_root: Optional[str] = field(default=None)
     mds_cache_limit: Optional[str] = field(default=None)   # e.g. "600gb" to bound local cache
+    # NODE-SHARDED MDS: comma-separated shard dirs THIS node holds locally (built by
+    # scripts/stage_mds_v3.sh). When set, StreamingImageTo3D shards node-locally (each node's
+    # owned shards split across its own ranks; disjoint shards across nodes tile the full set).
+    # Overrides --mds_root. See scripts/stage_mds_v3.sh + s1_v3_launch.sh.
+    mds_shards: Optional[str] = field(default=None)
 
     # torch.compile on the dense SS flow. -18.8% step time at ~zero quality risk on
     # tests/profile_native_compile.py (BASELINE 234ms → 190ms; backward -30%).
@@ -497,6 +502,18 @@ def main():
         )
         print(f"[train_native] torch.compile(ss_flow): mode={native_args.compile_mode!r} "
               f"dynamic={native_args.compile_dynamic}  (SLAT flows NOT compiled)")
+        # accelerate>=1.x: extract_model_from_parallel() does `has_compiled_regions(model)` and,
+        # if any SUBMODULE is compiled (our ss_flow), tries `model = model._orig_mod` on the TOP
+        # model — which is NOT compiled → AttributeError inside Trainer.__init__'s unwrap_model.
+        # We deliberately compile only the ss_flow submodule and keep it compiled through training,
+        # so neutralize that top-level unwrap probe (resume re-compiles → checkpoint keys still match).
+        try:
+            import accelerate.utils.other as _aother
+            if getattr(_aother, "has_compiled_regions", None) is not None:
+                _aother.has_compiled_regions = lambda *a, **k: False
+                print("[train_native] patched accelerate.has_compiled_regions→False (partial-compile unwrap fix)")
+        except Exception as _e:
+            print(f"[train_native] WARN: could not patch has_compiled_regions: {_e}")
 
     # Sync to TRELLIS official SLAT 512 config — register a LinearMemoryController so
     # each SLAT forward dynamically picks how many of the 30 blocks to checkpoint based
@@ -534,12 +551,14 @@ def main():
     #   --mixture_config (new, multi-task)   → MixtureIterableDataset + MultiTaskCollator
     #   else (legacy, single-dataset)        → TR2NativeVLMDataset + NativeVLMCollator
     per_dev_bs = max(1, int(training_args.per_device_train_batch_size))
-    if native_args.mds_root:
+    if native_args.mds_root or native_args.mds_shards:
         # MDS path: StreamingDataset does its own node/rank-aware sharding + resume.
         from trellis2_blip3o.data.streaming_task import StreamingImageTo3D
         from trellis2_blip3o.data.mixture import MultiTaskCollator
+        _shard_dirs = [d for d in (native_args.mds_shards or "").split(",") if d] or None
         train_ds = StreamingImageTo3D(
             native_args.mds_root,
+            shard_dirs=_shard_dirs,
             fuse_dino=native_args.fuse_dino,
             ss_only=native_args.ss_only,
             max_slat_tokens=native_args.max_slat_tokens,
@@ -547,8 +566,9 @@ def main():
             cache_limit=native_args.mds_cache_limit,
         )
         collator = MultiTaskCollator(processor=processor)
-        print(f"[train_native] MDS source {native_args.mds_root} "
-              f"({len(train_ds.ds)} samples, fuse_dino={native_args.fuse_dino}, ss_only={native_args.ss_only})")
+        _src = f"shards={_shard_dirs}" if _shard_dirs else native_args.mds_root
+        print(f"[train_native] MDS source {_src} "
+              f"({len(train_ds.ds)} samples this node, fuse_dino={native_args.fuse_dino}, ss_only={native_args.ss_only})")
         if not training_args.max_steps or training_args.max_steps <= 0:
             raise ValueError("--mds_root uses IterableDataset; --max_steps must be set.")
         # StreamingDataset is already rank-aware → each rank iterates its own loader (same as
@@ -617,4 +637,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Bind this rank's CUDA device BEFORE any collective. torchrun sets LOCAL_RANK; without an
+    # explicit set_device, early NCCL collectives (e.g. StreamingDataset's barrier, which runs
+    # before accelerate/DeepSpeed bind the device) warn "devices ... currently unknown" and can
+    # HANG cross-node (the 2-node S1 jobs timed out on an allreduce). Idempotent w/ accelerate.
+    import os as _os, torch as _torch
+    if _os.environ.get("LOCAL_RANK") is not None and _torch.cuda.is_available():
+        _torch.cuda.set_device(int(_os.environ["LOCAL_RANK"]))
     main()
