@@ -135,7 +135,11 @@ def main():
                     n_skip += 1
                     continue
                 views = sorted(int(v) for v in crng.choice(n_avail, size=size, replace=False))
-                imgs = ds._load_views(rec["renders_dir"], views)
+                try:
+                    imgs = ds._load_views(rec["renders_dir"], views)
+                except Exception as e:   # corrupt/truncated render → skip combo
+                    print(f"[shard {args.shard}] skip {sha} combo{ci}: {e!r}", flush=True)
+                    continue
                 if len(imgs) != size:
                     continue
                 # BUDGETED DINO (weikaih 2026-06-12: IM cond must NOT grow linearly with
@@ -176,7 +180,11 @@ def main():
             if os.path.exists(vlm_cache.entry_path(args.out_root, sha, v)):
                 n_skip += 1
                 continue
-            imgs = ds._load_views(rec["renders_dir"], [v])
+            try:
+                imgs = ds._load_views(rec["renders_dir"], [v])
+            except Exception as e:   # corrupt/truncated render → skip, don't kill the shard
+                print(f"[shard {args.shard}] skip {sha} v{v}: {e!r}", flush=True)
+                continue
             if not imgs:
                 continue
             batch = collate_vlm_3d([{"images": imgs, "caption": ""}], proc,

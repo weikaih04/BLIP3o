@@ -64,7 +64,11 @@ def main():
             if os.path.exists(vlm_cache.entry_path(args.out_root, sha, key)):
                 n_skip += 1
                 continue
-            imgs = ds._load_views(rec["renders_dir"], [v])
+            try:
+                imgs = ds._load_views(rec["renders_dir"], [v])
+            except Exception as e:   # corrupt/truncated render → skip, don't kill the shard
+                print(f"[shard {args.shard}] skip {sha} v{v}: {e!r}", flush=True)
+                continue
             if not imgs:
                 continue
             with torch.no_grad():
