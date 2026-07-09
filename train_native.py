@@ -494,14 +494,6 @@ def main():
     # requires_grad layout) and BEFORE Trainer wraps the model with DeepSpeed/FSDP.
     # SLAT flows are deliberately skipped — sparse + custom triton breaks Dynamo.
     if native_args.compile_ss_flow:
-        # Variable-length cond (batch-wise padding + dino_drop) makes the cross-attn SDPA
-        # recompile per cond length; the default dynamo cache_size_limit (8) is blown out →
-        # evict/recompile churn that erases the compile speedup. Raise the limits so every
-        # cond length is cached once (compute stays compute-bound; no per-step recompiles).
-        import torch._dynamo as _dyn
-        _dyn.config.cache_size_limit = 256
-        _dyn.config.accumulated_cache_size_limit = 1024
-        print("[train_native] dynamo cache_size_limit→256 (kills variable-cond recompile churn)")
         model.ss_flow = torch.compile(
             model.ss_flow,
             mode=native_args.compile_mode,
