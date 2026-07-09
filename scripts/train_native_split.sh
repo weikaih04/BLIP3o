@@ -36,9 +36,22 @@ cd "$(dirname "$0")/.."
 export PATH="$(dirname "$(command -v python)"):$PATH"
 
 EFF_BS=256
-GA=$(( EFF_BS / (PER_GPU_BS * NPROC) ))
-[ $(( PER_GPU_BS * NPROC * GA )) -eq $EFF_BS ] || {
-  echo "[split] PER_GPU_BS($PER_GPU_BS) × NPROC($NPROC) must divide 256" >&2; exit 1; }
+NNODES="${NNODES:-1}"
+WORLD=$(( PER_GPU_BS * NPROC * NNODES ))
+GA=$(( EFF_BS / WORLD ))
+[ $(( WORLD * GA )) -eq $EFF_BS ] || {
+  echo "[split] PER_GPU_BS($PER_GPU_BS) × NPROC($NPROC) × NNODES($NNODES) must divide 256" >&2; exit 1; }
+# multi-node: torchrun rendezvous + zhiyuan NCCL/EFA env (harmless single-node; the
+# bs8 shape kills the variable-length straggler — see memory train-native-multinode-straggler)
+DIST_FLAGS=""
+if [ "$NNODES" -gt 1 ]; then
+  DIST_FLAGS="--nnodes=$NNODES --node-rank=${NODE_RANK:?NODE_RANK required for NNODES>1} \
+              --master-addr=${MASTER_ADDR:?} --master-port=${MASTER_PORT:-29601}"
+  export LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}"
+  export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 NCCL_IB_DISABLE=0 NCCL_NET_GDR_LEVEL=2 NCCL_ASYNC_ERROR_HANDLING=1
+  _IF="$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null)"
+  export NCCL_SOCKET_IFNAME="$_IF" GLOO_SOCKET_IFNAME="$_IF"
+fi
 # INIT="none" → skip warm-start (speed profiling: init weights don't affect step time).
 if [ "$INIT" = "none" ]; then INIT_FLAG="";
 else [ -e "$INIT" ] || echo "[split][warn] INIT_CKPT not found on disk: $INIT" >&2; INIT_FLAG="--init_from_checkpoint $INIT"; fi
@@ -71,7 +84,12 @@ esac
 
 # Data source: MDS_ROOT (MosaicML Streaming, node/rank-sharded + resumable) overrides the
 # manifest mixture. For fusion (single-task I1) use MDS; s3 multitask still uses the yaml mixture.
-if [ -n "${MDS_ROOT:-}" ] && [ "$ROUND" = "fusion" ]; then
+if [ -n "${MDS_SHARDS:-}" ] && [ "$ROUND" = "fusion" ]; then
+  # node-local MDS shard dirs (comma-separated) — NVMe-fast; the mixture path starves GPUs
+  # when several nodes hammer /fsx with ~15MB/sample random reads (measured 0% GPU util).
+  DATA_FLAG="--mds_shards $MDS_SHARDS${MDS_CACHE_LIMIT:+ --mds_cache_limit $MDS_CACHE_LIMIT}"
+  DATA_DESC="mds_shards=$MDS_SHARDS"; WORKERS="${MDS_WORKERS:-0}"
+elif [ -n "${MDS_ROOT:-}" ] && [ "$ROUND" = "fusion" ]; then
   DATA_FLAG="--mds_root $MDS_ROOT${MDS_CACHE_LIMIT:+ --mds_cache_limit $MDS_CACHE_LIMIT}"
   DATA_DESC="mds=$MDS_ROOT"; WORKERS=0          # StreamingDataset shards internally; workers=0
 else
@@ -87,7 +105,7 @@ echo "        dino_drop=$DINO_DROP elastic=$ELASTIC_RATIO $DATA_DESC init=$INIT 
 export ATTN_BACKEND="${ATTN_BACKEND:-flash_attn_3}"
 export FUSED_MODULATE="${FUSED_MODULATE:-1}"
 
-torchrun --nproc_per_node="$NPROC" train_native.py \
+torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS} train_native.py \
   --vlm_model Qwen/Qwen3.5-2B \
   ${DATA_FLAG} \
   --build_vlm False \

@@ -30,17 +30,18 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$_IFACE}"
 
 DEST="${MDS_V3_ROOT:-/opt/dlami/nvme/weikaih_mds_v3_shards}"
 NUM_SHARDS="${MDS_NUM_SHARDS:-4}"
-NID="${SLURM_NODEID:-0}"; NN="${SLURM_NNODES:-1}"
+NID=$(( ${NID_BASE:-0} + ${SLURM_NODEID:-0} )); NN="${NN_TOTAL:-${SLURM_NNODES:-1}}"
 # barrier dir must be unique PER srun STEP (held-node pattern reuses one SLURM_JOB_ID across many
 # sruns → stale ready_* files would let a later run sail through the barrier unsynchronized)
-BAR="/fsx/sfr/weikaih/3dgen/model/BLIP3o/runs/cache_logs/s1v3bar_${SLURM_JOB_ID:-local}_${SLURM_STEP_ID:-0}"
+BAR="${BAR_DIR:-/fsx/sfr/weikaih/3dgen/model/BLIP3o/runs/cache_logs/s1v3bar_${SLURM_JOB_ID:-local}_${SLURM_STEP_ID:-0}}"
 OUTDIR="${OUTDIR:-runs/s1_v3}"; MAX_STEPS="${MAX_STEPS:-3000}"
 
 # (1) stage data. MDS_MODE=full → FOLLOW ZHIYUAN: every node builds the FULL MDS, StreamingDataset
 # does STANDARD global node/rank sharding (no node-local patch — removes the multi-node hang suspect).
 # MDS_MODE=shard (default) → node-local patch (each node only its 1/N).
 MDS_MODE="${MDS_MODE:-shard}"
-MANI=/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl
+DS_FLAG=$([ "${DEEPSPEED:-zero1}" = "none" ] && echo "" || echo "--deepspeed configs/deepspeed_${DEEPSPEED:-zero1}.json")
+MANI="${MANI:-/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl}"
 PY=/fsx/sfr/weikaih/miniconda3/envs/blip3o_trellis/bin/python
 if [ "$MDS_MODE" = "full" ]; then
   FULL="$DEST/full"
@@ -79,10 +80,10 @@ torchrun --nnodes="$NN" --node-rank="$NID" --nproc-per-node=8 \
   `# → NCCL allreduce timeout → SIGABRT (job 16976 died at step 15 this way). Frozen flow gains`\
   `# nothing from compile, so disable it here. (compile stays ON for the trainable split ss stage.)`\
   --target_tokens_per_view 1024 --slat_resolution 512 --cond_fusion none \
-  --max_slat_tokens 4096 --elastic_slat True --elastic_target_ratio 0.75 \
+  --max_slat_tokens "${MAX_SLAT:-8192}" --elastic_slat True --elastic_target_ratio "${ELASTIC_RATIO:-0.75}" \
   --output_dir "$OUTDIR" --max_steps "$MAX_STEPS" --bf16 True \
   --per_device_train_batch_size "${PER_GPU_BS:-2}" --gradient_accumulation_steps "${GA:-8}" \
   --learning_rate 1e-4 --warmup_steps 100 --weight_decay 0.01 \
   --adam_beta1 0.9 --adam_beta2 0.95 --max_grad_norm 1.0 --ema_decay 0.9999 --optim adamw_torch_fused \
   --logging_steps 5 --save_steps 500 --save_total_limit 4 --report_to none \
-  --deepspeed configs/deepspeed_zero1.json --ignore_data_skip True --dataloader_num_workers 0 2>&1 | grep -vE "load failed|resampling"
+  ${DS_FLAG} --ignore_data_skip True --dataloader_num_workers 0 2>&1 | grep -vE "load failed|resampling"

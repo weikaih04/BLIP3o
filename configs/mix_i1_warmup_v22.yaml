@@ -1,0 +1,16 @@
+# Stage-1 connector warmup — v2.2 encoder cond, QWEN-ONLY (no DINO).
+# Reads the offline v2.2 cond cache (build_vlm_cache_v22.py). fuse_dino: false → the
+# connector aligns v2.2 hiddens to TRELLIS cond space; DINO enters only at Stage-2 fusion.
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      cached_hidden_root: /fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: false
+sampling:
+  granularity: batch
+  temperature: 1.0
