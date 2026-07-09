@@ -76,18 +76,21 @@ class SLatJointAttention(nn.Module):
     to_qkv, q_rms_norm, k_rms_norm, rope, to_out. c-side uses SD3/diffusers naming.
     """
 
-    def __init__(self, channels: int, num_heads: int, qkv_bias: bool = True,
+    def __init__(self, channels: int, num_heads: int, ctx_channels: int = None,
+                 qkv_bias: bool = True,
                  qk_rms_norm: bool = True, use_rope: bool = True,
                  rope_freq: Tuple[float, float] = (1.0, 10000.0),
                  context_pre_only: bool = False):
         super().__init__()
         assert channels % num_heads == 0
         self.channels = channels
+        self.ctx_channels = ctx_channels or channels   # c-stream width (= cond_channels)
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.qk_rms_norm = qk_rms_norm
         self.use_rope = use_rope
         self.context_pre_only = context_pre_only
+        ctxc = self.ctx_channels
 
         # ---- x stream (migrated from pretrained SparseMultiHeadAttention) ----
         self.to_qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
@@ -98,16 +101,18 @@ class SLatJointAttention(nn.Module):
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
         self.to_out = nn.Linear(channels, channels)
 
-        # ---- c stream (fresh; SD3 naming; dense MultiHeadRMSNorm) ----
-        self.add_k_proj = nn.Linear(channels, channels, bias=qkv_bias)
-        self.add_v_proj = nn.Linear(channels, channels, bias=qkv_bias)
+        # ---- c stream: width = ctx_channels (TRELLIS cond dim). add_k/v_proj (ctxc→channels)
+        # INHERIT the pretrained cross_attn.to_kv (the learned "how to read the condition").
+        # add_q_proj / to_add_out / ffn are the genuinely-new co-evolving parts (fresh). ----
+        self.add_k_proj = nn.Linear(ctxc, channels, bias=qkv_bias)
+        self.add_v_proj = nn.Linear(ctxc, channels, bias=qkv_bias)
         if qk_rms_norm:
             self.norm_added_k = MultiHeadRMSNorm(self.head_dim, num_heads)
         if not context_pre_only:
-            self.add_q_proj = nn.Linear(channels, channels, bias=qkv_bias)
+            self.add_q_proj = nn.Linear(ctxc, channels, bias=qkv_bias)
             if qk_rms_norm:
                 self.norm_added_q = MultiHeadRMSNorm(self.head_dim, num_heads)
-            self.to_add_out = nn.Linear(channels, channels)
+            self.to_add_out = nn.Linear(channels, ctxc)
 
         self.c_gate = nn.Parameter(torch.zeros(num_heads))
 
@@ -240,13 +245,15 @@ class SLatJointBlock(nn.Module):
     x-stream = the pretrained sparse block minus its cross_attn step (fused Triton
     norm-modulate/gate-residual kept); c-stream = dense Qwen-Image txt stream."""
 
-    def __init__(self, channels: int, num_heads: int, mlp_ratio: float = 4.0,
+    def __init__(self, channels: int, num_heads: int, ctx_channels: int = None,
+                 mlp_ratio: float = 4.0,
                  mlp_ratio_c: float = 4.0, qkv_bias: bool = True, qk_rms_norm: bool = True,
                  use_rope: bool = True, rope_freq: Tuple[float, float] = (1.0, 10000.0),
                  use_checkpoint: bool = False, context_pre_only: bool = False):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.context_pre_only = context_pre_only
+        ctxc = ctx_channels or channels
 
         # ---- x stream (migrated) ----
         self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
@@ -254,14 +261,15 @@ class SLatJointBlock(nn.Module):
         self.mlp = SparseFeedForwardNet(channels, mlp_ratio=mlp_ratio)
         self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
 
-        # ---- c stream (fresh, dense) ----
-        self.norm1_c = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        # ---- c stream: width = ctx_channels (TRELLIS cond dim) ----
+        self.norm1_c = LayerNorm32(ctxc, elementwise_affine=False, eps=1e-6)
         if not context_pre_only:
-            self.norm2_c = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
-            self.ffn_c = FeedForwardNet(channels, mlp_ratio=mlp_ratio_c)
-        self.modulation_c = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
+            self.norm2_c = LayerNorm32(ctxc, elementwise_affine=False, eps=1e-6)
+            self.ffn_c = FeedForwardNet(ctxc, mlp_ratio=mlp_ratio_c)
+        self.modulation_c = nn.Parameter(torch.randn(6 * ctxc) / ctxc ** 0.5)
 
-        self.attn = SLatJointAttention(channels, num_heads, qkv_bias=qkv_bias,
+        self.attn = SLatJointAttention(channels, num_heads, ctx_channels=ctxc,
+                                       qkv_bias=qkv_bias,
                                        qk_rms_norm=qk_rms_norm, use_rope=use_rope,
                                        rope_freq=rope_freq,
                                        context_pre_only=context_pre_only)
@@ -320,17 +328,20 @@ class SLatFlowMMDiT(SLatFlowModel):
         rope_freq = tuple(ref.self_attn.rope.rope_freq) if use_rope and hasattr(ref.self_attn, "rope") \
             and hasattr(ref.self_attn.rope, "rope_freq") else (1.0, 10000.0)
         qkv_bias = ref.self_attn.to_qkv.bias is not None
+        ctxc = self.cond_channels                       # c-stream width = TRELLIS cond dim
         self.blocks = nn.ModuleList([
-            SLatJointBlock(ch, nh, mlp_ratio=self.mlp_ratio, mlp_ratio_c=mlp_ratio_c,
+            SLatJointBlock(ch, nh, ctx_channels=ctxc, mlp_ratio=self.mlp_ratio,
+                           mlp_ratio_c=mlp_ratio_c,
                            qkv_bias=qkv_bias, qk_rms_norm=ref.self_attn.qk_rms_norm,
                            use_rope=use_rope, rope_freq=rope_freq,
                            use_checkpoint=ref.use_checkpoint,
                            context_pre_only=(i == n - 1))
             for i in range(n)
         ])
+        # cond enters the c-stream directly at cond_channels (no 1024→1536 projection) so
+        # add_k/v_proj can inherit cross_attn.to_kv. Just a norm at the intake.
         self.txt_norm = nn.RMSNorm(self.cond_channels, eps=1e-6)
-        self.txt_in = nn.Linear(self.cond_channels, ch)
-        self.adaLN_modulation_c = nn.Sequential(nn.SiLU(), nn.Linear(ch, 6 * ch, bias=True))
+        self.adaLN_modulation_c = nn.Sequential(nn.SiLU(), nn.Linear(ch, 6 * ctxc, bias=True))
         # parent ran convert_to(dtype) on the OLD blocks before we replaced them — convert
         # the new joint blocks too (txt_*/adaLN_c stay fp32 like the parent's cond/t heads).
         self.convert_to(self.dtype)
@@ -372,9 +383,8 @@ class SLatFlowMMDiT(SLatFlowModel):
             pe = self.pos_embedder(h.coords[:, 1:])
             h = h + manual_cast(pe, self.dtype)
 
-        # context intake runs in fp32 (txt_norm/txt_in are model-level, like the parent's
-        # cond heads), THEN cast to the block dtype
-        c = manual_cast(self.txt_in(self.txt_norm(cond_dense)), self.dtype)
+        # context intake: norm only (c-stream IS cond_channels-wide), THEN cast
+        c = manual_cast(self.txt_norm(cond_dense), self.dtype)
         for block in self.blocks:
             h, c = block(h, c, mod, mod_c, cond_mask=cond_mask)
 
@@ -415,7 +425,21 @@ class SLatFlowMMDiT(SLatFlowModel):
             if sb.self_attn.use_rope:
                 db.attn.rope.load_state_dict(sb.self_attn.rope.state_dict())
             db.mlp.load_state_dict(sb.mlp.state_dict())
-            # (sb.cross_attn + sb.norm2 intentionally dropped)
+            # ★ INHERIT the pretrained condition-reading: cross_attn.to_kv (cond→K,V) splits
+            #   into the c-stream's add_k_proj (K half) + add_v_proj (V half); the cross qk-
+            #   norm on K → norm_added_k. This is the whole point of "MMDiT but keep TRELLIS".
+            ch = src.model_channels
+            kv_w = sb.cross_attn.to_kv.weight.data          # (2*ch, cond_ch)
+            db.attn.add_k_proj.weight.data.copy_(kv_w[:ch])
+            db.attn.add_v_proj.weight.data.copy_(kv_w[ch:])
+            if sb.cross_attn.to_kv.bias is not None:
+                kv_b = sb.cross_attn.to_kv.bias.data
+                db.attn.add_k_proj.bias.data.copy_(kv_b[:ch])
+                db.attn.add_v_proj.bias.data.copy_(kv_b[ch:])
+            if sb.cross_attn.qk_rms_norm and hasattr(db.attn, "norm_added_k"):
+                db.attn.norm_added_k.load_state_dict(sb.cross_attn.k_rms_norm.state_dict())
+            # (add_q_proj / to_add_out / ffn_c / c-modulation stay fresh — genuinely new
+            #  co-evolving parts with no pretrained analog; sb.norm2 dropped)
         return dst
 
     def c_gate_report(self) -> str:
