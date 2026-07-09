@@ -10,11 +10,11 @@
 # Run ONCE before training, on EVERY node:  srun --ntasks-per-node=1 bash scripts/stage_mds_v3.sh
 set -uo pipefail
 PY=/fsx/sfr/weikaih/miniconda3/envs/blip3o_trellis/bin/python
-MANI=/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl
+MANI="${MANI:-/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl}"
 DEST=${MDS_V3_ROOT:-/opt/dlami/nvme/weikaih_mds_v3_shards}
 NUM_SHARDS=${MDS_NUM_SHARDS:-4}
-NNODES=${SLURM_NNODES:-1}
-RANK=${SLURM_NODEID:-0}
+NNODES=${NN_TOTAL:-${SLURM_NNODES:-1}}
+RANK=$(( ${NID_BASE:-0} + ${SLURM_NODEID:-0} ))
 PROCS=${MDS_PROCS:-32}
 mkdir -p "$DEST"
 echo "[stage-mds] node $RANK/$NNODES  build shards k%$NNODES==$RANK  (of $NUM_SHARDS)  → $DEST"
@@ -22,6 +22,9 @@ for K in $(seq 0 $((NUM_SHARDS-1))); do
   [ $((K % NNODES)) -eq "$RANK" ] || continue
   OUT="$DEST/shard$K"
   if [ -f "$OUT/index.json" ]; then echo "[stage-mds] shard$K built already → skip"; continue; fi
+  # incomplete/leftover shard (part_* but no index.json) → clean before build (MDSWriter
+  # errors on a non-empty out dir). Idempotent: complete shards are skipped above.
+  [ -d "$OUT" ] && { echo "[stage-mds] shard$K incomplete → rm -rf"; rm -rf "$OUT"; }
   echo "[stage-mds] building shard$K → $OUT"
   "$PY" /fsx/sfr/weikaih/3dgen/model/BLIP3o/scripts/build_mds.py \
     --out "$OUT" --manifest "$MANI" --shard "$K" --num-shards "$NUM_SHARDS" --procs "$PROCS"

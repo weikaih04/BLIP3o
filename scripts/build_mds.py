@@ -16,7 +16,8 @@ from streaming import MDSWriter
 from streaming.base.util import merge_index
 
 MANI = "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v2/ready_v2_clean.jsonl"
-ROOT = "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/qwen35-2b_tok1024_crop_mv1"
+ROOT = os.environ.get("COND_ROOT",
+    "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/qwen35-2b_tok1024_crop_mv1")
 COLUMNS = {"sha": "str", "subset": "str",
            "cond": "bytes", "ss": "bytes", "shape": "bytes", "pbr": "bytes",
            "meta": "json"}

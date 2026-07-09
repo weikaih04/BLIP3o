@@ -59,13 +59,15 @@ def main():
         rec = ds.records[ri]
         sha = rec.get("sha256", f"idx_{ri}")
         n_views = min(int(rec.get("n_views", 16)), args.max_views)
+        _good = (5 + (int(sha[:8], 16) + {"A":0,"B":3,"C":5}[os.environ.get("VIEW_SET","A")]) % 7) if os.environ.get("GOOD_VIEWS", "0") == "1" else None
+        _force = os.environ.get("FORCE_REEXTRACT", "0") == "1"
         for v in range(n_views):
             key = vlm_cache.dino_key(v)
-            if os.path.exists(vlm_cache.entry_path(args.out_root, sha, key)):
+            if not _force and os.path.exists(vlm_cache.entry_path(args.out_root, sha, key)):
                 n_skip += 1
                 continue
             try:
-                imgs = ds._load_views(rec["renders_dir"], [v])
+                imgs = ds._load_views(rec["renders_dir"], [_good if _good is not None else v])
             except Exception as e:   # corrupt/truncated render → skip, don't kill the shard
                 print(f"[shard {args.shard}] skip {sha} v{v}: {e!r}", flush=True)
                 continue
