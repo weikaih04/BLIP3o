@@ -34,6 +34,14 @@ LR="${LR:-1e-4}"
 command -v torchrun >/dev/null 2>&1 || source /fsx/sfr/weikaih/miniconda3/bin/activate blip3o_trellis
 cd "$(dirname "$0")/.."
 export PATH="$(dirname "$(command -v python)"):$PATH"
+# torch.compile cache — MUST be LOCAL. Pointing TRITON_CACHE_DIR at /fsx (Lustre) crashes with
+# "OSError [Errno 14] Bad address" (triton mmaps its .llir/.so; Lustre doesn't support it).
+# So cache lives on /dev/shm (per node). Persistence across grabs is done by rsync
+# (/dev/shm build → save to /fsx → restore to /dev/shm next time), NOT by cache-dir-on-Lustre.
+export TORCHINDUCTOR_CACHE_DIR="/dev/shm/ind_${SLURM_NODEID:-0}"
+export TRITON_CACHE_DIR="/dev/shm/tri_${SLURM_NODEID:-0}"
+export TMPDIR="/dev/shm/tmpc_${SLURM_NODEID:-0}"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
 
 EFF_BS=256
 NNODES="${NNODES:-1}"
@@ -123,4 +131,4 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS} train_native.py \
   --ema_decay 0.998 \
   --logging_steps 5 --save_steps 500 --save_total_limit 4 \
   --report_to "$REPORT" ${DS_FLAG} \
-  --ignore_data_skip True --dataloader_num_workers "$WORKERS"
+  --ignore_data_skip True --dataloader_num_workers "$WORKERS" ${EXTRA_ARGS:-}

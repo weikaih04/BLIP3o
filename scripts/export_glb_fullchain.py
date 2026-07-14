@@ -45,6 +45,10 @@ def load_ss_flow(ckpt_dir, use_ema=True):
     assert fsd, "no ss_flow keys"
     missing, _ = flow.load_state_dict(fsd, strict=False)
     conn = TRELLIS2Connector(2048, flow.cond_channels)
+    if any(k.startswith("diffusion_connector.pos_stamp.") for k in sd):
+        from trellis2_blip3o.pos_stamp import DinoPosStamp   # dpos-stamped ckpt (pos_stamp.py)
+        conn.pos_stamp = DinoPosStamp()
+        print("[load-ss] pos_stamp attached", flush=True)
     conn.load_state_dict({k[len("diffusion_connector."):]: v for k, v in sd.items()
                           if k.startswith("diffusion_connector.")}, strict=True)
     dve = sd.get("dino_view_embed")

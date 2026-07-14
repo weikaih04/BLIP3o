@@ -264,6 +264,11 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             vlm_hidden_dim=config.vlm_hidden_size,
             trellis_cond_dim=TRELLIS_COND_DIM,
         )
+        # DINO position signature stamped on the qwen cond segment (ablation crossdpos win;
+        # memory blip3o-rope-position-hole). Connector submodule → saved/loaded with the ckpt.
+        if getattr(config, "cond_pos_stamp", False):
+            from trellis2_blip3o.pos_stamp import DinoPosStamp
+            self.diffusion_connector.pos_stamp = DinoPosStamp()
 
         # --- fusion: zero-init per-view-ordinal embedding for the DINO segment ---
         # (multi-image identity; no-op at init so I1-trained fusion ckpts load cleanly)

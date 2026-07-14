@@ -28,16 +28,21 @@ def main():
     ap.add_argument("--out_root", required=True)
     ap.add_argument("--crop_to_object", type=int, default=1)
     ap.add_argument("--max_views", type=int, default=4)
+    ap.add_argument("--image_size", type=int, default=DINOV3_IMAGE_SIZE,
+                    help="DINOv3 input size (multiple of 16). 512 → 1029 tok (prod); "
+                         "768 → 2309 tok (I1-HD variant). DINOv3 RoPE is computed from "
+                         "the actual input size — no pos-emb interpolation needed.")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num_shards", type=int, default=1)
     ap.add_argument("--min_aesthetic", type=float, default=None)
     args = ap.parse_args()
     dev = "cuda"
+    assert args.image_size % 16 == 0, "DINOv3 patch16: image_size must be a multiple of 16"
 
     ds = ImageTo3DDataset(manifest=args.manifest, ss_only=True,
                           crop_to_object=bool(args.crop_to_object),
                           min_aesthetic=args.min_aesthetic)
-    ext = DinoV3FeatureExtractor(TRELLIS_DINOV3_NAME, image_size=DINOV3_IMAGE_SIZE)
+    ext = DinoV3FeatureExtractor(TRELLIS_DINOV3_NAME, image_size=args.image_size)
     ext.model.eval().to(dev)
     for p in ext.model.parameters():
         p.requires_grad_(False)
@@ -47,7 +52,7 @@ def main():
         mp = os.path.join(args.out_root, "_meta.json")
         meta = json.load(open(mp)) if os.path.isfile(mp) else {}
         meta.update({"dino_model": TRELLIS_DINOV3_NAME,
-                     "dino_image_size": DINOV3_IMAGE_SIZE,
+                     "dino_image_size": int(args.image_size),
                      "dino_max_views": int(args.max_views)})
         os.makedirs(args.out_root, exist_ok=True)
         with open(mp, "w") as f:

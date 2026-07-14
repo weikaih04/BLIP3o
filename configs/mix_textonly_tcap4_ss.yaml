@@ -1,0 +1,15 @@
+# TEXT-ONLY S3 pilot — SS stage. Single T task over the full 422k capT manifest,
+# cond from the v22_tcap4 t-key cache (weighted t-sampling per its _meta.json:
+# long .35 / medium .20 / short .10 / long+tex .35, t003->t000 fallback).
+# ss_only: skip shape/pbr latent loading (SS job trains the dense SS flow only).
+tasks:
+  - name: text_to_3d_weighted
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_capT.jsonl
+      slat_resolution: 512
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_tcap4
+      ss_only: true
+sampling:
+  granularity: batch
+  temperature: 1.0

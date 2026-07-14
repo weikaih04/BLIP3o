@@ -157,6 +157,9 @@ def compute_cascade_flow_loss(
         drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
         keep = (~drop).to(cond_hidden.dtype).view(B, 1, 1)
         cond_q = connector(cond_hidden * keep)                       # (B, T_q, 1024)
+        if getattr(connector, "pos_stamp", None) is not None:        # DINO pos signature
+            from .pos_stamp import IMG_SPAN_FULL
+            cond_q = connector.pos_stamp(cond_q, IMG_SPAN_FULL)
         dino_seg = dino_hidden.to(cond_q.dtype)                      # (B, N_d, 1024)
         if dino_view_embed is not None and dino_view_ids is not None:
             # multi-image identity: zero-init per-ordinal embedding (grad flows to the
@@ -177,6 +180,9 @@ def compute_cascade_flow_loss(
         kd_active = False
     elif teacher_cond is None:
         cond = connector(mask_drop(cond_hidden, mask_drop_prob))
+        if getattr(connector, "pos_stamp", None) is not None:
+            from .pos_stamp import IMG_SPAN_FULL
+            cond = connector.pos_stamp(cond, IMG_SPAN_FULL)
         kd_active = False
     else:
         # Distill path: replicate mask_drop but KEEP the per-sample drop mask so we

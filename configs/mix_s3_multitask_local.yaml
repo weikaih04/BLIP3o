@@ -1,0 +1,39 @@
+# Stage-3 multitask (fsx-local): I1(.5) + IM(.3) + T(.2) over ready_v4_vlm_filtered,
+# all cached v2.2-encoder cond, fusion [DINO; Qwen] on image tasks (T = Qwen-only).
+# Built 2026-07-13 (S3 data phase). NOTE:
+#   - image_to_3d root = prod v22 cache AFTER the dino_fix hygiene force-remerge.
+#   - multi_image_to_3d root = pinned 4-view combos (m00, im_combo_sizes=[4]) —
+#     PENDING BUILD: storage arbitration needed (~5.4 TB). Placeholder path below.
+#   - text_to_3d = t000..t003 entries ([long, medium, short, texture] caption variants,
+#     manifest vlm_filtered_cap4.jsonl carries the same captions order).
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      cached_hidden_root: /fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      max_views: 4
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_im4_mv4  # PENDING BUILD
+      fuse_dino: true
+  - name: text_to_3d
+    weight: 0.2
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_cap4.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: null
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_tcap4
+sampling:
+  granularity: batch
+  temperature: 1.0

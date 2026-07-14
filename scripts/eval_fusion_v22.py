@@ -57,18 +57,22 @@ def build_cond(conn, dve, entry_dir, qwen_only=False):
     dmask = torch.from_numpy(a["dino_keep_mask"]).cuda()
     with torch.no_grad():
         cq = conn(qwen[None])                                    # (1, Tq, 1024)
+        c0 = conn(torch.zeros_like(qwen)[None])
+        if getattr(conn, "pos_stamp", None) is not None:         # dpos stamp (pos_stamp.py) —
+            from trellis2_blip3o.pos_stamp import IMG_SPAN_FULL  # full-seq span, BEFORE keep-indexing
+            cq = conn.pos_stamp(cq, IMG_SPAN_FULL)
+            c0 = conn.pos_stamp(c0, IMG_SPAN_FULL)               # uncond stamped too (train parity)
         dseg = dino[None]
         if dve is not None:
             dseg = dseg + dve[0][None, None].float()
         cond = torch.cat([dseg, cq], 1)                          # (1, Td+Tq, 1024)
         mask = torch.cat([dmask, qmask])[None]                   # (1, Td+Tq)
         # CFG uncond: zeros-DINO ; connector(0)  (flow_heads convention)
-        c0 = conn(torch.zeros_like(qwen)[None])
         uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
     if qwen_only:
         # DINO segment ABSENT — the dino_drop training regime (keys masked off entirely)
         keep = qmask
-        return cq[:, keep], conn(torch.zeros_like(qwen)[None])[:, keep]
+        return cq[:, keep], c0[:, keep]
     # keep only masked-in tokens (bs=1 → simply index, no padding needed)
     keep = mask[0]
     return cond[:, keep], uncond[:, keep]

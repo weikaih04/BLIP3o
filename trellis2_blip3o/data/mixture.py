@@ -143,20 +143,25 @@ class MixtureIterableDataset(IterableDataset):
             for i in range(len(self.tasks))
         ]
 
-        # Per-task cyclic index streams (each shuffles within its own dataset every "epoch").
+        # Per-task cyclic INDEX streams (each shuffles within its own dataset every
+        # "epoch"). Cyclers yield indices, NOT loaded items: the skip branch below can
+        # then advance the stream WITHOUT touching the dataset. Burned items used to be
+        # fully loaded and discarded — num_workers× read amplification (measured
+        # 2026-07-13, shape_textonly WORKERS=8: ~145ms/sample × 8× burns starved a
+        # 16-rank job to ~19s/it, GPUs 0%). Yielded samples are IDENTICAL: the RNG and
+        # index streams advance exactly as before; only the wasted loads are gone.
         def make_cycler(ti: int):
-            ds = self.tasks[ti]
-            n = len(ds)
+            n = len(self.tasks[ti])
             tr = per_task_rng[ti]
             while True:
                 order = tr.permutation(n) if n > 1 else np.array([0])
                 for j in order:
-                    yield ds[int(j)]
+                    yield int(j)
         cyclers = [make_cycler(i) for i in range(len(self.tasks))]
 
         # Worker-id stride: with num_workers workers, each yields every num_workers-th
-        # batch. We "burn" the cycler items for skipped batches so that all workers
-        # remain consistent with the shared task_rng sequence.
+        # batch. We "burn" the cycler indices for skipped batches so that all workers
+        # remain consistent with the shared task_rng sequence (burns skip the load).
         skip = worker_id
         while True:
             t = int(task_rng.choice(len(self.tasks), p=self.probs))
@@ -177,7 +182,7 @@ class MixtureIterableDataset(IterableDataset):
                 setter(task_rng)
             try:
                 for _ in range(n_emit):
-                    yield next(cyclers[t])
+                    yield ds[next(cyclers[t])]
             finally:
                 # Reset, so the next task draw starts clean.
                 clearer = getattr(ds, "clear_batch_params", None)

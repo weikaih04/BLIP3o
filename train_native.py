@@ -344,6 +344,7 @@ class NativeArgs:
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
+    cond_pos_stamp: bool = field(default=False)  # DINO position signature on qwen cond (pos_stamp.py)
     # Warm-start connector+flow from a prior run's checkpoint dir (loads model.safetensors,
     # strict=False, NO optimizer/step resume). For adding the dino head on trained weights.
     init_from_checkpoint: str = field(default="")
@@ -460,6 +461,7 @@ def main():
         train_stages=native_args.train_stages,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
+        cond_pos_stamp=native_args.cond_pos_stamp,
     )
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)

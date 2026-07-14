@@ -1,0 +1,17 @@
+# TEXT-ONLY S3 pilot — SHAPE stage. Same T task/cache/weights as mix_textonly_tcap4.yaml
+# but load_tex: false — the shape flow never consumes tex targets, and skipping the pbr
+# npz removes ~1/3 of the per-sample SLAT read cost on the unpacked mixture path
+# (part of the 2026-07-13 shape_textonly dataloader-starvation fix, together with the
+# mixture burn-without-load change and the adapter's voxel pre-check).
+tasks:
+  - name: text_to_3d_weighted
+    weight: 1.0
+    args:
+      manifest: /fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_capT.jsonl
+      slat_resolution: 512
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_tcap4
+      ss_only: false
+      load_tex: false
+sampling:
+  granularity: batch
+  temperature: 1.0
