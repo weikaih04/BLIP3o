@@ -31,24 +31,36 @@ ELASTIC_RATIO="${ELASTIC_RATIO:-0.75}"
 DINO_DROP="${DINO_DROP:-0.3}"
 MAX_STEPS="${MAX_STEPS:-3000}"
 LR="${LR:-1e-4}"
-command -v torchrun >/dev/null 2>&1 || source /fsx/sfr/weikaih/miniconda3/bin/activate blip3o_trellis
+# NOTE: /fsx/sfr/weikaih is the OLD cluster; the new (xgen-mm) cluster's env lives under
+# /fsx/home/weikai.huang. Try the new path first, keep the old as a fallback.
+if ! command -v torchrun >/dev/null 2>&1; then
+  source /fsx/home/weikai.huang/miniconda3/bin/activate blip3o_trellis 2>/dev/null \
+    || source /fsx/sfr/weikaih/miniconda3/bin/activate blip3o_trellis
+fi
 cd "$(dirname "$0")/.."
 export PATH="$(dirname "$(command -v python)"):$PATH"
 # torch.compile cache — MUST be LOCAL. Pointing TRITON_CACHE_DIR at /fsx (Lustre) crashes with
 # "OSError [Errno 14] Bad address" (triton mmaps its .llir/.so; Lustre doesn't support it).
 # So cache lives on /dev/shm (per node). Persistence across grabs is done by rsync
 # (/dev/shm build → save to /fsx → restore to /dev/shm next time), NOT by cache-dir-on-Lustre.
-export TORCHINDUCTOR_CACHE_DIR="/dev/shm/ind_${SLURM_NODEID:-0}"
-export TRITON_CACHE_DIR="/dev/shm/tri_${SLURM_NODEID:-0}"
-export TMPDIR="/dev/shm/tmpc_${SLURM_NODEID:-0}"
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
+# Respect caller-provided cache dirs (some nodes have /dev/shm unwritable → caller points these
+# at node-local NVMe); only default to /dev/shm when unset.
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/dev/shm/ind_${SLURM_NODEID:-0}}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/dev/shm/tri_${SLURM_NODEID:-0}}"
+export TMPDIR="${TMPDIR:-/dev/shm/tmpc_${SLURM_NODEID:-0}}"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR" 2>/dev/null || true
 
-EFF_BS=256
+# Effective batch size. Default 256 (the recipe every prior link in the chain used).
+# Overridable because 256 is NOT reachable on an ODD node count: 3 nodes × 8 GPUs = 24
+# ranks and 24 ∤ 256 (256 = 2^8 has no factor 3). The 3-node S3 multitask run therefore
+# uses EFF_BS=384 (bs8 × 24 ranks × ga2). Keep it a power-of-two multiple of the world
+# size or this assert fires.
+EFF_BS="${EFF_BS:-256}"
 NNODES="${NNODES:-1}"
 WORLD=$(( PER_GPU_BS * NPROC * NNODES ))
 GA=$(( EFF_BS / WORLD ))
 [ $(( WORLD * GA )) -eq $EFF_BS ] || {
-  echo "[split] PER_GPU_BS($PER_GPU_BS) × NPROC($NPROC) × NNODES($NNODES) must divide 256" >&2; exit 1; }
+  echo "[split] PER_GPU_BS($PER_GPU_BS) × NPROC($NPROC) × NNODES($NNODES) must divide EFF_BS($EFF_BS)" >&2; exit 1; }
 # multi-node: torchrun rendezvous + zhiyuan NCCL/EFA env (harmless single-node; the
 # bs8 shape kills the variable-length straggler — see memory train-native-multinode-straggler)
 DIST_FLAGS=""
@@ -77,8 +89,13 @@ fi
 REPORT="${REPORT_TO:-wandb}"
 
 # per-stage flow/build wiring (identical to ground truth). ss has no SLAT → no elastic.
+# COMPILE_SS (default 1=True) → --compile_ss_flow. Set COMPILE_SS=0 for IM runs: variable
+# cond length thrashes torch.compile (recompiles per new shape) → disable it there.
+COMPILE_SS="${COMPILE_SS:-1}"
+if [ "$COMPILE_SS" = "0" ]; then SS_COMPILE_FLAG="--compile_ss_flow False";
+else SS_COMPILE_FLAG="--compile_ss_flow True --compile_mode default"; fi
 case "$STAGE" in
-  ss)        SLAT_FLAGS="--build_slat False --ss_only True  --compile_ss_flow True --compile_mode default" ;;
+  ss)        SLAT_FLAGS="--build_slat False --ss_only True  $SS_COMPILE_FLAG" ;;
   shape|tex) SLAT_FLAGS="--build_slat True  --ss_only False --compile_ss_flow False --elastic_slat True --elastic_target_ratio ${ELASTIC_RATIO}" ;;
   *) echo "[split] STAGE must be ss|shape|tex (got '$STAGE')" >&2; exit 1 ;;
 esac
@@ -86,18 +103,20 @@ esac
 # per-round data/cond wiring. s3 raises cond_max_length for 4-view fusion (~8225 tok).
 case "$ROUND" in
   fusion) MIX="${MIX:-configs/mix_i1_cached_fusion_local.yaml}"; CONDMAX="";                      WORKERS="${WORKERS:-4}" ;;
-  s3)     MIX=configs/mix_s3_multitask.yaml;     CONDMAX="--cond_max_length 10240"; WORKERS="${WORKERS:-8}" ;;
+  s3)     MIX="${MIX:-configs/mix_s3_multitask.yaml}"; CONDMAX="--cond_max_length 10240"; WORKERS="${WORKERS:-8}" ;;
   *) echo "[split] ROUND must be fusion|s3 (got '$ROUND')" >&2; exit 1 ;;
 esac
 
 # Data source: MDS_ROOT (MosaicML Streaming, node/rank-sharded + resumable) overrides the
-# manifest mixture. For fusion (single-task I1) use MDS; s3 multitask still uses the yaml mixture.
-if [ -n "${MDS_SHARDS:-}" ] && [ "$ROUND" = "fusion" ]; then
+# manifest mixture. Accepted for fusion (single-task I1 cond) AND s3 (single-task IM cond) —
+# both pack ONE cond stream per sample, so a single MDS dataset covers them. (True multitask
+# mixtures would need one MDS per task; s3-over-MDS here is the IM-only cond path.)
+if { [ "$ROUND" = "fusion" ] || [ "$ROUND" = "s3" ]; } && [ -n "${MDS_SHARDS:-}" ]; then
   # node-local MDS shard dirs (comma-separated) — NVMe-fast; the mixture path starves GPUs
   # when several nodes hammer /fsx with ~15MB/sample random reads (measured 0% GPU util).
   DATA_FLAG="--mds_shards $MDS_SHARDS${MDS_CACHE_LIMIT:+ --mds_cache_limit $MDS_CACHE_LIMIT}"
   DATA_DESC="mds_shards=$MDS_SHARDS"; WORKERS="${MDS_WORKERS:-0}"
-elif [ -n "${MDS_ROOT:-}" ] && [ "$ROUND" = "fusion" ]; then
+elif { [ "$ROUND" = "fusion" ] || [ "$ROUND" = "s3" ]; } && [ -n "${MDS_ROOT:-}" ]; then
   DATA_FLAG="--mds_root $MDS_ROOT${MDS_CACHE_LIMIT:+ --mds_cache_limit $MDS_CACHE_LIMIT}"
   DATA_DESC="mds=$MDS_ROOT"; WORKERS=0          # StreamingDataset shards internally; workers=0
 else

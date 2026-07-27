@@ -1,0 +1,52 @@
+# ── Stage-3 TRI-MODAL multitask, NEW (xgen-mm / ip-10-1-x) cluster ─────────────
+# I1(0.5) + IM(0.3) + T(0.2), all served from the per-asset npz caches on /fsx
+# (Lustre). NOT MDS: the new cluster's FSx sustains ~860 samples/s / 7.7 GB/s at
+# 128 threads (measured 2026-07-24, cold, from the *login* node); training needs
+# ~100 samples/s aggregate, so the small-file random-read pattern that starved the
+# OLD cluster is a non-issue here. See mix_s3_multitask_xgenmm_ss.yaml for the
+# SS-stage variant (ss_only: true).
+#
+# THIS FILE = shape / tex stages (loads shape+pbr SLAT latents).
+#
+# Cond roots (three DIFFERENT roots — do not collapse them):
+#   I1 : v22_3dvlm_tok1024_mv1   v000.npz  (merged qwen hidden + DINOv3 tokens)
+#   IM : v22_im4r                m00.npz   (pinned weighted 4-of-16 combo; carries
+#                                           dino_view_ids for the per-view embedding)
+#   T  : v22_3dvlm_tok1024_mv1   t000..t003.npz (Qwen-only, no DINO — by design)
+#
+# T uses `text_to_3d_weighted` (not the stock `text_to_3d`) because the t-cache's
+# _meta.json declares t_sampling_weights {t000 .35, t001 .20, t002 .10, t003 .35}
+# + t_sampling_fallback {t003 -> t000}; the stock task would sample the 4 caption
+# variants uniformly and would 404 on the ~20 assets that only have 3 captions.
+# It stamps `_task: "text_to_3d"`, so MultiTaskCollator / model routing is identical.
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      max_views: 4
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_im4r
+      fuse_dino: true
+  - name: text_to_3d_weighted
+    weight: 0.2
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_capT.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+sampling:
+  granularity: batch
+  temperature: 1.0

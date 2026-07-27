@@ -236,9 +236,60 @@ class NativeTrainer(Trainer):
                 self._stage_sum[k] = self._stage_sum.get(k, 0.0) + v
             self._stage_n += 1
 
+        # Per-TASK loss (multitask mixture runs). Mixture batches are homogeneous
+        # (MixtureIterableDataset granularity="batch") AND rank-synced, so `_task` is a
+        # single label for the whole global batch — accumulating per label over the logging
+        # window gives an exact per-task loss curve. Kept as a device tensor (no .item())
+        # so this adds no extra GPU sync per micro-step. No-op for single-task runs
+        # (one key → identical numbers to train/loss).
+        t = inputs.get("_task") if isinstance(inputs, dict) else None
+        # S3_TASK_DEBUG=1 → one line per micro-batch per rank, so a 2-rank run can be
+        # diffed to PROVE the mixture's task draw is rank-synced. (Ranks that disagree
+        # would train mismatched used-parameter sets → DDP hang / silent grad corruption.)
+        if os.environ.get("S3_TASK_DEBUG") == "1":
+            self._dbg_i = getattr(self, "_dbg_i", 0) + 1
+            print(f"[taskdbg] rank={os.environ.get('RANK','0')} micro={self._dbg_i} "
+                  f"task={t} cond={tuple(inputs['cond_hidden'].shape)} "
+                  f"dino={tuple(inputs['dino_hidden'].shape) if 'dino_hidden' in inputs else None}",
+                  flush=True)
+        if t in self._TASK_IDX:
+            if not hasattr(self, "_task_sum"):
+                self._task_sum = [None] * len(self._TASK_NAMES)
+                self._task_n = [0] * len(self._TASK_NAMES)
+            i = self._TASK_IDX[t]
+            d = loss.detach().float()
+            self._task_sum[i] = d if self._task_sum[i] is None else self._task_sum[i] + d
+            self._task_n[i] += 1
+
         return (loss, model_out) if return_outputs else loss
 
+    # Fixed order so the cross-rank all_reduce below has an identical-length vector on
+    # every rank even if a rank happened to see no batch of some task in the window.
+    _TASK_NAMES = ("image_to_3d", "multi_image_to_3d", "text_to_3d")
+    _TASK_IDX = {n: i for i, n in enumerate(_TASK_NAMES)}
+
+    def _merge_task_logs(self, logs):
+        if not any(getattr(self, "_task_n", []) or []):
+            return
+        dev = self.args.device
+        s = torch.stack([(v if v is not None else torch.zeros((), device=dev))
+                         for v in self._task_sum]).float()
+        n = torch.tensor(self._task_n, dtype=torch.float32, device=dev)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(s, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(n, op=torch.distributed.ReduceOp.SUM)
+        tot = float(n.sum())
+        for i, name in enumerate(self._TASK_NAMES):
+            if float(n[i]) > 0:
+                logs.setdefault(f"train/task/{name}/loss", float(s[i] / n[i]))
+            # running mix fraction — the live check that we are actually at 0.5/0.3/0.2
+            logs.setdefault(f"train/task/{name}/frac", float(n[i]) / max(tot, 1.0))
+        self._task_sum = [None] * len(self._TASK_NAMES)
+        self._task_n = [0] * len(self._TASK_NAMES)
+
     def log(self, logs, *args, **kwargs):
+        if "loss" in logs:
+            self._merge_task_logs(logs)
         # Merge windowed, cross-GPU-averaged per-stage losses into the train-loss log call so
         # they ride the SAME monotonic wandb step (no drops) and match train/loss semantics.
         if getattr(self, "_stage_n", 0) > 0 and "loss" in logs:
@@ -344,7 +395,26 @@ class NativeArgs:
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
+    qwen_drop_prob: float = field(default=0.0)  # mirror of dino_drop; blocks the flow's escape to qwen
+    view_embed_mode: str = field(default="learned")  # "learned"(zero-init dve) | "sincos"(HY3D-mv fixed view enc)
+    # ── REPA-style SS aux alignment (trellis2_blip3o/repa.py; official sihyun-yu/REPA) ──
+    # repa_root = VGGT target cache root ({root}/{sha[:2]}/{sha}/vggt16.npz); "" = OFF.
+    # Also exported as env REPA_ROOT so the streaming dataset loads the targets.
+    # REQUIRES --compile_ss_flow False (forward hooks don't survive torch.compile) —
+    # enforced below. CFG-dropped samples get aux weight 0 (deliberate deviation).
+    repa_root: str = field(default="")
+    repa_coeff: float = field(default=0.5)     # λ on the negative-cosine proj loss
+    repa_depth: int = field(default=0)         # 1-indexed SS block tap; 0 = num_blocks//3
+    repa_zdim: int = field(default=2049)       # target dim (density 1 + RAW 2048-d VGGT feat)
+    # Targets below this builder quality score load as aux-weight-0 (gate finding:
+    # thin scan-like shells → garbage VGGT clouds). Exported as env REPA_MIN_QUALITY.
+    repa_min_quality: float = field(default=0.5)
     cond_pos_stamp: bool = field(default=False)  # DINO position signature on qwen cond (pos_stamp.py)
+    cond_adapter: str = field(default="xf2")      # cond connector: "mlp" (3.1M) | "xf2" (i1 2-block xformer, ~27M).
+    # DEFAULT=xf2 (weikaih 2026-07-15): kept for text-to-3D (i1's deep text-adapter finding — the
+    # language→generation interface is the bottleneck there). NOTE: on image/qwen-only SS the xf2
+    # ablation measured WORSE (IoU 0.229 vs MLP 0.256) — position is the bottleneck there, not the
+    # interface, so image-conditioned runs (I1/IM fusion) should pass --cond_adapter mlp explicitly.
     # Warm-start connector+flow from a prior run's checkpoint dir (loads model.safetensors,
     # strict=False, NO optimizer/step resume). For adding the dino head on trained weights.
     init_from_checkpoint: str = field(default="")
@@ -426,6 +496,24 @@ def main():
     # strip them before the collator runs.
     training_args.remove_unused_columns = False
 
+    # REPA (SS aux alignment): forward hooks on the SS blocks are skipped inside
+    # torch.compile'd regions, so repa requires the uncompiled SS flow. Fail EARLY
+    # and loudly (compile_ss_flow defaults True — repa runs must pass it False, which
+    # the split launcher does via COMPILE_SS=0). Export REPA_ROOT before the dataset
+    # is built so streaming_task loads the targets (workers inherit the env).
+    if native_args.repa_root:
+        if native_args.compile_ss_flow:
+            raise RuntimeError(
+                "--repa_root requires --compile_ss_flow False (COMPILE_SS=0): the SS "
+                "block forward hook that taps the REPA hidden is skipped inside "
+                "torch.compile'd blocks. IM SS runs already use COMPILE_SS=0."
+            )
+        os.environ["REPA_ROOT"] = native_args.repa_root
+        os.environ["REPA_MIN_QUALITY"] = str(native_args.repa_min_quality)
+        print(f"[train_native] REPA on: root={native_args.repa_root} "
+              f"coeff={native_args.repa_coeff} depth={native_args.repa_depth or 'auto'} "
+              f"zdim={native_args.repa_zdim} min_quality={native_args.repa_min_quality}")
+
     cfg = TrellisNativeVLMConfig(
         vlm_model=native_args.vlm_model,
         freeze_vlm=native_args.freeze_vlm,
@@ -461,7 +549,14 @@ def main():
         train_stages=native_args.train_stages,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
+        qwen_drop_prob=native_args.qwen_drop_prob,
+        view_embed_mode=native_args.view_embed_mode,
         cond_pos_stamp=native_args.cond_pos_stamp,
+        cond_adapter=native_args.cond_adapter,
+        repa_root=native_args.repa_root,
+        repa_coeff=native_args.repa_coeff,
+        repa_depth=native_args.repa_depth,
+        repa_zdim=native_args.repa_zdim,
     )
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)
@@ -486,6 +581,11 @@ def main():
         sd = _load_sft(sd_path)
         if any("_orig_mod." in k for k in sd):
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        # sincos view-embed is a FIXED buffer: a warm-start ckpt trained with the old zero-init
+        # LEARNED dino_view_embed would overwrite the sincos values with zeros → drop that key so
+        # the fresh sincos buffer survives (this is the whole point of the mode).
+        if native_args.view_embed_mode == "sincos":
+            sd = {k: v for k, v in sd.items() if "dino_view_embed" not in k}
         missing, unexpected = model.load_state_dict(sd, strict=False)
         new_keys = [k for k in missing if "dino_aligner" in k]
         print(f"[train_native] init_from_checkpoint={sd_path}: loaded "

@@ -10,42 +10,43 @@ import os, sys, json, argparse
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ.setdefault("FUSED_MODULATE", "1")
 sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 _VIEW_FILE = "008.webp"
 from PIL import Image, ImageDraw, ImageFont
-from safetensors.torch import load_file
-
 from trellis2_blip3o import _paths  # noqa
 from trellis2.modules import sparse as sp  # type: ignore
 from trellis2_blip3o.tr2_modules import (build_sc_vae_shape_decoder_frozen,
                                          load_norm_stats, SHAPE_SLAT_CONFIG_PATH)
-from trellis2_blip3o.connector import TRELLIS2Connector
+from benchmarks.checkpoint import load_connector, load_state_dict
 from scripts.eval_render import decode_render
 from trellis2.utils import render_utils as t2render  # type: ignore
 import utils3d  # type: ignore
 
 COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
 MANI = os.environ.get("EVAL_MANI", "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
-SHAPE_CKPT = "/fsx/sfr/weikaih/3dgen/model/checkpoints/TRELLIS.2-4B/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16"
+# base pretrained shape-SLAT flow. Resolve via tr2_modules (_paths.CHECKPOINTS_ROOT) so the
+# path follows the repo location — the old hardcoded /fsx/sfr/weikaih/... is dead on the
+# xgen-mm cluster (/fsx/home/weikai.huang/...).
+from trellis2_blip3o.tr2_modules import DEFAULT_SHAPE_SLAT as _DEFAULT_SHAPE_SLAT
+SHAPE_CKPT = os.environ.get("EVAL_BASE_SHAPE_SLAT", _DEFAULT_SHAPE_SLAT)
 
 
 def load_flow_and_connector(ckpt_dir, use_ema=True):
     from trellis2 import models as t2models  # type: ignore
     flow = t2models.from_pretrained(SHAPE_CKPT)
-    sd = load_file(os.path.join(ckpt_dir, "model.safetensors"))
-    if use_ema:
-        sd.update(load_file(os.path.join(ckpt_dir, "ema.safetensors")))
+    sd = load_state_dict(ckpt_dir, use_ema=use_ema)
     flow_sd = {k[len("shape_slat_512."):]: v for k, v in sd.items()
                if k.startswith("shape_slat_512.")}
     missing, unexpected = flow.load_state_dict(flow_sd, strict=False)
-    conn = TRELLIS2Connector(2048, flow.cond_channels)
-    conn_sd = {k[len("diffusion_connector."):]: v for k, v in sd.items()
-               if k.startswith("diffusion_connector.")}
-    conn.load_state_dict(conn_sd, strict=True)
-    dve = sd.get("dino_view_embed")
-    print(f"[load] flow {len(flow_sd)} tensors (missing={len(missing)}), conn {len(conn_sd)}, "
-          f"ema={use_ema}", flush=True)
+    conn, dve, ckcfg = load_connector(ckpt_dir, state=sd,
+                                      vlm_hidden_dim=2048,
+                                      cond_dim=flow.cond_channels)
+    conn_sd = {k for k in sd if k.startswith("diffusion_connector.")}
+    print(f"[load] flow {len(flow_sd)} tensors (missing={len(missing)}), "
+          f"conn={ckcfg['cond_adapter']} ({len(conn_sd)} tensors), "
+          f"pos_stamp={ckcfg.get('cond_pos_stamp', False)}, ema={use_ema}", flush=True)
     return flow.cuda().eval(), conn.cuda().eval().float(), (dve.cuda() if dve is not None else None)
 
 

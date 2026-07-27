@@ -32,6 +32,13 @@ import yaml
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from . import registry
+from .rank_aware import install_iterable_shard_passthrough
+
+# accelerate re-shards EVERY IterableDataset across ranks (discarding (N-1)/N of what
+# it loads) unless the dataset says it already did that itself. See rank_aware.py —
+# without this the per-batch task draw below is sliced ACROSS ranks and each rank
+# trains a different task in the same step.
+install_iterable_shard_passthrough()
 
 
 @dataclass
@@ -88,7 +95,18 @@ class MixtureIterableDataset(IterableDataset):
     from different workers (different tasks) into one batch, breaking
     homogeneity. We emit a warning at iter time and recommend num_workers ≤ 1.
     (A pre-batched yield API + identity collator would lift this; see TODO.)
+    NOTE 2026-07-25: measured, this does NOT happen for an IterableDataset — the
+    DataLoader assembles each batch inside a SINGLE worker and consumes workers
+    strictly round-robin, so worker w emits global batches w, w+W, w+2W, ... and
+    the burn/`skip` logic below keeps that consistent with the shared task_rng.
+    Verified homogeneous + rank-synced at num_workers ∈ {0, 1, 8}; the warning is
+    left in place as a guard for future non-Iterable use.
     """
+
+    # We partition per-rank ourselves: the task draw is rank-SYNCED (rank not in
+    # task_seed) while the within-task index stream is per-RANK (rank in
+    # within_seed). accelerate must therefore not re-shard us — see rank_aware.py.
+    _rank_sharded = True
 
     def __init__(
         self,

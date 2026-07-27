@@ -113,10 +113,22 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         # per-sample, training only) — anti rich-get-richer, makes Qwen self-sufficient.
         fuse_dino: bool = False,
         dino_drop_prob: float = 0.1,
+        qwen_drop_prob: float = 0.0,   # mirror of dino_drop (fusion only; T unaffected)
         # IM multi-view identity for the DINO segment (Qwen segment self-identifies via
         # template/M-RoPE). ZERO-INIT learned per-ordinal embedding added to the DINO
         # tokens — starts as a no-op (I1-trained fusion ckpts unaffected), learns at S3.
         dino_view_embed_max: int = 8,
+        view_embed_mode: str = "learned",   # "learned" (zero-init) | "sincos" (HY3D-mv fixed)
+        # ── REPA-style SS auxiliary alignment (trellis2_blip3o/repa.py; official
+        # sihyun-yu/REPA recipe: 3-layer MLP projector on the output of the SS block at
+        # ~1/3 depth, negative-cosine to per-asset VGGT voxel targets, all t uniformly,
+        # total = flow + repa_coeff·proj). repa_root = target cache root ("" = OFF —
+        # existing runs unaffected). Requires COMPILE_SS=0 / --compile_ss_flow False
+        # (forward hooks don't survive torch.compile). CFG-dropped samples get aux 0.
+        repa_root: str = "",
+        repa_coeff: float = 0.5,
+        repa_depth: int = 0,                    # 1-indexed tap depth; 0 = auto num_blocks//3
+        repa_zdim: int = 2049,                  # target dim (density 1 + RAW 2048-d VGGT feature)
         # Stage-split training: build/train only one component per job (see __init__).
         train_stages: str = "all",              # all | ss | shape | tex
         logitnorm_mean: float = 1.0,
@@ -164,10 +176,18 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.distill_cfg_null_grad = distill_cfg_null_grad
         self.target_tokens_per_view = target_tokens_per_view
         self.build_vlm = build_vlm
+        self.repa_root = repa_root
+        self.repa_coeff = repa_coeff
+        self.repa_depth = repa_depth
+        self.repa_zdim = repa_zdim
+        # (REPA λ-warmup env is read lazily in the MODEL's _repa_lambda, not here — this is the
+        # config class; the earlier copy here was a misplaced-edit bug that crashed on empty env.)
         self.train_stages = train_stages
         self.fuse_dino = fuse_dino
         self.dino_drop_prob = dino_drop_prob
+        self.qwen_drop_prob = qwen_drop_prob
         self.dino_view_embed_max = dino_view_embed_max
+        self.view_embed_mode = view_embed_mode
         self.logitnorm_mean = logitnorm_mean
         self.logitnorm_std = logitnorm_std
         self.flow_sigma_min = flow_sigma_min
@@ -259,24 +279,54 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             self.tex_slat_512 = None
             self.trellis_decoders = None
 
-        # --- connector (UNCHANGED MLP; input dim auto-matched to the VLM) ---
-        self.diffusion_connector = TRELLIS2Connector(
-            vlm_hidden_dim=config.vlm_hidden_size,
-            trellis_cond_dim=TRELLIS_COND_DIM,
-        )
+        # --- connector: MLP (default) or i1-style 2-block Transformer adapter (cond_adapter="xf2").
+        # Both map (B,T,vlm_dim)→(B,T,1024) with a dist-matched output LayerNorm; the adapter adds
+        # self-attn capacity to the language→generation interface (i1 §3.1). Named diffusion_connector
+        # either way → always-trainable (train_native flow-freeze) + saved/loaded with the ckpt.
+        if getattr(config, "cond_adapter", "mlp") == "xf2":
+            from trellis2_blip3o.connector import TRELLIS2TransformerAdapter
+            self.diffusion_connector = TRELLIS2TransformerAdapter(
+                vlm_hidden_dim=config.vlm_hidden_size,
+                trellis_cond_dim=TRELLIS_COND_DIM,
+            )
+        else:
+            self.diffusion_connector = TRELLIS2Connector(
+                vlm_hidden_dim=config.vlm_hidden_size,
+                trellis_cond_dim=TRELLIS_COND_DIM,
+            )
         # DINO position signature stamped on the qwen cond segment (ablation crossdpos win;
         # memory blip3o-rope-position-hole). Connector submodule → saved/loaded with the ckpt.
         if getattr(config, "cond_pos_stamp", False):
             from trellis2_blip3o.pos_stamp import DinoPosStamp
             self.diffusion_connector.pos_stamp = DinoPosStamp()
 
-        # --- fusion: zero-init per-view-ordinal embedding for the DINO segment ---
-        # (multi-image identity; no-op at init so I1-trained fusion ckpts load cleanly)
-        self.dino_view_embed = None
-        if getattr(config, "fuse_dino", False):
-            self.dino_view_embed = torch.nn.Parameter(
-                torch.zeros(int(getattr(config, "dino_view_embed_max", 8)),
-                            TRELLIS_COND_DIM))
+        # --- fusion: per-view-ordinal embedding for the DINO segment (multi-image identity) ---
+        # "learned"(default): zero-init trainable — no-op at init so I1 fusion ckpts load clean,
+        #   but empirically stays a weak slot tag (L2~2) and never enables view routing.
+        # "sincos": FIXED full-strength 1D sin-cos over view ordinal (Hunyuan3D-2-mv recipe;
+        #   same idea as our dpos position-stamp fix) — gives the model a strong, orthogonal
+        #   "which view" signal from step 0 so cross-attn can route per-view instead of averaging.
+        if not getattr(config, "fuse_dino", False):
+            self.dino_view_embed = None
+        else:
+            _vmax = int(getattr(config, "dino_view_embed_max", 8))
+            if getattr(config, "view_embed_mode", "learned") == "sincos":
+                import numpy as _np, os as _os
+                D = TRELLIS_COND_DIM
+                omega = _np.arange(D // 2, dtype=_np.float64) / (D / 2.0)
+                omega = 1.0 / (10000 ** omega)
+                pos = _np.arange(_vmax, dtype=_np.float64)
+                out = _np.einsum("m,d->md", pos, omega)            # (Vmax, D/2)
+                emb = _np.concatenate([_np.sin(out), _np.cos(out)], axis=1)  # (Vmax, D)
+                # SCALE: raw sincos L2≈22.6 ≈ 0.7× the DINO token L2 (~32) — that drowns the
+                # content and the flow flees to the qwen segment (DINO attn share collapsed
+                # 0.72→0.22, killing the routing gain). Scale to ~15% of DINO (L2≈4.8) so the
+                # view signal is clear but doesn't out-weigh the features. env VIEW_EMBED_SCALE.
+                _scale = float(_os.environ.get("VIEW_EMBED_SCALE", "1.0") or "1.0")
+                self.register_buffer("dino_view_embed",
+                                     torch.from_numpy(emb).float() * _scale, persistent=True)
+            else:
+                self.dino_view_embed = torch.nn.Parameter(torch.zeros(_vmax, TRELLIS_COND_DIM))
 
         # --- DINOv3 conditioning aligner (REPA-inspired; image tasks only) ---
         # Frozen DINOv3 + train-only projection head. OFF unless config.dino_align.
@@ -359,6 +409,54 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
 
         # --- per-stage flow loss fns (shared helper) ---
         self._loss_fn_ss, self._loss_fn_slat = flow_heads.build_flow_loss_fns(config)
+
+        # --- REPA-style SS aux alignment (repa.py; config.repa_root gates it) ---
+        # Projector = official REPA build_mlp (hidden = SS block width → 2048 → 2048 →
+        # z_dim); a forward hook on ss_flow.blocks[depth-1] stashes that block's OUTPUT
+        # (B, 4096, C) into self._repa_stash during the SS forward; flow_heads pops it,
+        # projects, and cosine-aligns to the batch's repa_target. The projector is a
+        # child module → trainable (not matched by the flow-freeze tags) + saved/loaded
+        # with the checkpoint.
+        self.repa_projector = None
+        self._repa_stash = None
+        if getattr(config, "repa_root", ""):
+            import os as _os_r
+            if self.ss_flow is None:
+                raise ValueError("[repa] repa_root set but no SS flow built — REPA is an "
+                                 "SS-flow aux; use --train_stages all|ss.")
+            # hooks do NOT survive torch.compile of the blocks (Dynamo inlines the block
+            # forward). IM SS runs use COMPILE_SS=0 anyway; enforce it loudly here, and
+            # train_native.py enforces the matching --compile_ss_flow False.
+            if _os_r.environ.get("COMPILE_SS", "0") == "1":
+                raise RuntimeError("[repa] requires COMPILE_SS=0 — the SS block forward "
+                                   "hook is skipped inside torch.compile'd blocks.")
+            for _flag, _why in (("dual_cond", "blocks are wrapped by dual routing"),
+                                ("distill_dino", "KD teacher passes re-fire the hook")):
+                if getattr(config, _flag, False):
+                    raise ValueError(f"[repa] not supported with {_flag} ({_why}).")
+            if getattr(config, "cond_fusion", "none") == "depthwise":
+                raise ValueError("[repa] not supported with cond_fusion=depthwise "
+                                 "(blocks are wrapped by depth routing).")
+            from trellis2_blip3o.repa import build_repa_projector
+            _nb = int(self.ss_flow.num_blocks)
+            _depth = int(getattr(config, "repa_depth", 0)) or (_nb // 3)
+            if not (1 <= _depth <= _nb):
+                raise ValueError(f"[repa] repa_depth={_depth} out of range 1..{_nb}")
+            _hid = int(self.ss_flow.model_channels)
+            _zd = int(getattr(config, "repa_zdim", 2049))
+            self.repa_projector = build_repa_projector(_hid, _zd)
+            self._repa_depth = _depth
+            self._repa_stash = {}
+
+            def _repa_hook(_mod, _inp, out, _stash=self._repa_stash, _model=self):
+                if _model.training:               # training-only (sampling won't stash)
+                    _stash["h"] = out
+
+            self._repa_hook_handle = self.ss_flow.blocks[_depth - 1].register_forward_hook(
+                _repa_hook)
+            rank0_print(f"[repa] SS aux alignment ON: tap=blocks[{_depth - 1}] (depth "
+                        f"{_depth}/{_nb}), width {_hid} → z_dim {_zd}, coeff="
+                        f"{getattr(config, 'repa_coeff', 0.5)}, root={config.repa_root}")
 
         # --- depth-wise Semantic Routing (optional): per-block fusion over VLM layers ---
         # One router PER flow (each is a separate DiT); the connector is SHARED. Each flow
@@ -523,6 +621,31 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         anchor = self.dual_router.build_dino_anchor(per_view)            # (B, V*N, 1024)
         return anchor.to(dtype=dtype, device=device)
 
+    def _repa_lambda(self) -> float:
+        """Scheduled REPA λ. Constant self.repa_coeff unless REPA_COEFF_HI is set, then:
+        λ = hi for the first W steps, cosine-decay hi→repa_coeff over the next W, then base.
+        Advances an internal step counter each TRAINING call (rank-local; only sets the aux
+        weight, so cross-rank drift of a few steps is harmless)."""
+        import os as _os, math
+        base = float(getattr(self.config, "repa_coeff", 0.5))
+        # lazy-init (attrs may be absent: they were set on the config-loaded model path but not
+        # every construction route runs the model __init__ block that defines them).
+        if not hasattr(self, "_repa_coeff_hi"):
+            _hi = _os.environ.get("REPA_COEFF_HI", "").strip()
+            self._repa_coeff_hi = float(_hi) if _hi else None
+            _w = _os.environ.get("REPA_WARMUP_STEPS", "").strip()
+            self._repa_warmup = int(_w) if _w else 2000
+            self._repa_step = 0
+        if not self.training or self._repa_coeff_hi is None:
+            return base
+        t, W, hi = self._repa_step, max(1, self._repa_warmup), self._repa_coeff_hi
+        self._repa_step += 1
+        if t < W:
+            return hi
+        if t < 2 * W:
+            return base + (hi - base) * 0.5 * (1 + math.cos(math.pi * (t - W) / W))
+        return base
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -546,10 +669,15 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         dino_hidden: Optional[torch.Tensor] = None,
         dino_keep_mask: Optional[torch.Tensor] = None,
         dino_view_ids: Optional[torch.Tensor] = None,   # (B, N_d) view ordinals (IM)
+        qwen_view_ids: Optional[torch.Tensor] = None,   # (B, T_q) view ordinals for the QWEN segment (-1 = text)
         # cond_keep_mask (collator): True = real CONTENT token (caption/image_pad); False = chat-
         # template boilerplate (im_start/im_end/vision_*/role/think). ANDed into cond_key_mask so
         # the flow cross-attn ignores boilerplate → cleaner cond (esp. text→3D).
         cond_keep_mask: Optional[torch.Tensor] = None,
+        # REPA SS aux targets (collator emits when REPA_ROOT is set; config.repa_root gates use):
+        # repa_target (B, 4096, z_dim) VGGT voxel features, repa_weight (B,) 1/0 (0 = missing).
+        repa_target: Optional[torch.Tensor] = None,
+        repa_weight: Optional[torch.Tensor] = None,
         # LM-task path (vqa / grounding / text_sft): CE loss on `labels`
         labels: Optional[torch.LongTensor] = None,
         # Task router stamp from MultiTaskCollator. None / "*_to_3d" → flow path.
@@ -650,6 +778,15 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             raise ValueError("[fusion] config.fuse_dino=True but batch has no dino_hidden — "
                              "dataset fuse_dino off or DINO cache entries missing")
 
+        # repa contract: config.repa_root runs MUST receive repa keys from the collator.
+        # (repa_target=None WITH repa_weight present = a whole batch of missing targets —
+        # that's the graceful aux-weight-0 path; BOTH None = the dataset isn't wired.)
+        if self.repa_projector is not None and self.training \
+                and repa_target is None and repa_weight is None:
+            raise ValueError("[repa] config.repa_root set but batch has no repa_target/"
+                             "repa_weight — REPA_ROOT env unset in the data path or the "
+                             "collator isn't stacking the targets")
+
         # drop chat-template boilerplate from the flow cond (keep caption + image patches only)
         if cond_keep_mask is not None and cond_key_mask is not None:
             cond_key_mask = cond_key_mask & cond_keep_mask.to(cond_key_mask.device, torch.bool)
@@ -749,11 +886,24 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             dino_key_mask=dino_keep_mask.bool()
                 if (dino_keep_mask is not None and getattr(self.config, "fuse_dino", False))
                 else None,
+            qwen_drop_prob=float(getattr(self.config, "qwen_drop_prob", 0.0)),
             dino_drop_prob=float(getattr(self.config, "dino_drop_prob", 0.0))
                 if self.training else 0.0,
             dino_view_ids=dino_view_ids if getattr(self.config, "fuse_dino", False) else None,
+            qwen_view_ids=qwen_view_ids if getattr(self.config, "fuse_dino", False) else None,
             dino_view_embed=self.dino_view_embed
                 if getattr(self.config, "fuse_dino", False) else None,
+            # REPA SS aux (repa.py): projector + hook-stash owned by this model; the
+            # helper pops the stash after the SS forward and adds repa_coeff·proj_loss.
+            # TRAINING-ONLY (the hook is training-gated): eval forwards pass None →
+            # pure flow loss, no stale-stash errors.
+            repa_projector=self.repa_projector if self.training else None,
+            repa_stash=self._repa_stash if self.training else None,
+            repa_target=repa_target if (self.repa_projector is not None and self.training)
+                else None,
+            repa_sample_weight=repa_weight
+                if (self.repa_projector is not None and self.training) else None,
+            repa_coeff=self._repa_lambda(),
         )
 
         if depthwise:   # release stashed per-block conds

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-DPOS_NPZ = "/fsx/sfr/weikaih/3dgen/model/BLIP3o/runs/cache_logs/dino_pos32.npz"
+DPOS_NPZ = "/fsx/home/weikai.huang/3dgen/model/BLIP3o/runs/cache_logs/dino_pos32.npz"
 IMG_SPAN_FULL = slice(10, 10 + 1024)   # train path (full seq incl. chat boilerplate)
 IMG_SPAN_KEPT = slice(7, 7 + 1024)     # eval path (boiler-compacted)
 

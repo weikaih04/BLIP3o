@@ -1,0 +1,42 @@
+# ── Stage-3 TRI-MODAL multitask, NEW cluster — SS STAGE (ss_only) ──────────────
+# Identical to mix_s3_multitask_xgenmm.yaml except `ss_only: true` on every task:
+# the SS job trains only the dense SS flow, so shape_latent_512 / pbr_latent_512
+# are never read. That is ~2/3 of the per-sample bytes — leaving it off would make
+# the SS run pay the shape+pbr IO for nothing.
+# (ss_only is a TASK arg, not a trainer arg: build_mixture instantiates the task
+# classes purely from this yaml's `args:` — train_native's --ss_only only reaches
+# the legacy / MDS datasets.)
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      ss_only: true
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      max_views: 4
+      ss_only: true
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_im4r
+      fuse_dino: true
+  - name: text_to_3d_weighted
+    weight: 0.2
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_capT.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      ss_only: true
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+sampling:
+  granularity: batch
+  temperature: 1.0

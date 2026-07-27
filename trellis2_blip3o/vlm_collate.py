@@ -147,6 +147,15 @@ def collate_vlm_3d(
                 for i, x in enumerate(ids):
                     vid[i, :x.shape[0]] = x
                 out["dino_view_ids"] = vid
+        # qwen-segment view ordinals (IM only). -1 = text/structural token → no view code.
+        # Padded positions also -1 so the embed is never added to padding.
+        qids = [b.get("qwen_view_ids") for b in batch]
+        if all(x is not None for x in qids):
+            Tq = out["cond_hidden"].shape[1]
+            qv = torch.full((len(qids), Tq), -1, dtype=torch.long)
+            for i, x in enumerate(qids):
+                qv[i, :x.shape[0]] = x
+            out["qwen_view_ids"] = qv
         if "_task" in batch[0]:
             out["_task"] = batch[0]["_task"]
         if "target_ss_latent" in batch[0]:
@@ -164,6 +173,17 @@ def collate_vlm_3d(
                 [inst["target_tex_slat_512_item"] for inst in batch])
             out["target_tex_slat_512"] = tex_pack["x_0"]
             out["tex_concat_cond"] = tex_pack["concat_cond"]
+        # REPA SS aux targets (repa.py): the key is present (possibly None per sample)
+        # iff the dataset ran with REPA_ROOT set — None-safe stacking: missing samples
+        # get a zero row + weight 0. All-missing → no repa_target (model's graceful
+        # aux-0 path), but repa_weight is always emitted so the wiring stays visible.
+        # REPA_ROOT unset → keys absent → this block never runs (byte-identical path).
+        if any("repa_target" in inst for inst in batch):
+            from .repa import stack_repa_targets
+            _tgt, _w = stack_repa_targets([inst.get("repa_target") for inst in batch])
+            if _tgt is not None:
+                out["repa_target"] = _tgt
+            out["repa_weight"] = _w
         return out
 
     texts: List[str] = []

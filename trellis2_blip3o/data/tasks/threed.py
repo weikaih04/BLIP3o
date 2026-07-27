@@ -378,8 +378,8 @@ class _ThreeDTaskBase(Dataset):
                 # honor the batch-locked view count (homogeneous batches): combo id is
                 # size-indexed (m00=2 views, m01=3, m02=4 by producer convention).
                 view = None
-                n = self._sample_n_views(rng)
-                n = max(min(n, max(self._im_combo_sizes)), min(self._im_combo_sizes))
+                n_want = self._sample_n_views(rng)
+                n = max(min(n_want, max(self._im_combo_sizes)), min(self._im_combo_sizes))
                 key = combo_key(self._im_combo_sizes.index(n))
             else:  # T — caption index keyed (cache built over the captions list order)
                 view = None
@@ -392,6 +392,24 @@ class _ThreeDTaskBase(Dataset):
                 "cond_keep_mask": entry["cond_keep_mask"],
                 "target_ss_latent": self._load_ss(rec["ss_latent_64"], rec.get("sha256")),
             }
+            if self.mode == "IM":
+                # Per-token view ordinal for the QWEN segment (mirror of dino_view_ids).
+                # The IM cond is ONE joint forward over all 4 images, so no qwen token says
+                # which image it came from — and the flow's cross-attention has NO positional
+                # encoding on its keys (TRELLIS modules.py applies RoPE in the self-attn
+                # branch only), i.e. the cond is an UNORDERED SET. Sequence structure (the
+                # <|vision_start|>/<|vision_end|> delimiters) therefore cannot convey view
+                # membership even unmasked — the token's own vector is the only channel.
+                # Layout verified constant over the whole 420k cache: 292 tokens, four
+                # 64-token image blocks at 10/76/142/208 (stride 66 = 64 + 2 delimiters).
+                # -1 = text/structural token → no code added.
+                T_q = int(entry["cond_hidden"].shape[0])
+                qv = torch.full((T_q,), -1, dtype=torch.long)
+                n_tok, stride, start, nv = 64, 66, 10, 4
+                if T_q >= start + stride * (nv - 1) + n_tok:
+                    for v in range(nv):
+                        qv[start + stride * v: start + stride * v + n_tok] = v
+                data["qwen_view_ids"] = qv
             if self.fuse_dino and self.mode in ("I1", "IM"):
                 if "dino_hidden" in entry:
                     # merged v-entry (schema 2) or IM combo m-entry: DINO arrays inline
@@ -400,6 +418,24 @@ class _ThreeDTaskBase(Dataset):
                     data["dino_view_ids"] = entry.get(
                         "dino_view_ids",
                         torch.zeros(entry["dino_hidden"].shape[0], dtype=torch.long))
+                    # VIEW-COUNT SUBSET (IM): the cache only ships ONE combo size (m00 = 4
+                    # views, `im_combo_sizes=[4]`), so the n_views draw above gets clamped
+                    # back to 4 and every IM sample would see exactly 4 views — the measured
+                    # root cause of zero fusion pressure (4-distinct ≈ 4-copy ≈ 1-view: the
+                    # flow learns to ignore views 2..n because any one suffices). Subset the
+                    # loaded combo down to the drawn count by dropping whole view blocks
+                    # (same fix as streaming_task.py's IM_VIEW_SUBSET). The qwen segment
+                    # still encodes all 4 images — DINO carries the spatial signal.
+                    if self.mode == "IM" and n_want < n:
+                        vids = data["dino_view_ids"]
+                        uniq = torch.unique(vids)
+                        if len(uniq) > n_want:
+                            sel = rng.choice(len(uniq), size=n_want, replace=False)
+                            keep = uniq[torch.as_tensor(sel, dtype=torch.long)]
+                            m = torch.isin(vids, keep)
+                            data["dino_hidden"] = data["dino_hidden"][m]
+                            data["dino_keep_mask"] = data["dino_keep_mask"][m]
+                            data["dino_view_ids"] = vids[m]
                 else:
                     # legacy: DINO tokens in a separate d-key file (2nd open)
                     dentry = load_entry(self.cached_hidden_root, sha, dino_key(view))

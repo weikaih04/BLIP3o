@@ -24,7 +24,7 @@ from ..tr2_modules import load_norm_stats, SHAPE_SLAT_CONFIG_PATH
 
 TAP_DIR = "/opt/dlami/nvme/vp1taps_v22"
 MANIFESTS = [
-    "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl",
+    "/fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v3/ready_v3_clean.jsonl",
 ]
 
 

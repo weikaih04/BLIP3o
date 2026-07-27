@@ -10,6 +10,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("FUSED_MODULATE", "1")
 os.environ.setdefault("EVAL_COND_ROOT", "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_heldout")
 sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,8 +23,7 @@ from trellis2_blip3o.tr2_modules import (build_sc_vae_shape_decoder_frozen,
                                          load_norm_stats, SHAPE_SLAT_CONFIG_PATH,
                                          TEX_SLAT_CONFIG_PATH, SS_FLOW_CONFIG_PATH,
                                          DEFAULT_SS_FLOW)
-from safetensors.torch import load_file
-from trellis2_blip3o.connector import TRELLIS2Connector
+from benchmarks.checkpoint import load_connector, load_state_dict
 import scripts.eval_fusion_v22 as EV
 from scripts.eval_fusion_v22 import (load_flow_and_connector, build_cond, sample_shape,
                                      good_view_b, input_image)
@@ -37,23 +37,18 @@ SSDEC = ("/fsx/home/weikai.huang/.cache/huggingface/hub/models--microsoft--TRELL
 
 def load_ss_flow(ckpt_dir, use_ema=True):
     flow = t2models.from_pretrained(DEFAULT_SS_FLOW)
-    sd = load_file(os.path.join(ckpt_dir, "model.safetensors"))
-    if use_ema:
-        sd.update(load_file(os.path.join(ckpt_dir, "ema.safetensors")))
+    sd = load_state_dict(ckpt_dir, use_ema=use_ema)
     fsd = {k[len("ss_flow."):]: v for k, v in sd.items() if k.startswith("ss_flow.")}
     fsd = {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v for k, v in fsd.items()}
     assert fsd, "no ss_flow keys"
     missing, _ = flow.load_state_dict(fsd, strict=False)
-    conn = TRELLIS2Connector(2048, flow.cond_channels)
-    if any(k.startswith("diffusion_connector.pos_stamp.") for k in sd):
-        from trellis2_blip3o.pos_stamp import DinoPosStamp   # dpos-stamped ckpt (pos_stamp.py)
-        conn.pos_stamp = DinoPosStamp()
-        print("[load-ss] pos_stamp attached", flush=True)
-    conn.load_state_dict({k[len("diffusion_connector."):]: v for k, v in sd.items()
-                          if k.startswith("diffusion_connector.")}, strict=True)
-    dve = sd.get("dino_view_embed")
+    conn, dve, ckcfg = load_connector(ckpt_dir, state=sd,
+                                      vlm_hidden_dim=2048,
+                                      cond_dim=flow.cond_channels)
     assert len(missing) == 0, f"ss flow load missing {len(missing)} keys!"
-    print(f"[load-ss] flow {len(fsd)} (missing={len(missing)})", flush=True)
+    print(f"[load-ss] flow {len(fsd)} (missing={len(missing)}), "
+          f"conn={ckcfg['cond_adapter']}, pos_stamp={ckcfg.get('cond_pos_stamp', False)}",
+          flush=True)
     return flow.cuda().eval(), conn.cuda().eval().float(), (dve.cuda() if dve is not None else None)
 
 

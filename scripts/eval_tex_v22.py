@@ -9,12 +9,11 @@ os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("FUSED_MODULATE", "1")
 sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 import cv2
 from PIL import Image, ImageDraw, ImageFont
-from safetensors.torch import load_file
-
 from trellis2_blip3o import _paths  # noqa
 from trellis2.modules import sparse as sp  # type: ignore
 from trellis2.representations import MeshWithVoxel  # type: ignore
@@ -25,13 +24,15 @@ from trellis2_blip3o.tr2_modules import (build_sc_vae_shape_decoder_frozen,
                                          build_sc_vae_tex_decoder_frozen,
                                          load_norm_stats, SHAPE_SLAT_CONFIG_PATH,
                                          TEX_SLAT_CONFIG_PATH, DEFAULT_TEX_SLAT)
-from trellis2_blip3o.connector import TRELLIS2Connector
+from benchmarks.checkpoint import load_connector, load_state_dict
 from scripts.eval_fusion_v22 import (build_cond, cam_from_transforms, input_image,
                                      good_view_b)
 import scripts.eval_fusion_v22 as EV
 
 PBR = {'base_color': slice(0, 3), 'metallic': slice(3, 4), 'roughness': slice(4, 5), 'alpha': slice(5, 6)}
-HDR = "/fsx/sfr/weikaih/3dgen/model/third_party_3d_gen/TRELLIS.2/assets/hdri/forest.exr"
+# envmap for the shaded render — resolve from the vendored TRELLIS.2 tree (_paths) so it
+# follows the repo; the old hardcoded /fsx/sfr/weikaih/... is dead on the xgen-mm cluster.
+HDR = os.environ.get("EVAL_HDR", os.path.join(_paths.TRELLIS2_ROOT, "assets/hdri/forest.exr"))
 COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
 MANI = os.environ.get("EVAL_MANI", "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
 
@@ -39,16 +40,15 @@ MANI = os.environ.get("EVAL_MANI", "/fsx/sfr/weikaih/3dgen/data/trellis2/manifes
 def load_tex_flow(ckpt_dir, use_ema=True):
     from trellis2 import models as t2models  # type: ignore
     flow = t2models.from_pretrained(DEFAULT_TEX_SLAT)
-    sd = load_file(os.path.join(ckpt_dir, "model.safetensors"))
-    if use_ema:
-        sd.update(load_file(os.path.join(ckpt_dir, "ema.safetensors")))
+    sd = load_state_dict(ckpt_dir, use_ema=use_ema)
     fsd = {k[len("tex_slat_512."):]: v for k, v in sd.items() if k.startswith("tex_slat_512.")}
     missing, _ = flow.load_state_dict(fsd, strict=False)
-    conn = TRELLIS2Connector(2048, flow.cond_channels)
-    conn.load_state_dict({k[len("diffusion_connector."):]: v for k, v in sd.items()
-                          if k.startswith("diffusion_connector.")}, strict=True)
-    dve = sd.get("dino_view_embed")
-    print(f"[load-tex] {os.path.basename(ckpt_dir)}: flow {len(fsd)} (missing={len(missing)})", flush=True)
+    conn, dve, ckcfg = load_connector(ckpt_dir, state=sd,
+                                      vlm_hidden_dim=2048,
+                                      cond_dim=flow.cond_channels)
+    print(f"[load-tex] {os.path.basename(ckpt_dir)}: flow {len(fsd)} "
+          f"(missing={len(missing)}), conn={ckcfg['cond_adapter']}, "
+          f"pos_stamp={ckcfg.get('cond_pos_stamp', False)}", flush=True)
     return flow.cuda().eval(), conn.cuda().eval().float(), (dve.cuda() if dve is not None else None)
 
 

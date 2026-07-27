@@ -111,11 +111,22 @@ def compute_cascade_flow_loss(
     # trained on. Segment order [DINO; Qwen] mirrors BOTH-CFG packed inference.
     dino_hidden: Optional[torch.Tensor] = None,    # (B, N_d, 1024) frozen DINOv3 tokens
     dino_key_mask: Optional[torch.Tensor] = None,  # (B, N_d) bool
+    qwen_drop_prob: float = 0.0,                   # mirror of dino_drop: qwen segment masked
     dino_drop_prob: float = 0.0,                   # DINO-dropout curriculum (anti rich-get-richer):
                                                    # per-sample, mask the WHOLE DINO segment OFF
                                                    # (segment absent — the text→3D/no-DINO regime)
     dino_view_ids: Optional[torch.Tensor] = None,  # (B, N_d) view ordinals (IM identity)
+    qwen_view_ids: Optional[torch.Tensor] = None,  # (B, T_q) qwen-segment view ordinals; -1 = no code
     dino_view_embed: Optional[torch.Tensor] = None,  # (V_max, 1024) ZERO-INIT learned param
+    # ── REPA-style SS auxiliary alignment (repa.py; official sihyun-yu/REPA recipe) ──
+    # The MODEL owns the projector + a forward hook on ss_flow.blocks[depth-1] that
+    # writes the block output into repa_stash during the SS forward; we read it here
+    # AFTER loss_fn_ss ran the flow, project, and cosine-align to repa_target.
+    repa_projector: Optional[Any] = None,          # 3-layer MLP (trainable, ckpt-saved)
+    repa_stash: Optional[Dict] = None,             # {"h": (B, 4096, C)} written by the hook
+    repa_target: Optional[torch.Tensor] = None,    # (B, 4096, z_dim); None = all missing
+    repa_sample_weight: Optional[torch.Tensor] = None,  # (B,) 1/0 — 0 = target missing
+    repa_coeff: float = 0.5,
 ) -> Tuple[torch.Tensor, Dict]:
     """VLM hidden → connector → TRELLIS cascade flow loss (SS + Shape + Tex).
 
@@ -147,6 +158,16 @@ def compute_cascade_flow_loss(
     if detach_cond:
         cond_hidden = cond_hidden.detach()
 
+    # REPA active = the model built a projector + hook (config.repa_root). We track the
+    # per-sample CFG drop mask on every path so dropped samples get aux weight 0 (our
+    # deliberate deviation from official REPA — with the cond zeroed, the model cannot
+    # satisfy alignment at high t from pure noise).
+    repa_active = repa_projector is not None and repa_stash is not None
+    if repa_active and teacher_cond is not None:
+        raise ValueError("[repa] REPA + V3 distill (teacher_cond) not supported — the KD "
+                         "teacher passes would also fire the SS block hook.")
+    drop_mask = None   # (B,) bool — per-sample CFG drop (explicit-drop paths only)
+
     # 3. project to TRELLIS cond space (+ CFG dropout).
     if dino_hidden is not None:
         # ── fusion path. CFG dropout must hit BOTH segments with the SAME per-sample
@@ -155,8 +176,23 @@ def compute_cascade_flow_loss(
         assert teacher_cond is None, "fusion + KD not supported (KD path archived)"
         B = cond_hidden.shape[0]
         drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+        drop_mask = drop
         keep = (~drop).to(cond_hidden.dtype).view(B, 1, 1)
-        cond_q = connector(cond_hidden * keep)                       # (B, T_q, 1024)
+        cond_q = connector(cond_hidden * keep, key_mask=cond_key_mask)   # (B, T_q, 1024)
+        # QWEN-segment view identity — the mirror of the DINO one, and for the same reason:
+        # the flow's cross-attention has no positional encoding on its keys, so it reads the
+        # cond as an unordered set. In the IM case the qwen tokens are ONE joint forward over
+        # all 4 images, so without this the flow cannot tell which image a qwen token came
+        # from (the <|vision_*|> delimiters are masked out, and would be unusable anyway).
+        # SAME buffer as the DINO segment on purpose: one code ⇒ the flow learns a single
+        # view detector that serves both segments. Applied AFTER the connector (its output
+        # LayerNorm puts qwen at the same ~32 magnitude as DINO, so the one calibrated
+        # scale transfers) and BEFORE the CFG zeroing, so the uncond pass stays plain.
+        if dino_view_embed is not None and qwen_view_ids is not None:
+            qm = qwen_view_ids.clamp_min(0)                      # -1 (text/pad) → row 0 …
+            add = dino_view_embed[qm].to(cond_q.dtype)
+            add = add * (qwen_view_ids >= 0).unsqueeze(-1).to(cond_q.dtype)   # … then zeroed
+            cond_q = cond_q + add
         if getattr(connector, "pos_stamp", None) is not None:        # DINO pos signature
             from .pos_stamp import IMG_SPAN_FULL
             cond_q = connector.pos_stamp(cond_q, IMG_SPAN_FULL)
@@ -172,14 +208,33 @@ def compute_cascade_flow_loss(
         # DINO-dropout: per-sample segment ABSENT (keys masked off). Independent of the
         # CFG drop — a CFG-dropped sample keeps its (zeroed) DINO keys visible, exactly
         # like the packed inference neg pass.
+        ddrop = torch.zeros(B, dtype=torch.bool, device=dino_hidden.device)
         if dino_drop_prob > 0:
             ddrop = (torch.rand(B, device=dino_hidden.device) < dino_drop_prob)
             dmask = dmask & ~ddrop[:, None]
+        # QWEN-dropout: the mirror of DINO-dropout. Without it the flow can escape to the
+        # qwen segment whenever the DINO side gets harder to read (measured: a strong view
+        # embed collapsed DINO's attention share 0.72→0.22 and the multi-view gain with it).
+        # MUTUALLY EXCLUSIVE with the DINO drop — dropping both would leave NO conditioning,
+        # which is the CFG drop's job, not a modality-robustness signal. The text task never
+        # reaches this branch (dino_hidden is None → qwen-only cond is never dropped there).
+        if qwen_drop_prob > 0:
+            qdrop = (torch.rand(B, device=cond_q.device) < qwen_drop_prob) & ~ddrop
+            cond_key_mask = cond_key_mask & ~qdrop[:, None]
         cond = torch.cat([dino_seg, cond_q], dim=1)
         cond_key_mask = torch.cat([dmask, cond_key_mask], dim=1)
         kd_active = False
     elif teacher_cond is None:
-        cond = connector(mask_drop(cond_hidden, mask_drop_prob))
+        if repa_active:
+            # REPA needs the per-sample drop mask → replicate mask_drop with an EXPLICIT
+            # mask (same convention as the fusion/distill paths). Non-REPA runs keep the
+            # original mask_drop call below, so their RNG stream / behavior is untouched.
+            B = cond_hidden.shape[0]
+            drop_mask = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+            keep = (~drop_mask).to(cond_hidden.dtype).view(B, *([1] * (cond_hidden.dim() - 1)))
+            cond = connector(cond_hidden * keep, key_mask=cond_key_mask)
+        else:
+            cond = connector(mask_drop(cond_hidden, mask_drop_prob), key_mask=cond_key_mask)
         if getattr(connector, "pos_stamp", None) is not None:
             from .pos_stamp import IMG_SPAN_FULL
             cond = connector.pos_stamp(cond, IMG_SPAN_FULL)
@@ -191,8 +246,9 @@ def compute_cascade_flow_loss(
         # RNG stream / behavior is untouched.
         B = cond_hidden.shape[0]
         drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+        drop_mask = drop
         keep = (~drop).to(cond_hidden.dtype).view(B, *([1] * (cond_hidden.dim() - 1)))
-        cond = connector(cond_hidden * keep)
+        cond = connector(cond_hidden * keep, key_mask=cond_key_mask)
         kd_active = not bool(drop.any())
     sdpa_mask = cond_key_mask[:, None, None, :]   # (B,1,1,T) True = attend
 
@@ -219,6 +275,39 @@ def compute_cascade_flow_loss(
         L_ss, log_ss = loss_fn_ss(ss_flow, ss_target, cond, cond_mask=sdpa_mask, **kd_kwargs)
         flow_losses["ss"] = L_ss
         stage_logs["ss"] = log_ss
+
+    # ── REPA aux (repa.py): the model's forward hook stashed ss_flow.blocks[depth-1]'s
+    # output (B, 4096, C) during the SS forward above — token order is the C-order raster
+    # flatten of the 16^3 grid (sparse_structure_flow.py forward: h = x.view(B, C, -1)
+    # .permute(0, 2, 1)), matching the target raster. Project → negative cosine vs the
+    # per-sample target, CFG-dropped / target-missing samples weighted 0. Applied at ALL
+    # t uniformly (official REPA). Pop the stash either way (frees the activation ref).
+    repa_loss = None
+    if repa_active:
+        h = repa_stash.pop("h", None)
+        if "ss" not in flow_losses:
+            raise ValueError("[repa] configured but the SS stage did not run — REPA is an "
+                             "SS-flow aux (train_stages must include ss and the batch must "
+                             "carry target_ss_latent).")
+        if h is None:
+            raise RuntimeError("[repa] SS block hook stashed nothing — hook not installed "
+                               "on this ss_flow (torch.compile wrapping?) or model not in "
+                               "training mode.")
+        from .repa import repa_cosine_loss
+        _pdt = next(repa_projector.parameters()).dtype
+        z_tilde = repa_projector(h.to(_pdt))                       # (B, 4096, z_dim)
+        w = repa_sample_weight
+        if drop_mask is not None:
+            w = (torch.ones(z_tilde.shape[0], device=z_tilde.device) if w is None
+                 else w.to(z_tilde.device).float())
+            w = w * (~drop_mask).float()
+        if repa_target is None:
+            # whole batch missing targets (collator emitted weight=0s) → exact-0 aux that
+            # still routes grad through the projector (graph consistent for DDP/ZeRO).
+            repa_loss = z_tilde.float().sum() * 0.0
+        else:
+            repa_loss = repa_cosine_loss(z_tilde, repa_target, w)
+        stage_logs["repa"] = {"flow_mse": float(repa_loss.detach())}
 
     # Stage 2: Shape SLAT (sparse, uniform t-schedule).
     if target_shape_slat_512 is not None and shape_slat is not None:
@@ -261,4 +350,9 @@ def compute_cascade_flow_loss(
         logs["kd_v"] = kd_v_logs
     if kd_f_logs:
         logs["kd_f"] = kd_f_logs
-    return flow_weight * flow_combined, logs
+    total = flow_weight * flow_combined
+    if repa_loss is not None:
+        # official REPA: total = flow_loss + repa_coeff * proj_loss (outside flow_weight
+        # and the stage-weight normalization — repa is an aux, not a cascade stage).
+        total = total + repa_coeff * repa_loss
+    return total, logs
