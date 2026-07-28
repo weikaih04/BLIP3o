@@ -32,6 +32,10 @@
 # NEVER scancel the held jobs — they are node holds, not this app. Stop the demo with
 #   bash scripts/run_demo_app.sh stop
 set -uo pipefail
+# start_apps.sh Popen's this from an interactive shell; ignore SIGHUP (and nohup the srun
+# below) so closing that terminal does not take the demo down with it. The wrapper itself
+# stays in the foreground because start_apps.sh dedupes with `pgrep -f "$cmd"`.
+trap '' HUP
 
 ROOT=/fsx/home/weikai.huang/3dgen/model/BLIP3o
 PORT=${DEMO_PORT:-7860}
@@ -64,7 +68,7 @@ echo "[demo] using job $JOB, port $PORT"
 
 : > "$APP_LOG"; : > "$CF_LOG"; : > "$URL_FILE"
 
-srun --jobid="$JOB" --overlap --gres=gpu:1 --job-name=blip3o_demo \
+nohup srun --jobid="$JOB" --overlap --gres=gpu:1 --job-name=blip3o_demo \
   bash -c "
 set -uo pipefail
 cd $ROOT
