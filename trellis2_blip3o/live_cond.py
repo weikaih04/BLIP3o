@@ -110,6 +110,66 @@ def _border_bg_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     return mask
 
 
+# ── learned matting (BiRefNet — the SAME model TRELLIS.2 uses for rembg). Segments a real
+#    photo into the object-on-black setup the training renders used, instead of the border
+#    heuristic (which refuses on busy backgrounds → raw photo w/ background fed to the
+#    encoders = OOD). Lazy singleton, loaded once on first real photo. Env: LIVE_REMBG=off
+#    forces the border fallback; BIREFNET_MODEL overrides the HF id. ──
+_BIREFNET = None            # (model, transform, device) once loaded; "FAILED" if unusable
+
+
+def _get_birefnet():
+    global _BIREFNET
+    if _BIREFNET is not None:
+        return None if _BIREFNET == "FAILED" else _BIREFNET
+    if os.environ.get("LIVE_REMBG", "").lower() in ("off", "border", "0"):
+        _BIREFNET = "FAILED"; return None
+    try:
+        from transformers import AutoModelForImageSegmentation
+        from torchvision import transforms
+        name = os.environ.get("BIREFNET_MODEL", "ZhengPeng7/BiRefNet")
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        model = AutoModelForImageSegmentation.from_pretrained(name, trust_remote_code=True)
+        model.eval().to(dev)
+        tfm = transforms.Compose([
+            transforms.Resize((1024, 1024)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        _BIREFNET = (model, tfm, dev)
+        print(f"[live_cond] BiRefNet loaded ({name}) on {dev} for background removal", flush=True)
+        return _BIREFNET
+    except Exception as e:
+        print(f"[live_cond] BiRefNet unavailable ({type(e).__name__}: {str(e)[:120]}); "
+              f"falling back to border-heuristic matting", flush=True)
+        _BIREFNET = "FAILED"; return None
+
+
+def _birefnet_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """Foreground mask via BiRefNet (TRELLIS.2-parity rembg). Boolean HxW mask, or None if
+    the model can't load / the matte is degenerate (→ caller falls back to the heuristic)."""
+    got = _get_birefnet()
+    if got is None:
+        return None
+    model, tfm, dev = got
+    try:
+        pil = Image.fromarray(rgb.astype(np.uint8)[:, :, :3])
+        pdtype = next(model.parameters()).dtype           # match model dtype (transformers may load half)
+        x = tfm(pil).unsqueeze(0).to(dev, pdtype)
+        with torch.no_grad():
+            matte = model(x)[-1].sigmoid().float().cpu()[0].squeeze()     # (1024,1024) ∈ [0,1]
+        matte = Image.fromarray((matte.numpy() * 255).astype(np.uint8)).resize(
+            (rgb.shape[1], rgb.shape[0]), Image.BILINEAR)
+        mask = np.array(matte) > 128                                      # threshold → object
+        frac = float(mask.mean())
+        if frac < 0.001 or frac > 0.999:            # empty or everything → treat as failure
+            return None
+        return _largest_component(mask)
+    except Exception as e:
+        print(f"[live_cond] BiRefNet inference failed ({type(e).__name__}: {str(e)[:100]})", flush=True)
+        return None
+
+
 def _square_box(mask: np.ndarray):
     """The alpha-crop box of ImageTo3DDataset._alpha_crop: square, centred on the bbox."""
     ys, xs = np.where(mask)
@@ -147,7 +207,9 @@ def object_frame(img: Image.Image, canvas: int = I1_QWEN_CANVAS,
     else:
         img_rgb = np.array(img)
     if mask is None and remove_bg:
-        mask = _border_bg_mask(img_rgb)
+        mask = _birefnet_mask(img_rgb)          # learned matting (TRELLIS.2-parity rembg)
+        if mask is None:                        # weights/net unavailable, or degenerate matte
+            mask = _border_bg_mask(img_rgb)     # fallback: uniform-backdrop heuristic
     segmented = mask is not None
     if mask is None:
         mask = np.ones(img_rgb.shape[:2], dtype=bool)
@@ -186,6 +248,11 @@ class CondPack:
     dino_keep: Optional[torch.Tensor] = None        # (Td,) bool cuda
     dino_view_ids: Optional[torch.Tensor] = None    # (Td,) long cuda — IM only
     qwen_view_ids: Optional[torch.Tensor] = None    # (Tq,) long cuda, -1 = no code — IM only
+    # VLM-as-narrator stream: the model's OWN caption of the input, encoded through the
+    # text->3D path. None = absent (the SAM3D-style "this modality is dropped" state).
+    cap_qwen: Optional[torch.Tensor] = None         # (Tc, 2048) float32 cuda
+    cap_keep: Optional[torch.Tensor] = None         # (Tc,) bool cuda
+    caption: Optional[str] = None                   # the readable text, for UI / debugging
     modality: str = "i1"
     info: Dict = field(default_factory=dict)
 
@@ -322,6 +389,94 @@ class LiveCondEncoder:
                   "preview": [f.full for f in frames]})
 
     # ─────────────────────────── T: text ───────────────────────────
+    # ───────────────── VLM-as-narrator: image(s) -> caption -> conditioning ─────────────────
+    # The v2.2 VLM was trained on BOTH halves of this loop with the SAME caption strings
+    # (vlm3d_stage1/build_messages_jsonl_v22.py):
+    #     "[VQA] <image>\n" + CAP_PROMPTS   -> caption      (the v2.1 "captioning heal" task)
+    #     "[3D Gen] " + TXT_PROMPTS(c=cap)  -> 3D codes     (the text->3D task)
+    # so a caption the model writes itself is IN-DISTRIBUTION for the text conditioning path.
+    # That is what makes this composable with zero training.
+    #
+    # Do NOT prefix a caption request with "[3D Gen]": that tag routes the model into 3D-token
+    # generation and it emits <3DSTART><SS_...> instead of prose (measured 2026-07-30).
+    CAPTION_PROMPTS = {
+        # exactly the trained strings — the safest, in-distribution default
+        "trained":   "[VQA] <image>\nDescribe this image in detail.",
+        "trained_short": "[VQA] <image>\nDescribe this image.",
+        # same tag, steered at the two axes the flow actually needs. Mildly OOD in wording,
+        # in-distribution in format; measured to produce accurate material words.
+        "material":  "[VQA] <image>\nDescribe this object's material and surface finish: "
+                     "what it is made of, whether it is metallic or non-metallic, glossy or "
+                     "matte, rough or smooth.",
+        "geometry":  "[VQA] <image>\nDescribe this object's shape, structure and parts in detail.",
+        # two-step "CoT": reason over shape then material, then commit to one sentence. The most
+        # OOD of the set for a 2B model — keep it behind an A/B, do not assume it wins.
+        "cot":       "[VQA] <image>\nFirst think about what the object is and how it is built, "
+                     "then about what it is made of, then give one detailed description covering "
+                     "shape, parts, colour, material and surface finish.",
+    }
+
+    @torch.no_grad()
+    def caption_images(self, imgs: Sequence[Image.Image], strategy: str = "trained",
+                       max_new_tokens: int = 96, remove_bg: bool = True) -> str:
+        """Let the VLM describe the input image(s) in its own words.
+
+        Single image uses the trained `[VQA] <image>` form verbatim. For multiple views the
+        <image> placeholder is repeated — the captioning task was trained single-image, but the
+        IM generation task fed several views through one joint forward, so the processor layout
+        is familiar even though this exact combination is an extrapolation.
+        """
+        if strategy not in self.CAPTION_PROMPTS:
+            raise ValueError(f"unknown caption strategy {strategy!r}; "
+                             f"have {sorted(self.CAPTION_PROMPTS)}")
+        frames = [object_frame(im, remove_bg=remove_bg).full for im in imgs]
+        prompt = self.CAPTION_PROMPTS[strategy]
+        if len(frames) > 1:                       # one placeholder per view
+            prompt = prompt.replace("<image>", "<image>" * len(frames), 1)
+        text = self._chat(prompt.replace("<image>", IMG_TOKEN))
+        inputs = self.proc(text=[text], images=frames, return_tensors="pt").to(self.device)
+        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        gen = self.tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        return gen.strip()
+
+    @torch.no_grad()
+    def encode_caption(self, caption: str, template: int = 0):
+        """Encode a caption through the TEXT->3D path and return (hidden, keep).
+
+        Identical to `encode_text`'s encoding, but returned raw so the caller can attach it to
+        an image pack as an EXTRA conditioning stream rather than as a standalone T request.
+        """
+        caption = (caption or "").strip()
+        if not caption:
+            return None, None
+        text = self._chat("[3D Gen] " + TXT_PROMPTS[template % len(TXT_PROMPTS)].format(c=caption))
+        qwen, keep, _, _ = self._encode(text)
+        return qwen[keep], keep[keep]
+
+    @torch.no_grad()
+    def attach_self_caption(self, pack: CondPack, imgs: Sequence[Image.Image],
+                            strategy: str = "trained", caption: Optional[str] = None,
+                            remove_bg: bool = True) -> CondPack:
+        """Add the narrator stream to an existing image pack, in place.
+
+        `caption=None` → the VLM writes it; pass a string to override (a user-edited caption,
+        or a GT caption for a controlled A/B). Failure to caption leaves the pack untouched,
+        so the image path keeps working.
+        """
+        try:
+            cap = caption if caption is not None else self.caption_images(
+                imgs, strategy=strategy, remove_bg=remove_bg)
+            h, k = self.encode_caption(cap)
+            if h is None:
+                return pack
+            pack.cap_qwen, pack.cap_keep, pack.caption = h, k, cap
+            pack.info["caption_strategy"] = "user" if caption is not None else strategy
+            pack.info["n_cap"] = int(h.shape[0])
+        except Exception as e:                       # narrator is additive — never fatal
+            print(f"[live_cond] self-caption failed ({type(e).__name__}: {str(e)[:90]})",
+                  flush=True)
+        return pack
+
     def encode_text(self, caption: str, template: int = 0) -> CondPack:
         caption = (caption or "").strip()
         if not caption:
@@ -340,12 +495,18 @@ class LiveCondEncoder:
 
 # ─────────────────────────── per-stage conditioning ───────────────────────────
 @torch.no_grad()
-def build_stage_cond(conn, dve, pack: CondPack):
+def build_stage_cond(conn, dve, pack: CondPack, cond_mode: str = "fusion"):
     """(cond, uncond) for ONE flow stage, through THAT stage's connector + view table.
 
     Merges the three cache-side builders of `scripts/trimodal_fullchain_eval.py`
     (build_cond_i1 / build_cond_im / build_cond_t) into one function keyed off what the
     pack carries — which is exactly how flow_heads.py branches at training time.
+
+    cond_mode selects which conditioning segments reach the flow:
+      "fusion"    — [DINO ; connector(qwen)]  (default; the trained deploy regime)
+      "qwen_only" — drop the DINO segment      (the dino_drop training regime — supported)
+      "dino_only" — drop the qwen segment      (EXPERIMENTAL: the model rarely saw DINO
+                    without qwen in training, so expect degraded / OOD behaviour)
     """
     qwen = pack.qwen
     cq = conn(qwen[None])
@@ -359,16 +520,35 @@ def build_stage_cond(conn, dve, pack: CondPack):
         qv = pack.qwen_view_ids
         add = dve[qv.clamp_min(0)].float() * (qv >= 0).unsqueeze(-1).float()
         cq = cq + add[None]
-    if pack.dino is None:                                  # TEXT: qwen-only, no fusion branch
-        return cq[:, pack.qwen_keep], c0[:, pack.qwen_keep]
+    # ── narrator stream: the VLM's own caption, encoded through the text->3D path ──
+    # Appended along the SEQUENCE (the same axis DINO and qwen already share) so no shape
+    # anywhere else changes; absent caption = the stream is simply not concatenated, which is
+    # the "modality dropped" state. CFG mirrors the qwen convention: connector(zeros).
+    cap_c = cap_u = None
+    if cond_mode != "dino_only" and pack.cap_qwen is not None:
+        cap_c = conn(pack.cap_qwen[None])[:, pack.cap_keep]
+        cap_u = conn(torch.zeros_like(pack.cap_qwen)[None])[:, pack.cap_keep]
+
+    # qwen-only: DINO segment absent — same path TEXT takes, and the dino_drop regime.
+    if cond_mode == "qwen_only" or pack.dino is None:
+        c, u = cq[:, pack.qwen_keep], c0[:, pack.qwen_keep]
+        if cap_c is not None:
+            c, u = torch.cat([c, cap_c], 1), torch.cat([u, cap_u], 1)
+        return c, u
     dseg = pack.dino[None]
     if dve is not None:
         dseg = dseg + (dve[pack.dino_view_ids][None].float()
                        if pack.dino_view_ids is not None else dve[0][None, None].float())
+    # dino-only: drop the qwen segment (EXPERIMENTAL). CFG uncond = zeros-DINO, as in fusion.
+    if cond_mode == "dino_only":
+        return dseg[:, pack.dino_keep], torch.zeros_like(dseg)[:, pack.dino_keep]
     cond = torch.cat([dseg, cq], 1)
     uncond = torch.cat([torch.zeros_like(dseg), c0], 1)    # flow_heads CFG convention
     keep = torch.cat([pack.dino_keep, pack.qwen_keep])
-    return cond[:, keep], uncond[:, keep]
+    cond, uncond = cond[:, keep], uncond[:, keep]
+    if cap_c is not None:                                  # narrator appended last
+        cond, uncond = torch.cat([cond, cap_c], 1), torch.cat([uncond, cap_u], 1)
+    return cond, uncond
 
 
 # ─────────────────────────── parity self-check ───────────────────────────

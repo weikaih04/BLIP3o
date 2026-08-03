@@ -139,10 +139,10 @@ def torch_oom_types():
 
 
 def _run(pack, kind, seed, ss_guidance, ss_steps, slat_cfg, slat_steps, stages, progress,
-         mode_note=""):
+         mode_note="", cond_mode="fusion"):
     res = PIPE.generate(pack, OUT_DIR, _tag(kind), seed=seed, ss_guidance=ss_guidance,
                         ss_steps=int(ss_steps), slat_cfg=slat_cfg,
-                        slat_steps=int(slat_steps), want_stages=stages,
+                        slat_steps=int(slat_steps), want_stages=stages, cond_mode=cond_mode,
                         progress=lambda f, m: progress(f, desc=m))
     return (res.glb, res.ss_glb, res.shape_glb,
             pack.info.get("preview") or None,
@@ -151,7 +151,7 @@ def _run(pack, kind, seed, ss_guidance, ss_steps, slat_cfg, slat_steps, stages, 
 
 # ─────────────────────────────── callbacks ───────────────────────────────
 def gen_image(img, seed, randomize, ss_guidance, ss_steps, slat_cfg, slat_steps, remove_bg,
-              stages, progress=gr.Progress()):
+              stages, cond_mode="fusion", progress=gr.Progress()):
     if img is None:
         raise gr.Error("drop an image first.")
     seed = _resolve_seed(seed, randomize)
@@ -161,8 +161,12 @@ def gen_image(img, seed, randomize, ss_guidance, ss_steps, slat_cfg, slat_steps,
         note = ("" if pack.info["segmented"] else
                 "_note: no clear object/background separation was found, so the whole frame "
                 "was used. A cut-out or a plain background will do better._")
+        if cond_mode == "dino_only":
+            note += "\n\n_conditioning = DINO only (experimental — the model rarely saw this)._"
+        elif cond_mode == "qwen_only":
+            note += "\n\n_conditioning = Qwen only (no DINO spatial signal — weaker on pose)._"
         return _run(pack, "img", seed, ss_guidance, ss_steps, slat_cfg, slat_steps, stages,
-                    progress, note)
+                    progress, note, cond_mode=cond_mode)
     except gr.Error:
         raise
     except Exception as e:
@@ -170,7 +174,7 @@ def gen_image(img, seed, randomize, ss_guidance, ss_steps, slat_cfg, slat_steps,
 
 
 def gen_views(files, seed, randomize, ss_guidance, ss_steps, slat_cfg, slat_steps, remove_bg,
-              stages, progress=gr.Progress()):
+              stages, cond_mode="fusion", progress=gr.Progress()):
     paths = [f if isinstance(f, str) else f.name for f in (files or [])]
     if len(paths) < 2:
         raise gr.Error("drop at least 2 views of the SAME object (up to 4).")
@@ -185,8 +189,12 @@ def gen_views(files, seed, randomize, ss_guidance, ss_steps, slat_cfg, slat_step
         if pack.info["n_views"] != 4:
             note = (f"_note: the multi-view task was trained on exactly 4 views; "
                     f"{pack.info['n_views']} still works but is extrapolation._")
+        if cond_mode == "dino_only":
+            note += "\n\n_conditioning = DINO only (experimental — the model rarely saw this)._"
+        elif cond_mode == "qwen_only":
+            note += "\n\n_conditioning = Qwen only (no DINO spatial signal — weaker on pose)._"
         return _run(pack, "mv", seed, ss_guidance, ss_steps, slat_cfg, slat_steps, stages,
-                    progress, note)
+                    progress, note, cond_mode=cond_mode)
     except gr.Error:
         raise
     except Exception as e:
@@ -213,7 +221,7 @@ def gen_text(text, template, seed, randomize, ss_guidance, ss_steps, slat_cfg, s
 
 
 # ─────────────────────────────── UI ───────────────────────────────
-def advanced(with_bg: bool = True):
+def advanced(with_bg: bool = True, with_mode: bool = True):
     """Seed / CFG / step controls shared by all three tabs."""
     with gr.Accordion("Advanced", open=False):
         with gr.Row():
@@ -229,12 +237,23 @@ def advanced(with_bg: bool = True):
                              label="Shape/texture guidance (CFG)")
             sl_s = gr.Slider(10, 50, value=SLAT_STEPS, step=1,
                              label="Shape/texture steps")
+        # conditioning-signal selector (image / multi-view tabs). tuple choices → the
+        # callback receives the canonical string directly. text tab hides it (qwen-only).
+        mode = gr.Radio(
+            choices=[("DINO + Qwen — fusion (best)", "fusion"),
+                     ("DINO only", "dino_only"),
+                     ("Qwen only", "qwen_only")],
+            value="fusion", label="Conditioning signal",
+            info="Fusion is the trained deploy mode. Qwen-only was a training regime "
+                 "(works, weaker on pose). DINO-only is experimental — the model rarely "
+                 "saw it, expect degraded results.",
+            visible=with_mode)
         bg = gr.Checkbox(value=True, label="Auto-segment the object and re-frame it "
                                            "(recommended — matches training)",
                          visible=with_bg)
         stages = gr.Checkbox(value=True, label="Also return the intermediate stages "
                                                "(occupancy + untextured shape)")
-    return seed, randomize, ss_g, ss_s, sl_c, sl_s, bg, stages
+    return seed, randomize, ss_g, ss_s, sl_c, sl_s, bg, stages, mode
 
 
 def outputs():
@@ -279,7 +298,7 @@ def build():
                     with gr.Column(scale=6):
                         o = outputs()
                 btn.click(gen_image, inputs=[img, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
-                                             a[7]],
+                                             a[7], a[8]],
                           outputs=list(o), concurrency_limit=1)
 
             # ── 2. multi-view ──
@@ -304,7 +323,7 @@ def build():
                     with gr.Column(scale=6):
                         o2 = outputs()
                 btn2.click(gen_views, inputs=[files, a2[0], a2[1], a2[2], a2[3], a2[4],
-                                              a2[5], a2[6], a2[7]],
+                                              a2[5], a2[6], a2[7], a2[8]],
                            outputs=list(o2), concurrency_limit=1)
 
             # ── 3. text ──
@@ -324,7 +343,7 @@ def build():
                         tmpl = gr.Dropdown(TXT_PROMPTS, value=TXT_PROMPTS[0],
                                            label="Prompt template (all three were used in "
                                                  "training)")
-                        a3 = advanced(with_bg=False)
+                        a3 = advanced(with_bg=False, with_mode=False)
                         btn3 = gr.Button("Generate 3D", variant="primary")
                     with gr.Column(scale=6):
                         o3 = outputs()

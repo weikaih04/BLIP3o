@@ -171,7 +171,7 @@ class Pipeline:
                  ss_guidance: float = SS_SAMPLER["guidance_strength"],
                  ss_steps: int = SS_SAMPLER["steps"],
                  slat_cfg: float = SLAT_CFG, slat_steps: int = SLAT_STEPS,
-                 want_stages: bool = True,
+                 want_stages: bool = True, cond_mode: str = "fusion",
                  progress: Callable[[float, str], None] = lambda f, m: None) -> Result:
         from trellis2.modules import sparse as sp  # type: ignore
         import sys
@@ -189,8 +189,9 @@ class Pipeline:
 
             # ── stage 1: structured sparse occupancy @64³ ──
             progress(0.10, "structure (SS flow, 64³ occupancy)")
-            c, u = build_stage_cond(self.ss_conn, self.ss_dve, pack)
+            c, u = build_stage_cond(self.ss_conn, self.ss_dve, pack, cond_mode)
             res.stats["cond_tokens"] = int(c.shape[1])
+            res.stats["cond_mode"] = cond_mode
             occ = self._sample_ss(c, u, seed, ss_guidance, ss_steps)
             res.timings["ss"] = time.time() - t0
             n_vox = int(occ.sum())
@@ -213,7 +214,7 @@ class Pipeline:
             # ── stage 2: shape SLAT-512 on the GENERATED coords ──
             t1 = time.time()
             progress(0.40, "shape (SLAT-512 flow on generated coords)")
-            c, u = build_stage_cond(self.sh_conn, self.sh_dve, pack)
+            c, u = build_stage_cond(self.sh_conn, self.sh_dve, pack, cond_mode)
             slat = sample_shape(self.sh_flow, c, u, coords, steps=slat_steps,
                                 cfg=slat_cfg, seed=seed)
             shape_raw = slat.feats.float() * self.ssd + self.sm
@@ -231,7 +232,7 @@ class Pipeline:
             # ── stage 3: shape-conditioned texture SLAT-512 ──
             t2 = time.time()
             progress(0.70, "texture (shape-conditioned SLAT-512 flow)")
-            c, u = build_stage_cond(self.tx_conn, self.tx_dve, pack)
+            c, u = build_stage_cond(self.tx_conn, self.tx_dve, pack, cond_mode)
             tex_n = sample_tex(self.tx_flow, c, u, coords,
                                (shape_raw - self.xm) / self.xsd,
                                steps=slat_steps, cfg=slat_cfg, seed=seed)
