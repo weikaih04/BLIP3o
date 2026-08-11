@@ -12,7 +12,7 @@ import os, sys, json, time, argparse, multiprocessing as mp
 sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
 os.chdir("/fsx/sfr/weikaih/3dgen/model/BLIP3o")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _preflight import require
+from _preflight import require, assert_wrote
 from trellis2_blip3o.vlm_cache import entry_path, view_key, combo_key
 from streaming import MDSWriter
 from streaming.base.util import merge_index
@@ -112,6 +112,10 @@ def main():
                 write_part, [(k, parts[k], a.out, a.size_limit) for k in range(a.procs)]):
             tot += n
             print(f"  part {pid:03d}: {n} samples {nb/1e9:.1f}GB {dt:.0f}s | total {tot}", flush=True)
+
+    # A zero-sample dataset is structurally valid: merging it and exiting 0 is exactly what
+    # turns a missing source into something that reads as a successful build.
+    assert_wrote(tot, what="MDS samples")
 
     # merge the per-part indices into one logical MDS dataset (sig 2: root auto-discovers part_*)
     part_dirs = [os.path.join(a.out, f"part_{k:03d}") for k in range(a.procs)]
