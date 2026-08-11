@@ -11,6 +11,8 @@ Resumable-ish: re-running overwrites; for a clean redo `rm -rf` the out dir firs
 import os, sys, json, time, argparse, multiprocessing as mp
 sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
 os.chdir("/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _preflight import require
 from trellis2_blip3o.vlm_cache import entry_path, view_key, combo_key
 from streaming import MDSWriter
 from streaming.base.util import merge_index
@@ -86,6 +88,11 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
+    # A renamed cond root makes every read miss; the per-record `except OSError: continue`
+    # below then skips the whole manifest and the writer still closes a valid, empty dataset.
+    require(a.manifest, "manifest")
+    require(IM_COND_ROOT if COND_MODE == "im" else ROOT,
+            f"cond cache root (COND_MODE={COND_MODE})")
     print(f"loading {a.manifest} ... (COND_MODE={COND_MODE}, "
           f"cond_root={IM_COND_ROOT if COND_MODE=='im' else ROOT})", flush=True)
     recs = load_manifest(a.manifest, a.limit)

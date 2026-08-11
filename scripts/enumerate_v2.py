@@ -5,6 +5,10 @@ No R2, no GPU — pure /fsx enumeration."""
 import os, json, collections
 TREE = "/fsx/sfr/weikaih/3dgen/data/trellis2"
 CACHE = "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/qwen35-2b_tok1024_crop_mv1"
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _preflight import require
+require(CACHE, "cond cache")          # else the whole tree is walked before this is hit
 SUBS = ["ObjaverseXL_github", "ObjaverseXL_sketchfab", "ABO", "HSSD", "Toys4k"]  # non-TexVerse
 SHAPE = "shape_latents/shape_enc_next_dc_f16c32_fp16_512"
 SS    = "ss_latents/ss_enc_conv3d_16l8_fp16_64"
