@@ -335,7 +335,7 @@ class MMDiT3D(nn.Module):
                  gen_channels: Optional[Dict[str, int]] = None,
                  cond_ch: int = 1024, mlp_ratio: float = 5.3334,
                  concat_cond: bool = True, use_checkpoint: bool = True,
-                 initialization: str = "scaled"):
+                 initialization: str = "scaled", dtype: str = "float32"):
         # mlp_ratio 5.3334 and initialization="scaled" are the RELEASED values
         # (slat_flow_img2shape_dit_1_3B_512_bf16.json:13,16). We shipped 4.0 +
         # vanilla xavier by mistake; audited 2026-08-17.
@@ -393,9 +393,18 @@ class MMDiT3D(nn.Module):
         # needs it (autocast covers everything), but the sampler runs outside
         # autocast on fp32 latents — without this, flash attention gets fp32 and
         # raises "FlashAttention only support fp16 and bf16 data type".
+        # SLatFlowModel takes dtype from its config and self-converts at the end
+        # of __init__ (structured_latent_flow.py:51,85). The two official configs
+        # for the SAME class differ here: the TRAINING config omits dtype
+        # (-> float32 torso, amp bf16 does the rest) while the RELEASED
+        # checkpoint config says "bfloat16". Mirror that contract so an inference
+        # entry point cannot silently end up with an fp32 torso just because it
+        # forgot to call convert_to.
         self.dtype = torch.float32
         (self.initialize_weights_scaled if initialization == "scaled"
          else self.initialize_weights)()
+        if dtype != "float32":
+            self.convert_to(getattr(torch, dtype))
 
     def convert_to(self, dtype: torch.dtype) -> None:
         """structured_latent_flow.py:94-99 — torso only. Here the torso is every

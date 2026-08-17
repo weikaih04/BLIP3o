@@ -660,10 +660,21 @@ def compute_unified_geotex_loss(
     # stream attends to; those are trained by the TEX loss flowing back through
     # the joint attention, not by this term.
     #
-    # Note TRELLIS.2 offers no evidence either way: its schedule is
-    # `t = torch.rand(B)` on [0,1) (flow_matching.py:135), which hits exactly 0
-    # with probability ~2^-24, so it never trains that atom and has nothing to
-    # mask. "Official masks nothing" is not an argument for training here.
+    # NO REFERENCE BACKS THIS — it is our call, and it is cheap to A/B later.
+    #   * TRELLIS.2 gives no evidence either way: its schedule is
+    #     `t = torch.rand(B)` on [0,1) (flow_matching.py:135), which hits exactly
+    #     0 with probability ~2^-24, so it never trains that atom and has nothing
+    #     to mask. "Official masks nothing" is NOT an argument for training here.
+    #   * Modality Forcing (arXiv 2606.13676) samples the same three-way split we
+    #     do (p_i2d = p_d2i = 0.2 against our 0.4/0.2) but its paper never states
+    #     whether the clean modality's loss is excluded at those corners, and the
+    #     public repo ships inference only — no loss, no training loop. The one
+    #     related thing it does disclose points the same way: the self-distillation
+    #     weight is (lambda_hi*t_depth + lambda_lo*(1-t_depth)), i.e. it DAMPS the
+    #     RGB term as depth goes clean. That is a soft version of this mask, not
+    #     evidence for a hard one.
+    # The load-bearing argument is the first one above: nothing downstream reads
+    # this output.
     if geo_loss_w > 0:
         v_s_target = loss_fn_slat.get_v(x0_s, noise_s, t_s)
         keep = (t_s != 0)
