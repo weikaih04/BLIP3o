@@ -154,6 +154,7 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         geotex_p_corner: float = 0.4,           # t_s=0 corner mass (user 2026-08-11: flagship-mode priority; MF-exact 0.2 = A1 arm)
         geotex_p_corner2: float = 0.2,          # t_x=1 corner (mesh-only marginal; MF's second corner, bidir design)
         geotex_p_band: float = 0.0,             # A6-only leader-biased band (OFF = MF-faithful)
+        geotex_concat_cond: bool = False,       # per-voxel shape concat into tex (cascade legacy)
         geotex_p_lag: float = 0.0,              # A6-primary: uniform over the upper triangle
         geotex_p_marg_s: float = 0.0,           # t_s=1 edge (tex marginal / free modality-CFG)
         logitnorm_mean: float = 1.0,
@@ -226,6 +227,7 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.geotex_p_corner = geotex_p_corner
         self.geotex_p_corner2 = geotex_p_corner2
         self.geotex_p_band = geotex_p_band
+        self.geotex_concat_cond = geotex_concat_cond
         self.geotex_p_lag = geotex_p_lag
         self.geotex_p_marg_s = geotex_p_marg_s
         self.fuse_dino = fuse_dino
@@ -316,7 +318,11 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 depth_double=int(getattr(config, "geotex_depth_double", 8)),
                 depth_single=int(getattr(config, "geotex_depth_single", 16)),
                 mlp_ratio=float(getattr(config, "geotex_mlp_ratio", 5.3334)),
-                initialization=str(getattr(config, "geotex_init", "scaled")))
+                initialization=str(getattr(config, "geotex_init", "scaled")),
+                # False since 2026-08-17 — the per-voxel shape concat is the
+                # cascade's mechanism and measures at 2% here, while it is the
+                # only structural asymmetry between the two generated streams.
+                concat_cond=bool(getattr(config, "geotex_concat_cond", False)))
             # ONE cond stream ⇒ one connector. It is the standard-named
             # diffusion_connector, built fresh a few dozen lines below by the
             # ordinary (non-geotex) path, so EMA/save/load conventions hold.

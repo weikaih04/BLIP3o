@@ -439,6 +439,7 @@ class NativeArgs:
     geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
     geotex_p_band: float = field(default=0.0)
     # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
+    geotex_concat_cond: bool = field(default=False)  # cascade-legacy shape concat into tex
     geotex_p_lag: float = field(default=0.0)      # t_s~U[0,t_x] over the upper triangle
     geotex_p_marg_s: float = field(default=0.0)   # t_s=1 edge (tex marginal / free modality-CFG)
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
@@ -621,6 +622,7 @@ def main():
         geotex_p_corner=native_args.geotex_p_corner,
         geotex_p_corner2=native_args.geotex_p_corner2,
         geotex_p_band=native_args.geotex_p_band,
+        geotex_concat_cond=native_args.geotex_concat_cond,
         geotex_p_lag=native_args.geotex_p_lag,
         geotex_p_marg_s=native_args.geotex_p_marg_s,
         fuse_dino=native_args.fuse_dino,

@@ -135,8 +135,14 @@ def load_scratch(ckpt, ema=False):
     # release, and every checkpoint written before then is 4.0. Reading it back
     # keeps old runs loadable instead of dying on a shape mismatch.
     mlp_hidden = uni_sd["shared_blocks.0.mlp.mlp.0.weight"].shape[0]
+    # concat_cond from the WEIGHTS, not the constructor default: the tex input
+    # layer is 64 wide (32 tex + 32 concatenated shape) when it is on and 32 when
+    # it is off, and that default flipped to False on 2026-08-17. Reading it back
+    # keeps every earlier checkpoint loadable instead of dying on a shape error.
+    tex_in = uni_sd["tex_flow.input_layer.weight"].shape[1]
+    cc = tex_in == 2 * uni_sd["geo_flow.input_layer.weight"].shape[1]
     m = MMDiT3D(dim=dim, num_heads=dim // 128, depth_double=nd, depth_single=ns,
-                mlp_ratio=mlp_hidden / dim)
+                mlp_ratio=mlp_hidden / dim, concat_cond=cc)
     m.load_state_dict(uni_sd, strict=True)
     m = m.cuda().eval()
     m.convert_to(torch.bfloat16)   # torso only; the sampler feeds fp32 latents

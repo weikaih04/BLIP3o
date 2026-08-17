@@ -334,7 +334,7 @@ class MMDiT3D(nn.Module):
                  depth_double: int = 8, depth_single: int = 16,
                  gen_channels: Optional[Dict[str, int]] = None,
                  cond_ch: int = 1024, mlp_ratio: float = 5.3334,
-                 concat_cond: bool = True, use_checkpoint: bool = True,
+                 concat_cond: bool = False, use_checkpoint: bool = True,
                  initialization: str = "scaled", dtype: str = "float32"):
         # mlp_ratio 5.3334 and initialization="scaled" are the RELEASED values
         # (slat_flow_img2shape_dit_1_3B_512_bf16.json:13,16). We shipped 4.0 +
@@ -357,8 +357,22 @@ class MMDiT3D(nn.Module):
         # but this architecture has a single joint-attention path, no variant.
         self.fused_attn = True
 
-        # concat_cond: TRELLIS.2 feeds the tex flow the shape latent per VOXEL,
-        # not only through attention — the cascade's own mechanism, kept in S1.
+        # concat_cond: TRELLIS.2 feeds the tex flow the shape latent per VOXEL.
+        # That is the CASCADE's mechanism — there the shape is an external input
+        # and attention to it does not exist, so the concat is the only path.
+        #
+        # DEFAULT FLIPPED TO FALSE 2026-08-17. In a joint model the geo stream
+        # sits in the same attention, so the concat is a SECOND copy of
+        # information the tex stream can already reach. Measured on
+        # checkpoint-60000 at t_s=0 (clean GT geometry) / t_x=1: zeroing the
+        # concat costs the tex prediction 2.0%, while removing the geo stream's
+        # tokens costs 7.3% — attention is doing the work, the concat is not.
+        #
+        # It is also the ONLY structural asymmetry between the two generated
+        # streams (tex input 64 = 32+32, geo input 32 with no second path), and
+        # the geo stream is the one that failed to learn to read its
+        # conditioning. Keeping the streams symmetric removes that confound.
+        # Set concat_cond=True to restore the cascade behaviour as an A/B arm.
         extra = {n: 0 for n in self.gen_names}
         if concat_cond and {"geo", "tex"} <= set(self.gen_names):
             extra["tex"] = self.gen_channels["geo"]

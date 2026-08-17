@@ -501,6 +501,16 @@ def sample_timestep_pairs(
     Code shape = JointDiT train.py:515-555 (scenario randint + per-sample select).
     Convention: t=0 clean, t=1 noise (all reference codebases + ours).
     """
+    # The segments are laid out on `u` cumulatively, so a total > 1 does NOT
+    # error — the tail segments simply never get drawn. p_lag is the one that
+    # would vanish, and p_lag=0 is exactly the silent failure that cost the
+    # 2026-08-16 60K run: the whole upper triangle (the region every inference
+    # mode actually traverses) went untrained, and nothing in the log said so.
+    _tot = p_corner + p_corner2 + p_band + p_lag + p_marg_s
+    assert _tot <= 1.0 + 1e-6, (
+        f"timestep segments sum to {_tot:.3f} > 1: the tail segments "
+        f"(p_lag={p_lag}, p_marg_s={p_marg_s}) would be silently starved")
+
     t_x = torch.rand(B, device=device)
     t_s = torch.rand(B, device=device)                       # joint regime default
     u = torch.rand(B, device=device)
@@ -518,7 +528,18 @@ def sample_timestep_pairs(
     _c = p_corner + p_corner2 + p_band
     if p_lag > 0:                                            # A6 arm
         lag = (u >= _c) & (u < _c + p_lag)
-        t_s = torch.where(lag, t_x * torch.rand(B, device=device), t_s)
+        # UNIFORM on the triangle = draw two uniforms and sort them. The old
+        # `t_s = t_x * rand` with t_x ~ U[0,1] is NOT uniform on the triangle
+        # even though the docstring claimed it was: given t_x, t_s spreads over
+        # [0, t_x] with density 1/t_x, so the joint density goes as 1/t_x and
+        # the mass piles up where the TEXTURE IS CLEAN — the opposite of what
+        # this arm is for. Measured over 1M draws: E[t_x] 0.500 vs 0.667, and
+        # P(t_x > 0.9) 10.0% vs 19.0%. Sorting two uniforms is the textbook
+        # uniform-on-a-simplex draw and costs one extra rand.
+        a = torch.rand(B, device=device)
+        b = torch.rand(B, device=device)
+        t_s = torch.where(lag, torch.minimum(a, b), t_s)
+        t_x = torch.where(lag, torch.maximum(a, b), t_x)
     _c = _c + p_lag
     if p_marg_s > 0:                                         # tex-marginal edge
         marg = (u >= _c) & (u < _c + p_marg_s)
@@ -604,6 +625,22 @@ def compute_unified_geotex_loss(
     t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2,
                                      p_band=p_band, p_lag=p_lag, p_marg_s=p_marg_s,
                                      alpha_lo=alpha_lo, alpha_hi=alpha_hi)
+    # ONE-TIME REPORT of what was actually sampled, not what was configured.
+    # The 2026-08-16 run trained with p_lag=0 while the launch script said 0.4
+    # (the script was edited mid-run and the launcher reads it only at start),
+    # and nothing anywhere printed the difference. The number that matters is
+    # not the config value but the MEASURED share of the batch that lands in
+    # the region inference traverses: geometry supervised (t_s != 0) AND
+    # texture no cleaner than geometry (t_s <= t_x).
+    if not getattr(compute_unified_geotex_loss, "_reported", False):
+        compute_unified_geotex_loss._reported = True
+        sup = (t_s != 0)
+        tri = sup & (t_s <= t_x)
+        print(f"[timestep] corner {p_corner} corner2 {p_corner2} band {p_band} "
+              f"lag {p_lag} marg_s {p_marg_s} | measured on this batch: "
+              f"geo-supervised {sup.float().mean():.0%}, of which "
+              f"inference-aligned (t_s<=t_x) "
+              f"{(tri.sum() / sup.sum().clamp_min(1)).item():.0%}", flush=True)
     # dtype discipline (audit; loss.py:172-177 verbatim rule): cast t to the
     # TARGET dtype — never float() — or diffuse upcasts x_t to fp32; and cast
     # targets to a common dtype like the cascade path does (:314/:322).
