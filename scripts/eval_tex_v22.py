@@ -8,7 +8,7 @@ import os, sys, json, argparse
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("FUSED_MODULATE", "1")
-sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, "/fsx/home/weikai.huang/3dgen/model/BLIP3o")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
@@ -33,8 +33,8 @@ PBR = {'base_color': slice(0, 3), 'metallic': slice(3, 4), 'roughness': slice(4,
 # envmap for the shaded render — resolve from the vendored TRELLIS.2 tree (_paths) so it
 # follows the repo; the old hardcoded /fsx/sfr/weikaih/... is dead on the xgen-mm cluster.
 HDR = os.environ.get("EVAL_HDR", os.path.join(_paths.TRELLIS2_ROOT, "assets/hdri/forest.exr"))
-COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
-MANI = os.environ.get("EVAL_MANI", "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
+COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
+MANI = os.environ.get("EVAL_MANI", "/fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
 
 
 def load_tex_flow(ckpt_dir, use_ema=True):
@@ -71,24 +71,42 @@ def sample_tex(flow, cond, uncond, coords, shape_z_feats, steps=25, cfg=3.0, see
 
 
 def render_textured(shape_dec, tex_dec, coords, shape_raw, tex_raw, extr, intr, envmap,
-                    render_res=1024):
-    """shape_raw/tex_raw = DENORMALIZED latents. Returns shaded PIL from given camera."""
+                    render_res=1024, channel=None):
+    """shape_raw/tex_raw = DENORMALIZED latents. Returns shaded PIL from given camera.
+
+    `channel` overrides which render output is returned. The default "shaded" is
+    composited as w = (1-alpha)*gb_alpha against a BLACK background
+    (pbr_mesh_renderer.py:453-458), so a low decoded PBR alpha renders a
+    WATERTIGHT mesh as if it were full of holes. "normal" / "mask" come off the
+    rasterizer's first layer and never touch alpha — pass one of those to tell a
+    real hole from a transparency artifact."""
     slat = sp.SparseTensor(shape_raw.float(), coords.cuda())
     shape_dec.set_resolution(512)
     meshes, gsubs = shape_dec(slat, return_subs=True)
     mesh = meshes[0]
     try:
         mesh.fill_holes()
-    except Exception:
-        pass
+    except Exception as e:
+        # was a silent `pass`: a cumesh failure here leaves a genuinely holed
+        # mesh and looks identical to a model-quality problem downstream.
+        print(f"[render_textured] fill_holes FAILED: {type(e).__name__}: {e}", flush=True)
     tex_vox = tex_dec(sp.SparseTensor(tex_raw.float(), coords.cuda()), guide_subs=gsubs) * 0.5 + 0.5
     mw = MeshWithVoxel(mesh.vertices, mesh.faces, origin=[-0.5, -0.5, -0.5],
                        voxel_size=1 / 512, coords=tex_vox.coords[:, 1:], attrs=tex_vox.feats,
                        voxel_shape=torch.Size([*tex_vox.shape, *tex_vox.spatial_shape]), layout=PBR)
     rd = t2render.render_frames(mw, [extr], [intr],
                                 {"resolution": render_res, "bg_color": (1, 1, 1)}, envmap=envmap)
-    key = "shaded" if "shaded" in rd else ("color" if "color" in rd else list(rd)[0])
-    return Image.fromarray(rd[key][0])
+    if channel is not None:
+        assert channel in rd, f"channel {channel!r} not rendered; have {list(rd)}"
+        key = channel
+    else:
+        key = "shaded" if "shaded" in rd else ("color" if "color" in rd else list(rd)[0])
+    img = rd[key][0]
+    if img.dtype != np.uint8:                      # normal/mask come back float
+        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    if img.ndim == 2:
+        img = np.repeat(img[..., None], 3, -1)
+    return Image.fromarray(img)
 
 
 def main():
@@ -130,7 +148,7 @@ def main():
     sm, ssd = tex_shape_norm["mean"].cuda(), tex_shape_norm["std"].cuda()
 
     cell, hdrh = 640, 72
-    _font = ImageFont.truetype("/fsx/sfr/weikaih/miniconda3/envs/blip3o_trellis/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf", 44)
+    _font = ImageFont.truetype("/fsx/home/weikai.huang/miniconda3/envs/blip3o_trellis/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf", 44)
     cols = (["input", "GT textured", "qwen-only", "qwen+dino"]
             if os.environ.get("OLD_QWEN_ONLY") == "1"
             else ["input", "GT textured", "old-view tex", "good-view tex"])
