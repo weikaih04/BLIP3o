@@ -235,10 +235,32 @@ class GeoTexSampler:
     # ── mode ①: joint (geo leads by α) ──────────────────────────────────────
     @torch.no_grad()
     def sample_joint(self, coords, cond_s, uncond_s, cond_x, uncond_x,
-                     alpha: float = 32.0, seed: int = 0):
+                     alpha: float = 32.0, seed: int = 0, refine_tex: bool = True):
         """Returns (shape SparseTensor, tex feats). Within a step the tex read
         uses the CURRENT geo state (kv + concat_cond at t_s,i), then geo
-        advances — matching the training distribution (cc = x_{t_s})."""
+        advances — matching the training distribution (cc = x_{t_s}).
+
+        refine_tex (DEFAULT ON, Modality Forcing's `--refine-depth`,
+        runner.py:311-326): after the joint rollout, RE-DERIVE the texture from
+        the finished geometry with a full-length tex_given_mesh pass. MF makes
+        this its demo default and gives the reason — conditioning the follower on
+        a fully formed leader instead of a co-evolving noisy one.
+
+        We need it for a sharper reason: the Mobius warp t_x = f_alpha(t_s)
+        leaves the texture almost stationary and then drops it in one Euler step.
+        At the released 12 steps with alpha=32, the FINAL step covers 90% of the
+        texture trajectory (t_x: 1.000 .. 0.897 -> 0). One big flow step is
+        effectively a direct x_0 prediction, i.e. the MMSE estimate — measured on
+        checkpoint-48000, joint texture had the LOWEST latent MSE (1.043) and the
+        LOWEST std, 66% of GT's, against 73% for the cascade and 81% for
+        tex|GT-mesh. That is a conditional MEAN, not a sample: best possible MSE,
+        visibly washed out. MF has the same arithmetic (their own shipped
+        mu=1.1 / alpha=32 / 50 steps puts 66% of the depth trajectory in the last
+        step), which is presumably why the refine pass exists at all.
+
+        The joint rollout still earns its keep: it is what lets the texture shape
+        the GEOMETRY through the bidirectional attention. Only the texture is
+        re-derived."""
         if alpha == float("inf"):
             xs = self.sample_mesh_only(coords, cond_s, uncond_s, seed=seed)
             xt = self.sample_tex_given_mesh(coords, xs.feats, cond_s, cond_x,
@@ -280,4 +302,11 @@ class GeoTexSampler:
                           ps["guidance_strength"], ps["guidance_rescale"],
                           ps["guidance_interval"])
             x_s = x_s.replace(x_s.feats - (tss - tsp) * v_s)
+        if refine_tex:
+            # Stage 2 (MF runner.py:311-326): the geometry from stage 1 is final,
+            # so re-derive the texture over its OWN full 12-step grid. Fresh seed
+            # so this is a new draw rather than a continuation of the collapsed
+            # one. Geometry is NOT touched — only the follower is re-sampled.
+            x_x = self.sample_tex_given_mesh(coords, x_s.feats, cond_s, cond_x,
+                                             uncond_x, seed=seed + 1)
         return x_s, x_x

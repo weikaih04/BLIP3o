@@ -114,7 +114,13 @@ def load_scratch(ckpt):
     dim = uni_sd["geo_flow.adaLN_modulation.1.weight"].shape[1]
     nd = 1 + max(int(k.split(".")[2]) for k in uni_sd if k.startswith("geo_flow.blocks."))
     ns = 1 + max(int(k.split(".")[1]) for k in uni_sd if k.startswith("shared_blocks."))
-    m = MMDiT3D(dim=dim, num_heads=dim // 128, depth_double=nd, depth_single=ns)
+    # mlp_ratio MUST come from the checkpoint, never from the constructor
+    # default: that default moved 4.0 -> 5.3334 on 2026-08-17 to match the
+    # release, and every checkpoint written before then is 4.0. Reading it back
+    # keeps old runs loadable instead of dying on a shape mismatch.
+    mlp_hidden = uni_sd["shared_blocks.0.mlp.mlp.0.weight"].shape[0]
+    m = MMDiT3D(dim=dim, num_heads=dim // 128, depth_double=nd, depth_single=ns,
+                mlp_ratio=mlp_hidden / dim)
     m.load_state_dict(uni_sd, strict=True)
     m = m.cuda().eval()
     m.convert_to(torch.bfloat16)   # torso only; the sampler feeds fp32 latents
@@ -197,6 +203,13 @@ def main():
     print(f"{'asset':14} {'vox':>6} {'tex|GTmesh':>11} {'joint tex':>10} "
           f"{'joint geo':>10} {'mesh only':>10} {'casc tex':>9} {'casc geo':>9}")
     acc = {k: [] for k in ("tm", "jt", "jg", "mo", "ct", "cg")}
+    # latent MSE ALONE is the wrong score for a generative model: the MMSE
+    # estimate — i.e. the conditional MEAN — minimises it by construction, so a
+    # sampler that collapses to the mean wins on MSE while looking washed out.
+    # Measured on checkpoint-48000 before the refine pass: joint had the LOWEST
+    # MSE and the LOWEST std (66% of GT). Track std/GT alongside; a healthy
+    # sample sits near 1.0.
+    sd = {k: [] for k in ("gt_s", "gt_t", "tm", "jt", "jg", "mo", "ct", "cg")}
     for r, ed in recs:
         sha = r["sha256"]
         EV._VIEW_FILE = good_view_b(sha)
@@ -227,6 +240,9 @@ def main():
         for k, v in (("tm", v_tm), ("jt", v_jt), ("jg", v_jg), ("mo", v_mo),
                      ("ct", v_ct), ("cg", v_cg)):
             acc[k].append(v)
+        for k, z in (("gt_s", s_gt), ("gt_t", t_gt), ("tm", x_tm), ("jt", jt),
+                     ("jg", js), ("mo", x_mo), ("ct", ct), ("cg", cs)):
+            sd[k].append(float(f(z).std()))
         print(f"{sha[:12]:14} {cx.shape[0]:6d} {v_tm:11.4f} {v_jt:10.4f} "
               f"{v_jg:10.4f} {v_mo:10.4f} {v_ct:9.4f} {v_cg:9.4f}", flush=True)
 
@@ -284,8 +300,13 @@ def main():
                 grid.paste(im.resize((CELL, CELL)), (c_ * CELL, HDRH + ri * CELL))
 
     mean = {k: float(np.mean(v)) for k, v in acc.items()}
-    print(f"\n{'MEAN':14} {'':6} {mean['tm']:11.4f} {mean['jt']:10.4f} "
+    print(f"\n{'MSE':14} {'':6} {mean['tm']:11.4f} {mean['jt']:10.4f} "
           f"{mean['jg']:10.4f} {mean['mo']:10.4f} {mean['ct']:9.4f} {mean['cg']:9.4f}")
+    S = {k: float(np.mean(v)) for k, v in sd.items()}
+    rt, rs = S["gt_t"], S["gt_s"]      # GT std per stream (tex / shape)
+    print(f"{'std / GT':14} {'':6} {S['tm']/rt:10.0%} {S['jt']/rt:10.0%} "
+          f"{S['jg']/rs:10.0%} {S['mo']/rs:10.0%} {S['ct']/rt:9.0%} {S['cg']/rs:9.0%}"
+          "    <- near 100% = a sample; well under = collapsed to the mean")
     if grid is not None:
         grid.save(a.render)
         print(f"\n[overfit] grid -> {a.render}")

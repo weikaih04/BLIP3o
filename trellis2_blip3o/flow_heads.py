@@ -644,10 +644,26 @@ def compute_unified_geotex_loss(
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex
     # loss — i.e. geo would be optimized to SERVE tex, and its own marginal
-    # p(geo|cond) would drift. MASKED at the t_s=0 corner: there x_ts IS x0, so
-    # the target v = eps - x0 is unpredictable from the input (E[v|x0] = -x0)
-    # and 40% of the batch would inject pure variance. MF's corner sampling
-    # likewise only supervises the modality being generated.
+    # p(geo|cond) would drift.
+    #
+    # MASKED at the t_s=0 corner. The reason stated here until 2026-08-17 —
+    # "the target is unpredictable from the input" — was wrong and is corrected:
+    # at t=0, x_t IS x_0, so the optimal prediction E[v|x_0] = -x_0 is the input
+    # negated and is PERFECTLY predictable. That is exactly why the term is
+    # worthless here: the model would spend p_corner (0.4) of its geo gradient
+    # learning a trivial negation while absorbing the irreducible zero-mean eps
+    # as pure variance. Inference never reads geo velocity at t_s=0 either —
+    # mesh_only/joint stop evaluating at the second-to-last node (t ~ 0.21), and
+    # tex_given_mesh pins t_s=0 but keeps only the TEX velocity.
+    #
+    # What the corner IS for is the geo stream's internal features, which the tex
+    # stream attends to; those are trained by the TEX loss flowing back through
+    # the joint attention, not by this term.
+    #
+    # Note TRELLIS.2 offers no evidence either way: its schedule is
+    # `t = torch.rand(B)` on [0,1) (flow_matching.py:135), which hits exactly 0
+    # with probability ~2^-24, so it never trains that atom and has nothing to
+    # mask. "Official masks nothing" is not an argument for training here.
     if geo_loss_w > 0:
         v_s_target = loss_fn_slat.get_v(x0_s, noise_s, t_s)
         keep = (t_s != 0)
