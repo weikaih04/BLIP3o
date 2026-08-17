@@ -22,5 +22,14 @@ _diag
 
 data_viewer/
 
+# Local evaluator dependency overlays (installed from Miniconda/pip)
+third_party/eval/.deps/
+third_party/eval/.deps_t3/
+third_party/eval/.deps_t2i/
+third_party/eval/.deps_imagereward/
+
 
 tests/
+
+# derived manifests (hundreds of MB) — regenerate with scripts/data/*.py
+manifests/*.jsonl

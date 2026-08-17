@@ -1,0 +1,62 @@
+# Stage-3 TRI-MODAL multitask, on the DESIGNATED fine-tune manifest.
+# Identical to mix_s3_multitask_xgenmm.yaml except for the I1 / IM manifests.
+#
+# CHANGED — image_to_3d and multi_image_to_3d now read
+#   ready_v5_vlm_filtered/vlm_filtered_all_matclean.jsonl   (789,104, 0 bad)
+# instead of the ready_v4 layer the old runs used (419,999 with 5.4% material
+# bugs — cond render grey while the GT pbr is colourful, i.e. input != supervision).
+# WHY NOT the 789,104 file directly: it is ready_v4's 419,999 + SWH's 397,797,
+# and SWH has NO cond cache (v22_3dvlm_tok1024_mv1 covers 422,292 ~= the v4 pool;
+# measured coverage of the v5 file is 50.5%, SWH alone 0.4%). The loader does
+# resample on a cache miss, but at a ~50% miss rate it exhausts its retries and
+# the FileNotFoundError escapes: a 32-GPU run died that way at 2026-08-15 22:24
+# (threed.py:387 -> vlm_cache.py:89). So the manifest below is that same file
+# INTERSECTED with the cache — 398,870 rows, of which 1% is held out by sha hash
+# (data skill S5: carve same-distribution held-out BEFORE the next run, the
+# fine-tune pool has none left). Rebuild: scripts/_tmp/cachelist.py.
+# Nothing else is filtered; when the SWH cache exists, regenerate and the pool
+# doubles.
+#
+# CHANGED — text_to_3d_weighted no longer reads ready_v4's raw capT (422,039,
+# 5.75% material-bug). v5 has no capT counterpart, so the same verdict join was
+# applied: material_verdict_v5.jsonl, drop verdict in {BUG, BUG_partial}
+# (the values are MIXED CASE — a [a-z_]+ regex silently matches nothing and
+# reports "0 bad", the opposite of the truth). 422,039 -> 393,828 train + 3,955
+# held out; nothing was lost to the cache filter, capT is entirely v4.
+# Rebuild: scripts/_tmp/mk_capT.py.
+#
+# The HELD-OUT RULE IS THE SAME on all three tasks — md5(sha)[:8] % 100 == 0 —
+# so an asset held out for image is held out for text too. A per-task rule would
+# leak: the same mesh seen through a caption is the same mesh.
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/v5_matclean_cached_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/v5_matclean_cached_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      max_views: 4
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_im4r
+      fuse_dino: true
+  - name: text_to_3d_weighted
+    weight: 0.2
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/v4_capT_matclean_cached_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+sampling:
+  granularity: batch
+  temperature: 1.0

@@ -1,0 +1,28 @@
+# OVERFIT SANITY — 10 assets, image_to_3d only.
+#
+# The question this answers is the only one that matters before a real run:
+# CAN this architecture fit anything at all? So everything stochastic that
+# fights memorization is turned off at the launcher (DINO_DROP=0), and there is
+# exactly ONE task so the collator never mixes modes.
+#
+# The 10 assets (scripts/_tmp/pick10.py) each satisfy, verified per asset:
+#   * material verdict not BUG / BUG_partial   (data skill §3)
+#   * pbr_latent_512 present                   (tex needs supervision)
+#   * cond cache present at v22_3dvlm_tok1024_mv1/<sha[:2]>/<sha>/v000.npz
+#   * 800 <= shape SLAT voxels <= 6000         (under the 8192 loader gate, so
+#     none of them is silently resampled away mid-run)
+# voxels: 1001 1394 2411 4084 1803 2057 1845 2045 1874 4971
+# subsets: TexVerse, HSSD, ObjaverseXL_sketchfab
+tasks:
+  - name: image_to_3d
+    weight: 1.0
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/overfit10.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 0.0
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+sampling:
+  granularity: batch
+  temperature: 1.0
