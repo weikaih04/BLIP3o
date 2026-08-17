@@ -1,0 +1,67 @@
+# Stage-3 TRI-MODAL multitask on the 2026-08-17 split-safe manifests.
+#
+# REPLACES configs/mix_s3_multitask_v5matclean.yaml. Same tasks, same weights,
+# same cond caches — the ONLY change is which manifest each task reads.
+#
+# WHY. The previous lists (`v5_matclean_cached_train.jsonl` /
+# `v4_capT_matclean_cached_train.jsonl`) removed the OLD 1% held-out
+# (`md5(sha)[:8] % 100 == 0`) and nothing else. The 2026-08-17 re-split defines
+# val/test as `md5(sha)[:8] % 1000 < 50`, of which only the `r == 0` tenth
+# overlaps that old rule — so ~90% of the new val/test sits INSIDE those old
+# training lists. Training with the old config now contaminates the eval set.
+#
+# The three official pools are exactly nested (measured, 0 exceptions):
+#     1.8M pretrain_clean 1,667,854  >  800k all_matclean 787,472
+#                                    >  400k (has cond cache) 397,238
+# and the SAME 20k val+test is stripped from all three, so any tier can be
+# swapped in here without re-checking for leakage:
+#     splits/pool400k_train.jsonl    378,925   <- this file uses it
+#     splits/pool800k_train.jsonl    769,159   (needs the SWH cond cache first)
+#     splits/pool1800k_train.jsonl 1,648,002   (pretraining)
+#
+# Built by scripts/mk_splits.py (idempotent). Eval with splits/val200.jsonl
+# while tuning and splits/test200.jsonl only for a final number — skill
+# trellis2-3d-data S5/S6.
+#
+# TEXT TASK — no longer descends from v4 (fixed 2026-08-17). The old
+# splits/capT_train.jsonl came from ready_v4's vlm_filtered_capT, which was just
+# the caption STORE joined onto the v4 pool in 2026-07-13; that join, not the
+# captions, was what capped the text task at v4's asset set. Measured against
+# the store itself (/fsx/home/weikai.huang/hyperpod/weikaih_cap/FINAL_*.json,
+# 1,741,113 assets) coverage is 100% of every pool. scripts/mk_capT_from_store.py
+# re-joins it onto the SAME split pools the image tasks read, so all three
+# modalities now see one identical asset set — verified capT400k_train subset of
+# pool400k_train, and 0 overlap with val/test. capT800k_train.jsonl is already
+# built for the day the SWH cond cache exists.
+tasks:
+  - name: image_to_3d
+    weight: 0.5
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/pool400k_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+  - name: multi_image_to_3d
+    weight: 0.3
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/pool400k_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      max_views: 4
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/vlm_hidden_cache/v22_im4r
+      fuse_dino: true
+  - name: text_to_3d_weighted
+    weight: 0.2
+    args:
+      manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/capT400k_train.jsonl
+      slat_resolution: 512
+      crop_to_object: true
+      min_aesthetic: 4.5
+      cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
+      fuse_dino: true
+sampling:
+  granularity: batch
+  temperature: 1.0

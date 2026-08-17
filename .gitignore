@@ -33,3 +33,7 @@ tests/
 
 # derived manifests (hundreds of MB) — regenerate with scripts/data/*.py
 manifests/*.jsonl
+# splits/ 里是 GB 级的 pool*_train —— 只提交生成脚本 scripts/data/mk_*.py
+# (.gitignore 不支持行尾注释，写在同一行会把注释当成模式的一部分)
+manifests/**/*.jsonl
+manifests/DELETED_*.txt

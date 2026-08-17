@@ -9,7 +9,7 @@ EMA weights overlaid (the released-TRELLIS convention).
 import os, sys, json, argparse
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ.setdefault("FUSED_MODULATE", "1")
-sys.path.insert(0, "/fsx/sfr/weikaih/3dgen/model/BLIP3o")
+sys.path.insert(0, "/fsx/home/weikai.huang/3dgen/model/BLIP3o")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
@@ -24,8 +24,13 @@ from scripts.eval_render import decode_render
 from trellis2.utils import render_utils as t2render  # type: ignore
 import utils3d  # type: ignore
 
-COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/sfr/weikaih/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
-MANI = os.environ.get("EVAL_MANI", "/fsx/sfr/weikaih/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
+COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
+# DEFAULT IS THE VAL SPLIT, not the training manifest. It used to point at
+# ready_v4_vlm_filtered/vlm_filtered_all.jsonl — the SAME file the training
+# mixture read — so forgetting EVAL_MANI silently measured training-set
+# reconstruction with no warning (memory: eval-scripts-default-to-training-manifest).
+MANI = os.environ.get("EVAL_MANI",
+    "/fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/val200.jsonl")
 # base pretrained shape-SLAT flow. Resolve via tr2_modules (_paths.CHECKPOINTS_ROOT) so the
 # path follows the repo location — the old hardcoded /fsx/sfr/weikaih/... is dead on the
 # xgen-mm cluster (/fsx/home/weikai.huang/...).
@@ -175,7 +180,7 @@ def main():
     m_, sd_ = norm["mean"].cuda(), norm["std"].cuda()
 
     cell, hdr = 640, 72
-    _font = ImageFont.truetype("/fsx/sfr/weikaih/miniconda3/envs/blip3o_trellis/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf", 44)
+    _font = ImageFont.truetype("/fsx/home/weikai.huang/miniconda3/envs/blip3o_trellis/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf", 44)
     cols = (["input (good view)", "GT", "qwen-only", "qwen+dino"]
             if os.environ.get("OLD_QWEN_ONLY") == "1"
             else ["input (good view)", "GT", "old-view model", "good-view model"])

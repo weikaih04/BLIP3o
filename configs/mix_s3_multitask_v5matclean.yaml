@@ -1,3 +1,8 @@
+# 🔴 DEPRECATED 2026-08-17 — 用 configs/mix_s3_splits.yaml 代替。
+# 这份指向的两个清单只剔了旧的 1% 留出(md5%100==0)。新的 val/test 是 md5%1000<50，
+# 其中只有 r==0 那一成和旧规则重合 —— 也就是**新 val/test 的 ~90% 还在这两份训练清单里**。
+# 拿这份配置再开训 = 把评测集吃掉。保留只为记录 2026-08-16 那轮 60K 用的是什么。
+#
 # Stage-3 TRI-MODAL multitask, on the DESIGNATED fine-tune manifest.
 # Identical to mix_s3_multitask_xgenmm.yaml except for the I1 / IM manifests.
 #

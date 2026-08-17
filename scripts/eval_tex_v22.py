@@ -34,7 +34,12 @@ PBR = {'base_color': slice(0, 3), 'metallic': slice(3, 4), 'roughness': slice(4,
 # follows the repo; the old hardcoded /fsx/sfr/weikaih/... is dead on the xgen-mm cluster.
 HDR = os.environ.get("EVAL_HDR", os.path.join(_paths.TRELLIS2_ROOT, "assets/hdri/forest.exr"))
 COND_ROOT = os.environ.get("EVAL_COND_ROOT", "/fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1")
-MANI = os.environ.get("EVAL_MANI", "/fsx/home/weikai.huang/3dgen/data/trellis2/manifests/ready_v4_vlm_filtered/vlm_filtered_all.jsonl")
+# DEFAULT IS THE VAL SPLIT, not the training manifest. It used to point at
+# ready_v4_vlm_filtered/vlm_filtered_all.jsonl — the SAME file the training
+# mixture read — so forgetting EVAL_MANI silently measured training-set
+# reconstruction with no warning (memory: eval-scripts-default-to-training-manifest).
+MANI = os.environ.get("EVAL_MANI",
+    "/fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/val200.jsonl")
 
 
 def load_tex_flow(ckpt_dir, use_ema=True):
