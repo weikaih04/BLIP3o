@@ -18,7 +18,7 @@
 #
 # Usage: bash scripts/train_native_geotex.sh [NPROC=8]
 #   env: PER_GPU_BS(4) MAX_STEPS(3000) LR(5e-5) RUN_TAG(v1) WORKERS(10)
-#        COUPLING(union) P_CORNER(0.4) P_LAG(0.4) DINO_DROP(0.0) EMA(0.9999)
+#        COUPLING(union) P_CORNER(0.2) P_LAG(0.4) DINO_DROP(0.0) EMA(0.9999)
 #        MIX(configs/mix_s3_multitask_xgenmm.yaml) REPORT_TO(wandb)
 #        DEEPSPEED(configs/deepspeed_zero1.json) EFF_BS(256) EXTRA_ARGS
 #   Long runs go through sbatch (scripts/geotex_s1.sbatch) — srun-on-a-hold gets
@@ -39,15 +39,20 @@ COND_MODE="${COND_MODE:-cross_attn}"   # cross_attn (variant A, S1 default) | st
 COND_STREAM_BLOCKS="${COND_STREAM_BLOCKS:-10}"   # <=0 = all 30 (required when annealing cross-attn away)
 XATTN_ANNEAL_START="${XATTN_ANNEAL_START:-0}"
 XATTN_ANNEAL_END="${XATTN_ANNEAL_END:-0}"
-# t_s=0 corner = the tex|mesh config, which is ALSO what the joint sampler's
-# refine pass runs (MF's --refine-depth: re-derive the follower on the finished
-# leader, geotex_sampler.sample_joint). That makes it the production texture
-# path, so it earns a double share.
-# History: 0.4 (2026-08-11, warm start) -> 0.2 (2026-08-17, on the theory that
-# the corner starved geo, since geo loss was masked at t_s=0) -> 0.4 again, same
-# day: that mask is gone, so t_s=0 now supervises geo like any other t and the
-# corner costs geometry nothing.
-P_CORNER="${P_CORNER:-0.4}"   # MF-exact is 0.2 = the A1 ablation arm
+# t_s=0 corner: geometry clean, texture generated = the tex|mesh mode, which is
+# also what the joint sampler's refine pass runs. The geo velocity loss IS masked
+# there (flow_heads: the target -x_0 is the input negated, and no inference mode
+# reads geo velocity at t_s=0), so this corner is texture budget only.
+#
+# NOT symmetric with the t_x=1 corner (P_CORNER2). There the texture input IS the
+# noise and the model must predict E[x_0|cond] — the generation task itself, and
+# joint's first step reads exactly that velocity. So P_CORNER2 is never masked.
+#
+# 0.4 (2026-08-11, warm start) -> 0.2 (2026-08-17, owner): back to MF's own
+# value. Measured at 50k steps, tex|GT-mesh is the ONLY mode under MSE 1.0
+# (0.971) while joint geo 1.167 / mesh-only 1.171 lag, so the freed 20% is worth
+# more in the joint region than in the mode that is already ahead.
+P_CORNER="${P_CORNER:-0.2}"   # MF-exact; 0.4 = the warm-start-era value (A1 arm)
 P_CORNER2="${P_CORNER2:-0.2}" # t_x=1 corner (mesh-only marginal; bidir design)
 P_BAND="${P_BAND:-0.0}"
 # A6 sampler arms (default OFF = the S1/S2b recipe). Proposed A6 arm:

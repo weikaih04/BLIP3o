@@ -652,9 +652,25 @@ def compute_unified_geotex_loss(
     # negated and is PERFECTLY predictable. That is exactly why the term is
     # worthless here: the model would spend p_corner (0.4) of its geo gradient
     # learning a trivial negation while absorbing the irreducible zero-mean eps
-    # as pure variance. Inference never reads geo velocity at t_s=0 either —
-    # mesh_only/joint stop evaluating at the second-to-last node (t ~ 0.21), and
-    # tex_given_mesh pins t_s=0 but keeps only the TEX velocity.
+    # as pure variance. And NO inference mode reads geo velocity at t_s=0 — the
+    # test is GLOBAL, not per-mode: mesh_only/joint evaluate the model only at
+    # the first `steps` nodes, so the last geo evaluation is t_s = 0.2143
+    # (12 steps, rescale_t=3) and the final node 0 is the destination, never an
+    # input; tex_given_mesh does pin t_s=0 but mmdit3d.tex_forward_cached returns
+    # `_, v_x` and discards the geo velocity.
+    #
+    # Contrast the OTHER sampled corner, t_x=1 (p_corner2), which is NOT masked.
+    # mesh_only ignores the tex velocity there (geotex_sampler:195 `v_sp, _`),
+    # but joint's FIRST step sits at exactly t_x = 1.0000 and integrates it
+    # (:292 `v_sp, v_xp`) — one consumer is enough. It is also where the texture
+    # learns E[x_0|cond] from pure noise, i.e. the generation task itself.
+    #
+    # The rule is therefore "mask a stream's loss at ITS OWN t=0, if nothing
+    # reads that velocity", applied to both streams alike. t_x=0 would qualify
+    # too, but the tex schedule is continuous and hits it with probability 0
+    # (measured over 4M draws), so that branch never runs. Only the SAMPLING is
+    # asymmetric — tex|mesh is a product mode, "texture given, generate geometry"
+    # is not.
     #
     # What the corner IS for is the geo stream's internal features, which the tex
     # stream attends to; those are trained by the TEX loss flowing back through
