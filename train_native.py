@@ -205,8 +205,19 @@ class NativeTrainer(Trainer):
         # (without this, step 2 with a different-sized asset raises ValueError).
         from contextlib import ExitStack
         base = self._unwrap(model)
+        # cross-attn anneal: drive the unified model's xattn_scale 1 -> 0 over
+        # [start, end] steps so the run ENDS as a pure three-stream MMDiT (one
+        # conditioning pathway) while STARTING bit-exact with the warm start.
+        _uni = getattr(base, "unified_geotex", None)
+        if _uni is not None and getattr(_uni, "cond_mode", "") == "stream":
+            _a = int(getattr(base.config, "geotex_xattn_anneal_start", 0))
+            _b = int(getattr(base.config, "geotex_xattn_anneal_end", 0))
+            if _b > _a:
+                _st = int(self.state.global_step)
+                _uni.xattn_scale = float(
+                    1.0 if _st <= _a else 0.0 if _st >= _b else 1.0 - (_st - _a) / (_b - _a))
         ctxs = []
-        for name in ("shape_slat_512", "tex_slat_512"):
+        for name in ("shape_slat_512", "tex_slat_512", "unified_geotex"):
             m = getattr(base, name, None)
             ctrl = getattr(m, "_memory_controller", None) if m is not None else None
             if ctrl is not None:
@@ -389,9 +400,47 @@ class NativeArgs:
     # build_vlm=False: skip loading the 2B VLM (conds arrive precomputed via the
     # dataset's cached_hidden_root — set THAT in the mixture yaml task args).
     build_vlm: bool = field(default=True)
-    # Train only one cascade component per job (TRELLIS-style split): all|ss|shape|tex.
+    # Train only one cascade component per job (TRELLIS-style split): all|ss|shape|tex,
+    # or "geotex" = the unified geo-tex dual-stream DiT (docs/UNIFIED_GEOTEX_DIT_DESIGN.md).
     # Stages are GT-decoupled in training; each split job trains its own connector copy.
     train_stages: str = field(default="all")
+    # ── geotex (unified) knobs — only read when train_stages="geotex" ──
+    geotex_shape_init: str = field(default="")   # shape-specialist run ckpt (EMA overlaid)
+    geotex_tex_init: str = field(default="")     # tex-specialist run ckpt (EMA overlaid)
+    geotex_coupling: str = field(default="union")  # union (MF-bare, G0-cleared) | gated
+    geotex_cond_mode: str = field(default="cross_attn")  # cross_attn (A) | stream (B: three-stream MMDiT)
+    geotex_cond_stream_blocks: int = field(default=10)   # cond stream on the LAST N blocks; <=0 = all 30
+    # cross-attn anneal window (steps). end>start enables it; the run finishes
+    # with cross-attn at exactly 0 = a true single-pathway MMDiT.
+    geotex_xattn_anneal_start: int = field(default=0)
+    geotex_xattn_anneal_end: int = field(default=0)
+    # FROM SCRATCH: three-stream sparse MMDiT (trellis2_blip3o/mmdit3d.py), no
+    # TRELLIS.2 weights. shape_init/tex_init are ignored; the VAEs are unchanged.
+    # Sizing is these four knobs only (defaults = the 298M pilot).
+    geotex_from_scratch: bool = field(default=False)
+    geotex_dim: int = field(default=768)
+    geotex_heads: int = field(default=6)
+    geotex_depth_double: int = field(default=8)    # triple-stream blocks (own weights)
+    geotex_depth_single: int = field(default=16)   # shared-weight blocks (2x double, owner's 1:2)
+    # released 512 config values (slat_flow_img2shape_dit_1_3B_512_bf16.json:13,16);
+    # we shipped 4.0 + vanilla xavier by mistake, audited 2026-08-17
+    geotex_mlp_ratio: float = field(default=5.3334)
+    geotex_init: str = field(default="scaled")     # "scaled" (released) | "vanilla"
+    geotex_bidir: bool = field(default=False)  # corner-masked bidirectional geo<->tex
+    geotex_fused: bool = field(default=True)   # fused MMDiT attention (MFU 18.7->30.0%, G0-fused certified)
+    geotex_gc: float = field(default=1.0)      # fraction of block pairs gradient-checkpointed (1=all, 0=none)
+    # S2b — unfreeze geo (three-pack: geo loss + self-distill + G3 red line)
+    geotex_unfreeze_geo: bool = field(default=False)
+    geotex_geo_loss_w: float = field(default=1.0)
+    geotex_distill_w: float = field(default=1.0)
+    geotex_distill_lo: float = field(default=0.1)
+    geotex_distill_hi: float = field(default=1.0)
+    geotex_p_corner: float = field(default=0.4)  # user 2026-08-11: flagship tex|mesh mass; 0.2 = A1
+    geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
+    geotex_p_band: float = field(default=0.0)
+    # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
+    geotex_p_lag: float = field(default=0.0)      # t_s~U[0,t_x] over the upper triangle
+    geotex_p_marg_s: float = field(default=0.0)   # t_s=1 edge (tex marginal / free modality-CFG)
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
@@ -547,6 +596,33 @@ def main():
         target_tokens_per_view=native_args.target_tokens_per_view,
         build_vlm=native_args.build_vlm,
         train_stages=native_args.train_stages,
+        geotex_shape_init=native_args.geotex_shape_init,
+        geotex_tex_init=native_args.geotex_tex_init,
+        geotex_coupling=native_args.geotex_coupling,
+        geotex_cond_mode=native_args.geotex_cond_mode,
+        geotex_cond_stream_blocks=native_args.geotex_cond_stream_blocks,
+        geotex_xattn_anneal_start=native_args.geotex_xattn_anneal_start,
+        geotex_xattn_anneal_end=native_args.geotex_xattn_anneal_end,
+        geotex_from_scratch=native_args.geotex_from_scratch,
+        geotex_dim=native_args.geotex_dim,
+        geotex_heads=native_args.geotex_heads,
+        geotex_depth_double=native_args.geotex_depth_double,
+        geotex_depth_single=native_args.geotex_depth_single,
+        geotex_mlp_ratio=native_args.geotex_mlp_ratio,
+        geotex_init=native_args.geotex_init,
+        geotex_bidir=native_args.geotex_bidir,
+        geotex_fused=native_args.geotex_fused,
+        geotex_gc=native_args.geotex_gc,
+        geotex_unfreeze_geo=native_args.geotex_unfreeze_geo,
+        geotex_geo_loss_w=native_args.geotex_geo_loss_w,
+        geotex_distill_w=native_args.geotex_distill_w,
+        geotex_distill_lo=native_args.geotex_distill_lo,
+        geotex_distill_hi=native_args.geotex_distill_hi,
+        geotex_p_corner=native_args.geotex_p_corner,
+        geotex_p_corner2=native_args.geotex_p_corner2,
+        geotex_p_band=native_args.geotex_p_band,
+        geotex_p_lag=native_args.geotex_p_lag,
+        geotex_p_marg_s=native_args.geotex_p_marg_s,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
         qwen_drop_prob=native_args.qwen_drop_prob,
@@ -561,6 +637,71 @@ def main():
     model = TrellisNativeVLMForConditionalGeneration(cfg)
     _apply_flow_freeze(model, native_args.flow_tune)
     print(f"[train_native] flow_tune={native_args.flow_tune!r}")
+
+    if native_args.train_stages == "geotex":
+        # geotex warm-start/freeze are owned by the model __init__ (two-ckpt EMA
+        # assembly); the single-ckpt and compile/elastic paths don't apply.
+        assert not native_args.init_from_checkpoint, \
+            "[geotex] warm-start via --geotex_{shape,tex}_init, not --init_from_checkpoint"
+        assert not native_args.compile_ss_flow, "[geotex] no SS flow to compile"
+        # elastic GC: TRELLIS's OWN adaptive controller (audit 2026-08-12 — the
+        # first version hard-coded a static fraction, throwing away the policy
+        # that decides how many blocks to checkpoint from a fitted memory model).
+        # --elastic_slat True enables it; --geotex_gc stays as the static
+        # kill-switch. NativeTrainer enters the controller's record() context.
+        if native_args.elastic_slat:
+            from trellis2.utils.elastic_utils import LinearMemoryController
+            model.unified_geotex.register_memory_controller(LinearMemoryController(
+                buffer_size=1000, update_every=500,
+                target_ratio=native_args.elastic_target_ratio,
+                max_mem_ratio_start=0.5))
+            print(f"[geotex] elastic GC ON (TRELLIS LinearMemoryController, "
+                  f"target_ratio={native_args.elastic_target_ratio})")
+        # freeze audit: trainables must be EXACTLY {tex flow, t-mixer, cross_alpha,
+        # c_gates, tex connector} — a stray geo/VLM param here would silently train.
+        _allowed = ("unified_geotex.tex_flow.", "unified_geotex.t_mixer.",
+                    "unified_geotex.t_mixer_s.",
+                    "unified_geotex.cond_proj.", "unified_geotex.cond_blocks.",
+                    "diffusion_connector.")
+        if native_args.geotex_unfreeze_geo:
+            # S2b: geo joins. The geo CONNECTOR stays frozen on purpose — one
+            # variable at a time; geo's blocks 0-23 have never seen our cond, so
+            # let them adapt to the existing cond distribution first.
+            _allowed = _allowed + ("unified_geotex.geo_flow.",)
+        if getattr(getattr(model, "unified_geotex", None), "from_scratch", False):
+            # From-scratch MMDiT3D: there is no frozen warm start, so EVERY
+            # unified param is meant to train (geo_flow, tex_flow, cond_flow,
+            # cond_t, shared_blocks). The audit still earns its keep — it keeps
+            # catching a VLM or geo-connector param leaking into the optimizer.
+            _allowed = _allowed + ("unified_geotex.",)
+        _exact = {"unified_geotex.cross_alpha", "unified_geotex.cross_alpha_s",
+                  "unified_geotex.c_gates", "unified_geotex.b_gates",
+                  "unified_geotex.cond_gates_tex", "unified_geotex.cond_gates_geo",
+                  "unified_geotex.cond_reads_gate"}
+        _bad = [n for n, p in model.named_parameters()
+                if p.requires_grad and not (n.startswith(_allowed) or n in _exact)]
+        assert not _bad, f"[geotex] unexpected trainable params: {_bad[:8]}"
+        print(f"[geotex] freeze audit OK — coupling={native_args.geotex_coupling} "
+              f"p_corner={native_args.geotex_p_corner} p_band={native_args.geotex_p_band}")
+        # dino_view_embed is a FIXED buffer whose scale is an env var at build time
+        # (t50b ckpts: sincos × VIEW_EMBED_SCALE=0.2, L2/row 4.531). Restore the tex
+        # run's exact table so the warm-started connector sees the values it was
+        # trained with — env drift here would silently shift every IM cond.
+        # ...but only for a warm start. From scratch there is no ckpt to be
+        # consistent WITH — the fresh connector's table is built here, at this
+        # run's VIEW_EMBED_SCALE, and is the only definition. Reading the tex
+        # ckpt anyway would crash a machine that has no such ckpt, and would
+        # otherwise silently overwrite the table this run just built.
+        from safetensors.torch import load_file as _lf_ve
+        _sd_ve = {} if native_args.geotex_from_scratch else \
+            _lf_ve(os.path.join(native_args.geotex_tex_init, "model.safetensors"))
+        if "dino_view_embed" in _sd_ve and getattr(model, "dino_view_embed", None) is not None:
+            with torch.no_grad():
+                model.dino_view_embed.copy_(
+                    _sd_ve["dino_view_embed"].to(model.dino_view_embed.dtype))
+            print("[geotex] dino_view_embed restored from tex ckpt "
+                  f"(L2/row={model.dino_view_embed.norm(dim=1).mean():.3f})")
+        del _sd_ve
     # V3 token raise: one process-wide knob, consumed by vlm_collate (all 3D collates).
     if native_args.target_tokens_per_view:
         from trellis2_blip3o.vlm_collate import set_default_target_tokens_per_view

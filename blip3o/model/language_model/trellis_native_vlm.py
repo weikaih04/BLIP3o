@@ -24,6 +24,7 @@ Design choices (vs blip3oQwenForCausalLM):
 from __future__ import annotations
 
 import contextlib
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -130,7 +131,31 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         repa_depth: int = 0,                    # 1-indexed tap depth; 0 = auto num_blocks//3
         repa_zdim: int = 2049,                  # target dim (density 1 + RAW 2048-d VGGT feature)
         # Stage-split training: build/train only one component per job (see __init__).
-        train_stages: str = "all",              # all | ss | shape | tex
+        train_stages: str = "all",              # all | ss | shape | tex | geotex
+        # ── unified geo-tex DiT (train_stages="geotex"; docs/UNIFIED_GEOTEX_DIT_DESIGN.md) ──
+        # Warm-start comes from TWO run ckpts (shape + tex specialists), each loaded with its
+        # EMA overlay + its own connector — NOT via --init_from_checkpoint (single-ckpt path).
+        geotex_shape_init: str = "",            # e.g. runs/s3_shape_t50b/checkpoint-8000
+        geotex_tex_init: str = "",              # e.g. runs/s3_tex_t50b/checkpoint-8000
+        geotex_coupling: str = "union",         # union (MF-bare; G0 [SCALE]=0.168 cleared) | gated
+        geotex_cond_mode: str = "cross_attn",   # cross_attn (variant A) | stream (variant B, three-stream MMDiT)
+        geotex_cond_stream_blocks: int = 10,    # cond stream on the LAST N blocks; <=0 = all 30
+        geotex_xattn_anneal_start: int = 0,     # cross-attn scale 1->0 over [start, end] steps
+        geotex_xattn_anneal_end: int = 0,
+        geotex_bidir: bool = False,             # corner-masked bidirectional geo<->tex (user topology 2026-08-11)
+        geotex_fused: bool = True,              # fused MMDiT attention (1 varlen call/lane): MFU 18.7%->30.0%, G0-fused certified
+        geotex_gc: float = 1.0,                 # fraction of block pairs gradient-checkpointed (1=all, 0=none)
+        # ── S2b: unfreeze geo (design doc "three-pack"; only with G3 as a red line) ──
+        geotex_unfreeze_geo: bool = False,      # geo becomes trainable (joint's value needs this)
+        geotex_geo_loss_w: float = 1.0,         # geo's own velocity loss (else geo just serves tex)
+        geotex_distill_w: float = 1.0,          # MF self-distill vs the frozen S1 geo
+        geotex_distill_lo: float = 0.1,         # distill weight at t_x->0 (tex clean)
+        geotex_distill_hi: float = 1.0,         # distill weight at t_x->1 (tex pure noise)
+        geotex_p_corner: float = 0.4,           # t_s=0 corner mass (user 2026-08-11: flagship-mode priority; MF-exact 0.2 = A1 arm)
+        geotex_p_corner2: float = 0.2,          # t_x=1 corner (mesh-only marginal; MF's second corner, bidir design)
+        geotex_p_band: float = 0.0,             # A6-only leader-biased band (OFF = MF-faithful)
+        geotex_p_lag: float = 0.0,              # A6-primary: uniform over the upper triangle
+        geotex_p_marg_s: float = 0.0,           # t_s=1 edge (tex marginal / free modality-CFG)
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
         flow_sigma_min: float = 1e-5,
@@ -183,6 +208,26 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         # (REPA λ-warmup env is read lazily in the MODEL's _repa_lambda, not here — this is the
         # config class; the earlier copy here was a misplaced-edit bug that crashed on empty env.)
         self.train_stages = train_stages
+        self.geotex_shape_init = geotex_shape_init
+        self.geotex_tex_init = geotex_tex_init
+        self.geotex_coupling = geotex_coupling
+        self.geotex_cond_mode = geotex_cond_mode
+        self.geotex_cond_stream_blocks = geotex_cond_stream_blocks
+        self.geotex_xattn_anneal_start = geotex_xattn_anneal_start
+        self.geotex_xattn_anneal_end = geotex_xattn_anneal_end
+        self.geotex_bidir = geotex_bidir
+        self.geotex_fused = geotex_fused
+        self.geotex_gc = geotex_gc
+        self.geotex_unfreeze_geo = geotex_unfreeze_geo
+        self.geotex_geo_loss_w = geotex_geo_loss_w
+        self.geotex_distill_w = geotex_distill_w
+        self.geotex_distill_lo = geotex_distill_lo
+        self.geotex_distill_hi = geotex_distill_hi
+        self.geotex_p_corner = geotex_p_corner
+        self.geotex_p_corner2 = geotex_p_corner2
+        self.geotex_p_band = geotex_p_band
+        self.geotex_p_lag = geotex_p_lag
+        self.geotex_p_marg_s = geotex_p_marg_s
         self.fuse_dino = fuse_dino
         self.dino_drop_prob = dino_drop_prob
         self.qwen_drop_prob = qwen_drop_prob
@@ -254,8 +299,144 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # runs too. A split job gets its own connector copy (per-stage connectors are a
         # feature: more capacity, assembled at inference). flow_heads skips None flows.
         _stages = str(getattr(config, "train_stages", "all"))
-        assert _stages in ("all", "ss", "shape", "tex"), f"bad train_stages={_stages!r}"
+        assert _stages in ("all", "ss", "shape", "tex", "geotex"), f"bad train_stages={_stages!r}"
         self.ss_flow = build_ss_flow(config) if _stages in ("all", "ss") else None
+        self.unified_geotex = None
+        # From-scratch three-stream MMDiT (no TRELLIS.2 weights). Everything
+        # downstream of construction — elastic GC, the freeze audit, the loss,
+        # the sampler — is the SAME path; only the pieces that only make sense
+        # for a warm start are skipped, each guarded on this flag.
+        _gt_scratch = (_stages == "geotex"
+                       and bool(getattr(config, "geotex_from_scratch", False)))
+        if _gt_scratch:
+            from trellis2_blip3o.mmdit3d import MMDiT3D
+            self.unified_geotex = MMDiT3D(
+                dim=int(getattr(config, "geotex_dim", 768)),
+                num_heads=int(getattr(config, "geotex_heads", 6)),
+                depth_double=int(getattr(config, "geotex_depth_double", 8)),
+                depth_single=int(getattr(config, "geotex_depth_single", 16)),
+                mlp_ratio=float(getattr(config, "geotex_mlp_ratio", 5.3334)),
+                initialization=str(getattr(config, "geotex_init", "scaled")))
+            # ONE cond stream ⇒ one connector. It is the standard-named
+            # diffusion_connector, built fresh a few dozen lines below by the
+            # ordinary (non-geotex) path, so EMA/save/load conventions hold.
+            self.geo_connector = None
+            rank0_print(
+                f"[geotex] FROM SCRATCH: three-stream MMDiT3D "
+                f"dim={self.unified_geotex.dim} "
+                f"{len(self.unified_geotex.geo_flow.blocks)} triple + "
+                f"{len(self.unified_geotex.shared_blocks)} shared, "
+                f"{sum(p.numel() for p in self.unified_geotex.parameters())/1e6:.0f}M params")
+        elif _stages == "geotex":
+            # Unified geo-tex DiT (Stage-1): both SLAT specialists assembled into ONE
+            # dual-stream model, warm-started from TWO run ckpts with EMA overlay
+            # (unified_geotex.assemble_unified; G0-certified bit-exact). Geo stream is
+            # FROZEN; tex stream + t-mixer (+ gates) train. The geo run's connector is
+            # loaded frozen alongside; the tex run's connector becomes THE
+            # diffusion_connector (standard name → EMA/save/inference conventions hold).
+            from trellis2_blip3o.unified_geotex import (
+                assemble_unified, load_connectors, assemble_unified_from_run,
+                load_run_connectors, load_geo_teacher_from_run)
+            assert config.geotex_shape_init and config.geotex_tex_init, \
+                "[geotex] --geotex_shape_init and --geotex_tex_init are required"
+            # A geotex RUN checkpoint (S1 -> S2b) stores `unified_geotex.*`; the
+            # specialist pair stores `shape_slat_512.` / `tex_slat_512.`. Detect
+            # rather than make the caller remember which flag to use.
+            _resume = None
+            if config.geotex_shape_init == config.geotex_tex_init:
+                from safetensors import safe_open
+                with safe_open(os.path.join(config.geotex_shape_init,
+                                            "model.safetensors"), framework="pt") as _f:
+                    if any(k.startswith("unified_geotex.") for k in _f.keys()):
+                        _resume = config.geotex_shape_init
+            _kw = dict(cond_mode=getattr(config, "geotex_cond_mode", "cross_attn"),
+                       coupling=config.geotex_coupling,
+                       bidirectional=bool(getattr(config, "geotex_bidir", False)))
+            if _kw["cond_mode"] == "stream":
+                _kw["cond_stream_blocks"] = int(
+                    getattr(config, "geotex_cond_stream_blocks", 10))
+            if _resume:
+                self.unified_geotex = assemble_unified_from_run(_resume, **_kw)
+                rank0_print(f"[geotex] RESUMED unified model from run ckpt {_resume}")
+            else:
+                self.unified_geotex = assemble_unified(
+                    config.geotex_shape_init, config.geotex_tex_init, **_kw)
+            self.unified_geotex.fused_attn = bool(getattr(config, "geotex_fused", True))
+            # connectors follow the same resume/fresh split (a run ckpt stores
+            # them as geo_connector.* / diffusion_connector.*)
+            if _resume:
+                self.geo_connector, self.diffusion_connector = load_run_connectors(_resume)
+            else:
+                self.geo_connector, self.diffusion_connector = load_connectors(
+                    config.geotex_shape_init, config.geotex_tex_init)
+            self.geo_connector.requires_grad_(False)
+            self.geo_connector.eval()
+            # geo_flow is a PRETRAINED specialist on this branch and S1 freezes
+            # it on purpose. Doing the same to a from-scratch MMDiT3D would pin
+            # a RANDOM geo tower with a zero-init out_layer for the whole run
+            # (v_s == 0 forever, S2b's geo/distill terms constant with no
+            # gradient) — and the freeze audit could not catch it, since it only
+            # inspects params that still require grad. Hence the branch.
+            self.unified_geotex.geo_flow.requires_grad_(False)
+
+        if _stages == "geotex":
+            # Activation checkpointing. In the bidir path the WHOLE block pair is
+            # wrapped, so GC costs a full extra forward (~29% of total work) —
+            # worth trading for memory only when memory is actually tight.
+            # geotex_gc: 1.0 = every block (default), 0.0 = none, 0<f<1 = the
+            # first f fraction of blocks (early blocks hold activations longest,
+            # so checkpointing those buys the most memory per unit of recompute).
+            _gc = float(getattr(config, "geotex_gc", 1.0))
+            if getattr(self.unified_geotex, "from_scratch", False):
+                # MMDiT3D drives the blocks itself (it reaches into blk.attn /
+                # norm1 / norm2 / mlp and never calls block.forward), so the
+                # per-block use_checkpoint flags below are dead there — setting
+                # them would have made --geotex_gc 0 silently keep checkpointing
+                # all 24 joint blocks. Its own switch is the model-level one.
+                self.unified_geotex.use_checkpoint = _gc > 0
+                _nb = (len(self.unified_geotex.shared_blocks)
+                       + len(self.unified_geotex.geo_flow.blocks))
+                rank0_print(f"[geotex] gradient checkpointing "
+                            f"{'ON' if _gc > 0 else 'OFF'} for all {_nb} joint blocks "
+                            f"(geotex_gc={_gc}; elastic GC overrides per step)")
+            else:
+                _nb = len(self.unified_geotex.tex_flow.blocks)
+                _n_ckpt = int(round(_gc * _nb))
+                for _i, _b in enumerate(self.unified_geotex.tex_flow.blocks):
+                    _b.use_checkpoint = (_i < _n_ckpt)
+                rank0_print(f"[geotex] gradient checkpointing on {_n_ckpt}/{_nb} block pairs "
+                            f"(geotex_gc={_gc})")
+            # ── S2b: unfreeze geo + build the frozen self-distill teacher ──
+            if getattr(config, "geotex_unfreeze_geo", False):
+                self.unified_geotex.unfreeze_geo()
+                # Self-distillation needs an S1 geo to distil FROM. There is
+                # none from scratch — the flag is a no-op there, not an error,
+                # so a shared launcher config still runs.
+                if float(getattr(config, "geotex_distill_w", 0.0)) > 0 and not _gt_scratch:
+                    # Teacher = a SECOND copy of the S1 geo weights, frozen, run
+                    # ONE-WAY (it never learned to read tex, so its function is
+                    # the pretrained specialist's). Non-child attribute so it
+                    # stays out of the state_dict and ZeRO partitioning — the
+                    # same pattern this file uses for the frozen DINOv3.
+                    if _resume:
+                        _teacher = load_geo_teacher_from_run(_resume)
+                    else:
+                        from trellis2_blip3o.unified_geotex import _load_prefixed_state
+                        from blip3o.model.multimodal_decoder.builder import build_shape_slat_512
+                        class _C2:
+                            trellis_shape_slat_ckpt = None
+                        _teacher = build_shape_slat_512(_C2())
+                        _teacher.load_state_dict(_load_prefixed_state(
+                            config.geotex_shape_init, "shape_slat_512."), strict=True)
+                        _teacher.requires_grad_(False).eval()
+                    object.__setattr__(self, "_geo_teacher", _teacher)
+                    rank0_print("[geotex] S2b self-distill teacher built (frozen S1 geo)")
+                rank0_print(f"[geotex] S2b: geo UNFROZEN "
+                            f"(geo_loss_w={config.geotex_geo_loss_w} "
+                            f"distill_w={config.geotex_distill_w})")
+            rank0_print(f"[geotex] unified assembled: shape={config.geotex_shape_init} "
+                        f"tex={config.geotex_tex_init} coupling={config.geotex_coupling} "
+                        f"(geo frozen, tex GC on)")
         if config.build_slat and _stages in ("all", "shape", "tex"):
             # Attribute names keep the "_512" suffix for cross-file compatibility; the
             # underlying flow is the 1024 variant when slat_resolution=1024 (manifest
@@ -283,7 +464,9 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # Both map (B,T,vlm_dim)→(B,T,1024) with a dist-matched output LayerNorm; the adapter adds
         # self-attn capacity to the language→generation interface (i1 §3.1). Named diffusion_connector
         # either way → always-trainable (train_native flow-freeze) + saved/loaded with the ckpt.
-        if getattr(config, "cond_adapter", "mlp") == "xf2":
+        if _stages == "geotex" and not _gt_scratch:
+            pass  # both connectors already loaded from the two warm-start ckpts above
+        elif getattr(config, "cond_adapter", "mlp") == "xf2":
             from trellis2_blip3o.connector import TRELLIS2TransformerAdapter
             self.diffusion_connector = TRELLIS2TransformerAdapter(
                 vlm_hidden_dim=config.vlm_hidden_size,
@@ -790,6 +973,78 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # drop chat-template boilerplate from the flow cond (keep caption + image patches only)
         if cond_keep_mask is not None and cond_key_mask is not None:
             cond_key_mask = cond_key_mask & cond_keep_mask.to(cond_key_mask.device, torch.bool)
+
+        # ── unified geo-tex path (train_stages="geotex") ─────────────────────
+        # Bypasses the cascade entirely: (t_s,t_x) pair sampling + noised-geo-GT
+        # concat_cond + tex-velocity loss live in compute_unified_geotex_loss.
+        # Geo cond runs the FROZEN geo-run connector (deterministic, no drops);
+        # tex cond runs the trained connector with the production dropout stack.
+        if self.unified_geotex is not None:
+            if target_shape_slat_512 is None or target_tex_slat_512 is None:
+                raise ValueError(
+                    "[geotex] batch missing target_shape_slat_512/target_tex_slat_512 — "
+                    "the unified loss needs BOTH GT SLATs; train on tex-full data (the "
+                    "same s3 tex mixture) so every batch carries both.")
+            _fuse = getattr(self.config, "fuse_dino", False)
+            # the self-distill teacher is a NON-CHILD attribute (kept off the
+            # state_dict and out of ZeRO partitioning), so model.to(device)
+            # never moves it — lazy-move on first use, same as the frozen
+            # DINOv3 extractor above.
+            _teacher = getattr(self, "_geo_teacher", None)
+            if _teacher is not None:
+                _dev = target_shape_slat_512.feats.device
+                if next(_teacher.parameters()).device != _dev:
+                    _teacher.to(_dev)
+            loss, glogs = flow_heads.compute_unified_geotex_loss(
+                unified_model=self.unified_geotex,
+                connector_geo=self.geo_connector,
+                connector_tex=self.diffusion_connector,
+                loss_fn_slat=self._loss_fn_slat,
+                cond_hidden=cond_hidden,
+                cond_key_mask=cond_key_mask,
+                target_shape_slat_512=target_shape_slat_512,
+                target_tex_slat_512=target_tex_slat_512,
+                dino_hidden=dino_hidden if _fuse else None,
+                dino_key_mask=dino_keep_mask.bool()
+                    if (dino_keep_mask is not None and _fuse) else None,
+                dino_view_ids=dino_view_ids if _fuse else None,
+                qwen_view_ids=qwen_view_ids if _fuse else None,
+                dino_view_embed=self.dino_view_embed if _fuse else None,
+                mask_drop_prob=_mask_drop,
+                dino_drop_prob=float(getattr(self.config, "dino_drop_prob", 0.0))
+                    if self.training else 0.0,
+                qwen_drop_prob=float(getattr(self.config, "qwen_drop_prob", 0.0)),
+                cond_max_length=self.config.cond_max_length,
+                p_corner=float(self.config.geotex_p_corner),
+                p_corner2=float(getattr(self.config, "geotex_p_corner2", 0.2)),
+                p_band=float(self.config.geotex_p_band),
+                p_lag=float(getattr(self.config, 'geotex_p_lag', 0.0)),
+                p_marg_s=float(getattr(self.config, 'geotex_p_marg_s', 0.0)),
+                # "unfreeze" gates the geo loss because in a WARM START geo is
+                # frozen by default. From scratch nothing is frozen and the flag
+                # is meaningless — but leaving the gate as-is would silently
+                # train geo with NO loss of its own, shaped only by what leaks
+                # back through the tex loss. That is precisely the failure the
+                # geo term exists to prevent (see flow_heads: "geo would be
+                # optimized to SERVE tex"), and it would look like a healthy run.
+                geo_loss_w=(float(getattr(self.config, "geotex_geo_loss_w", 0.0))
+                            if (getattr(self.config, "geotex_unfreeze_geo", False)
+                                or getattr(self.config, "geotex_from_scratch", False))
+                            else 0.0),
+                geo_teacher=_teacher,
+                # Self-distillation is warm-start-only by nature: there is no S1
+                # geo to distil from. _teacher is None from scratch, so the term
+                # is skipped either way; zero it here so the log says so too.
+                distill_w=(float(getattr(self.config, "geotex_distill_w", 0.0))
+                           if (getattr(self.config, "geotex_unfreeze_geo", False)
+                               and not getattr(self.config, "geotex_from_scratch", False))
+                           else 0.0),
+                distill_lo=float(getattr(self.config, "geotex_distill_lo", 0.1)),
+                distill_hi=float(getattr(self.config, "geotex_distill_hi", 1.0)),
+            )
+            loss = loss * float(self.config.flow_weight)
+            self._last_diag = {f"per_stage/{k}": float(v) for k, v in glogs.items()}
+            return CausalLMOutputWithPast(loss=loss, logits=None)
 
         # 1b. dual-branch: build the DINOv3 anchor (image/multi-image) or a null token (text)
         # and stash it on the router so each SS block's ORIGINAL cross-attn gets DINOv3 while
