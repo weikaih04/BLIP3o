@@ -299,9 +299,23 @@ class _ThreeDTaskBase(Dataset):
             if path is None:
                 continue
             img = Image.open(path)
-            if self.crop_to_object and img.mode == "RGBA":
-                img = self._alpha_crop(img)
-            img = img.convert("RGB")
+            if img.mode == "RGBA":
+                # TRELLIS.2's own preprocess_image (pipelines/trellis2_image_to_3d.py
+                # :137-161), step for step: cap the long side at 1024, take the tight
+                # square alpha bbox, then composite RGB*alpha onto BLACK. The last
+                # step is the one that matters — convert("RGB") drops alpha outright,
+                # which leaves un-attenuated anti-aliased edge pixels around the
+                # silhouette that the released DINOv3 conditioning never sees.
+                m = max(img.size)
+                if m > 1024:
+                    sc = 1024 / m
+                    img = img.resize((int(img.width * sc), int(img.height * sc)),
+                                     Image.LANCZOS)
+                if self.crop_to_object:
+                    img = self._alpha_crop(img)
+                img = self._composite_black(img)
+            else:
+                img = img.convert("RGB")
             # Safety: upscale any degenerate / tiny image to a processor-safe size
             # (smart_resize needs ≥ one patch; a 1×1 crop → div-by-zero).
             w, h = img.size
@@ -314,17 +328,31 @@ class _ThreeDTaskBase(Dataset):
         return out
 
     @staticmethod
+    def _composite_black(img: Image.Image) -> Image.Image:
+        """RGB * alpha, i.e. composite onto black — TRELLIS.2's preprocess_image:160."""
+        a = np.array(img).astype(np.float32) / 255.0
+        rgb = a[:, :, :3] * a[:, :, 3:4]
+        return Image.fromarray((rgb * 255).astype(np.uint8))
+
+    @staticmethod
     def _alpha_crop(img: Image.Image) -> Image.Image:
         a = np.array(img.getchannel("A"))
-        ys, xs = np.where(a > 0)
+        # 0.8*255, not >0: the official bbox ignores the near-transparent halo, so a
+        # faint stray pixel cannot blow the crop box out and shrink the object.
+        ys, xs = np.where(a > 0.8 * 255)
+        if ys.size == 0:                       # nothing solid — fall back to any coverage
+            ys, xs = np.where(a > 0)
         if ys.size == 0:
             return img
         x0, x1 = int(xs.min()), int(xs.max())
         y0, y1 = int(ys.min()), int(ys.max())
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        # Half-size: never let a thin/single-pixel object collapse the box to 0.
-        h = max(x1 - x0, y1 - y0, 1) / 2.0
-        box = (int(cx - h), int(cy - h), int(cx + h), int(cy + h))
+        # `size // 2` on BOTH sides, exactly as preprocess_image:157-159 — not
+        # ±size/2, which rounds to a box one pixel wider on odd extents and made
+        # our crop differ from the released one on 5 of 8 sampled assets.
+        # max(..., 2) keeps a thin/single-pixel object from collapsing the box.
+        half = max(x1 - x0, y1 - y0, 2) // 2
+        box = (cx - half, cy - half, cx + half, cy + half)
         cropped = img.crop(box)
         # crop() can still yield a tiny image; the _load_views min-size guard
         # backstops it, but bail to the original if somehow empty.
