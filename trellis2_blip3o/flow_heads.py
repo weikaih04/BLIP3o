@@ -465,10 +465,23 @@ def sample_timestep_pairs(B: int, device, p_corner: float = 0.2,
     nothing in the log to say so. All four extra knobs are deleted; the
     invariant is now structural.
 
-    Uniform on the triangle = sort two uniforms. The old `t_s = t_x * rand` was
-    NOT uniform despite its docstring: density 1/t_x, mass piled where the
-    TEXTURE IS CLEAN, i.e. exactly where the geometry stream can lean on it.
-    Measured over 1M draws: E[t_x] 0.500 vs 0.667, P(t_x > 0.9) 10.0% vs 19.0%.
+    THE DRAW IS NOT UNIFORM ON THE TRIANGLE, and that is deliberate. Sorting two
+    uniforms (t_s=min, t_x=max) gives the triangle its uniform measure, but it
+    also makes t_s the MINIMUM — E[t_s] 0.333 and only 1.0% of samples above 0.9.
+    The geometry stream would then spend 99% of training in the low-noise regime,
+    where its own x_s already carries the answer and the image is unnecessary.
+    Meanwhile t_x is the MAXIMUM: 19% above 0.9, where the image is the only
+    source. Measured on the 2026-08-18 probe, that is exactly what the two
+    streams learned — texture reached cond-sensitivity 1.76 in 2000 steps while
+    geometry sat at 1.01 after 5700. Same attention, same cond, same rope; the
+    only difference was the noise each one was fed. (It also rules RoPE out: the
+    one-sided rotation applies identically to both streams, so it cannot explain
+    an asymmetry this large.)
+
+    Drawing t_s ~ U[0,1] FIRST and then t_x ~ U[t_s, 1] keeps t_s <= t_x while
+    restoring t_s's uniform marginal: 10% of samples above 0.9 instead of 1%, a
+    10x increase in the regime the rollout starts from. t_x only gets noisier
+    (33% above 0.9), so the texture stream loses nothing.
 
     Defaults 0.2 / 0.2 measured over 600k draws: geometry supervised on 80% of
     samples (the t_s=0 edge gives it no loss), 25% at t_x exactly 1 and 14% in
@@ -477,15 +490,23 @@ def sample_timestep_pairs(B: int, device, p_corner: float = 0.2,
     """
     assert p_corner + p_corner2 <= 1.0 + 1e-6, (
         f"p_corner {p_corner} + p_corner2 {p_corner2} > 1")
-    a = torch.rand(B, device=device)
-    b = torch.rand(B, device=device)
-    t_s = torch.minimum(a, b)          # geometry: cleaner
-    t_x = torch.maximum(a, b)          # texture: noisier
+    t_s = torch.rand(B, device=device)                  # uniform marginal
+    t_x = t_s + (1.0 - t_s) * torch.rand(B, device=device)   # >= t_s by construction
     u = torch.rand(B, device=device)
+    edge_s = u < p_corner                                    # t_s = 0 edge
+    edge_x = (u >= p_corner) & (u < p_corner + p_corner2)    # t_x = 1 edge
     # pin the two edges; anything not claimed keeps the triangle interior
-    t_x = torch.where((u >= p_corner) & (u < p_corner + p_corner2),
-                      torch.ones_like(t_x), t_x)
-    t_s = torch.where(u < p_corner, torch.zeros_like(t_s), t_s)
+    t_x = torch.where(edge_x, torch.ones_like(t_x), t_x)
+    # The t_s=0 edge needs t_x REDRAWN, not inherited. t_x above is the max of two
+    # uniforms, so keeping it here leaves the edge with density -ln(1-t_x): 3.5x
+    # over-sampled at t_x=0.95 and 0.24x at t_x=0.21. That edge IS the shipped
+    # texture|given-mesh rollout (and, with refine_tex, half of joint's tex
+    # forwards), whose last step covers 21% of the trajectory and was getting
+    # 2.5% of the samples. Once t_s is 0 the t_x >= t_s constraint is vacuous, so
+    # the correct marginal is the uniform official trains on
+    # (configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json: "uniform").
+    t_x = torch.where(edge_s, torch.rand(B, device=device), t_x)
+    t_s = torch.where(edge_s, torch.zeros_like(t_s), t_s)
     return t_s, t_x
 
 

@@ -51,6 +51,7 @@ class EMACallback(TrainerCallback):
         self.decay = decay
         self.shadow = None      # {param_name: fp32 tensor on device}
         self._base = None
+        self._n = 0             # EMA updates so far — drives the warmup below
 
     @staticmethod
     def _unwrap(m):
@@ -69,10 +70,22 @@ class EMACallback(TrainerCallback):
         self.shadow = {n: p.detach().clone().float() for n, p in self._trainable()}
         print(f"[EMA] tracking {len(self.shadow)} trainable tensors, decay={self.decay}")
 
+    def _decay_at(self, n: int) -> float:
+        """Warmed-up decay: min(decay, (1+n)/(10+n)).
+
+        A bare 0.9999 has a time constant of 10k updates, so on a 10k-step run the
+        shadow is still 0.9999**10000 = 36.8% the RANDOM INIT when it is written
+        out — v7's ema.safetensors is that. Official uses 0.9999 too, but over 1M
+        steps, where the init leaks e^-100. The warmup makes the shadow track the
+        model from update 0 and reach the nominal decay by ~n=1e5, so the same
+        number stays correct at both run lengths."""
+        return min(self.decay, (1.0 + n) / (10.0 + n))
+
     def on_step_end(self, args, state, control, model=None, **kw):
         if self.shadow is None:
             return
-        d = self.decay
+        d = self._decay_at(self._n)
+        self._n += 1
         with torch.no_grad():
             for n, p in self._trainable():
                 self.shadow[n].mul_(d).add_(p.detach().float(), alpha=1.0 - d)
