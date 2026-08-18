@@ -333,12 +333,20 @@ class MMDiT3D(nn.Module):
     def __init__(self, dim: int = 768, num_heads: int = 6,
                  depth_double: int = 8, depth_single: int = 16,
                  gen_channels: Optional[Dict[str, int]] = None,
-                 cond_ch: int = 1024, mlp_ratio: float = 5.3334,
-                 concat_cond: bool = False, use_checkpoint: bool = True,
+                 cond_ch: int = 1024, mlp_ratio: float = 5.375,
+                 concat_cond: bool = False, pooled_cond: bool = True,
+                 use_checkpoint: bool = True,
                  initialization: str = "scaled", dtype: str = "float32"):
-        # mlp_ratio 5.3334 and initialization="scaled" are the RELEASED values
-        # (slat_flow_img2shape_dit_1_3B_512_bf16.json:13,16). We shipped 4.0 +
-        # vanilla xavier by mistake; audited 2026-08-17.
+        # mlp_ratio 5.375, NOT the released 5.3334. The released number is not a
+        # ratio anyone chose — it is 16/3, picked so that the official width
+        # 1536 * 16/3 lands exactly on 8192. At our dim=1024 the same ratio
+        # gives hidden 5461 = 43*127, which no tensor-core tile divides:
+        # measured 2.619 s/step against 1.600 for mlp 4.0 (hidden 4096).
+        # Rounding up to 5.375 -> hidden 5504 (64*86) costs 5M MORE parameters
+        # and runs at 1.670 s/step, i.e. 57% faster than the "official" ratio.
+        # What to copy from the release is an ALIGNED hidden width, not 16/3.
+        # initialization="scaled" is the released value; we shipped 4.0 +
+        # vanilla xavier by mistake, audited 2026-08-17.
         super().__init__()
         # LATENT widths, both 32. The tex specialist's config says in 64 / out 32
         # because its 64 is tex(32) + the concatenated shape latent(32) — that
@@ -390,6 +398,33 @@ class MMDiT3D(nn.Module):
         # asymmetric, so (t_s, t_x) and (t_x, t_s) do not collide.
         self.cond_flow.t_embedder = None
         self.cond_t = nn.ModuleDict({n: TimestepEmbedder(dim) for n in self.gen_names})
+        # MMDiT's SECOND conditioning path, which this model was missing.
+        #
+        # Condition tokens reach a voxel only as extra attention keys, and that
+        # whole attention output is scaled by gate_msa = modulation + adaLN(t).
+        # adaLN is zero-initialised and modulation is randn(6C)/sqrt(C), so at
+        # dim=1024 the gate opens at |g| ~ 0.026: the image arrives at ~1/39 of
+        # full strength and has to push the gate open before it means anything.
+        # Every shipped comparable model gives conditioning a route that the
+        # gate cannot close — TRELLIS.2 and the released Hunyuan3D-2.1 through
+        # an ungated cross-attention residual, SD3 and FLUX by adding a POOLED
+        # condition vector to the timestep embedding, which is what produces
+        # shift/scale/gate in the first place. Only the second one is available
+        # to a single-softmax MMDiT, so it is what we copy, from
+        # diffusers/models/embeddings.py:1601-1609 (SD3) and :1632-1633 (FLUX):
+        #
+        #     text_embedder = PixArtAlphaTextProjection(pooled_dim, dim, "silu")
+        #                   = Linear -> SiLU -> Linear      (:2213-2222)
+        #     conditioning  = timesteps_emb + text_embedder(pooled)
+        #
+        # Their pooled vector is CLIP's pooled output; ours is the mean over the
+        # condition tokens that survived the drop curriculum, which is defined
+        # in every mode (DINO-dropped, Qwen-dropped, and the CFG-uncond branch)
+        # where a fixed slot such as DINO's CLS would not be.
+        self.pooled_cond = pooled_cond
+        self.cond_pool = nn.Sequential(
+            nn.Linear(cond_ch, dim), nn.SiLU(), nn.Linear(dim, dim),
+        ) if pooled_cond else None
         self.shared_blocks = nn.ModuleList(
             [_make_block(dim, num_heads, mlp_ratio) for _ in range(depth_single)])
         for tw in self._towers():
@@ -482,6 +517,12 @@ class MMDiT3D(nn.Module):
         for te in self.cond_t.values():
             nn.init.normal_(te.mlp[0].weight, std=0.02)
             nn.init.normal_(te.mlp[2].weight, std=0.02)
+        if self.cond_pool is not None:
+            # It is summed with t_embedder's output, so it gets t_embedder's
+            # scale (structured_latent_flow.py:153-154) rather than the body's.
+            for lin in (self.cond_pool[0], self.cond_pool[2]):
+                nn.init.normal_(lin.weight, std=0.02)
+                nn.init.zeros_(lin.bias)
 
     def initialize_weights(self) -> None:
         """structured_latent_flow.py:101-126: xavier bodies (:106), timestep
@@ -513,6 +554,10 @@ class MMDiT3D(nn.Module):
         for te in self.cond_t.values():          # cond's embedders too
             nn.init.normal_(te.mlp[0].weight, std=0.02)
             nn.init.normal_(te.mlp[2].weight, std=0.02)
+        if self.cond_pool is not None:            # summed with them, same scale
+            for lin in (self.cond_pool[0], self.cond_pool[2]):
+                nn.init.normal_(lin.weight, std=0.02)
+                nn.init.zeros_(lin.bias)
 
     # ── contract: elastic activation checkpointing ─────────────────────────
     def register_memory_controller(self, controller):
@@ -575,6 +620,27 @@ class MMDiT3D(nn.Module):
         ctrl.update_run_states(n, exact)
         return out
 
+    @staticmethod
+    def _cond_list(cond_x):
+        """cond as a per-sample list of (T_b, cond_ch), whatever it arrived as."""
+        if torch.is_tensor(cond_x):
+            return list(cond_x.unbind(0))
+        if isinstance(cond_x, sp.VarLenTensor):
+            return [cond_x.feats[sl] for sl in cond_x.layout]
+        return cond_x
+
+    def _pooled_cond(self, cond_list):
+        """SD3's `text_embedder(pooled_projection)` — embeddings.py:1607.
+
+        Mean over each sample's surviving condition rows. flow_heads has already
+        removed padding and curriculum-dropped tokens (_masked_list), so this is
+        a plain mean, and it stays consistent between training and sampling
+        because both pool the SAME tensor the attention keys come from — the CFG
+        uncond branch included, whose pooled vector is simply the pooled
+        [zeros(DINO); connector(0)] it is built from."""
+        pooled = torch.stack([c.mean(0) for c in cond_list])       # (B, cond_ch)
+        return self.cond_pool(pooled.to(self.cond_pool[0].weight.dtype))
+
     def _pack_cond(self, cond_x):
         """cond must be a SparseTensor, not a VarLenTensor: TRELLIS's fused
         modulate/gate kernels index a spatial cache only SparseTensor carries,
@@ -591,10 +657,7 @@ class MMDiT3D(nn.Module):
         flow_heads has ALREADY dropped padded and curriculum-dropped tokens
         (`_masked_list`, flow_heads.py:575) and hands us a per-sample list, so
         there is no mask to apply here."""
-        if torch.is_tensor(cond_x):
-            cond_x = list(cond_x.unbind(0))
-        if isinstance(cond_x, sp.VarLenTensor):
-            cond_x = [cond_x.feats[sl] for sl in cond_x.layout]
+        cond_x = self._cond_list(cond_x)
         rows, coords = [], []
         dt = self.cond_flow.input_layer.weight.dtype
         for b, c in enumerate(cond_x):
@@ -622,6 +685,11 @@ class MMDiT3D(nn.Module):
         x = {"geo": x_s, "tex": x_x}
         t = {"geo": t_s, "tex": t_x}
         hs, mods, turns = [], [], []
+        cond_list = self._cond_list(cond_x)
+        # SD3 feeds ONE `conditioning` vector to every stream's norm1 (its
+        # norm1 and norm1_context take the same temb, attention.py:203-211), so
+        # the pooled term is computed once and added to all three here.
+        vec = self._pooled_cond(cond_list) if self.cond_pool is not None else None
         for n in self.gen_names:
             tw, xn = getattr(self, f"{n}_flow"), x[n]
             if self.concat_cond and n == "tex" and "geo" in self.gen_names:
@@ -636,14 +704,19 @@ class MMDiT3D(nn.Module):
             # the adaLN, exactly where SLatFlowModel does it (:183, :187).
             h = manual_cast(tw.input_layer(xn), self.dtype)
             hs.append(h)
-            mods.append(manual_cast(tw.adaLN_modulation(tw.t_embedder(t[n])), self.dtype))
+            emb = tw.t_embedder(t[n])
+            if vec is not None:
+                emb = emb + vec.to(emb.dtype)      # embeddings.py:1609
+            mods.append(manual_cast(tw.adaLN_modulation(emb), self.dtype))
             turns.append(torch.full((h.feats.shape[0],), SEGMENTS[n],
                                     dtype=torch.int32, device=h.feats.device))
-        hc = self._pack_cond(cond_x)
+        hc = self._pack_cond(cond_list)
         # SparseLinear takes the SparseTensor, not .feats
         hs.append(manual_cast(self.cond_flow.input_layer(hc), self.dtype))
-        mods.append(manual_cast(self.cond_flow.adaLN_modulation(
-            sum(self.cond_t[n](t[n]) for n in self.gen_names)), self.dtype))
+        cemb = sum(self.cond_t[n](t[n]) for n in self.gen_names)
+        if vec is not None:
+            cemb = cemb + vec.to(cemb.dtype)
+        mods.append(manual_cast(self.cond_flow.adaLN_modulation(cemb), self.dtype))
         turns.append(self._cond_turns(hs[-1]))
         return hs, mods, turns
 

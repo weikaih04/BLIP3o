@@ -141,8 +141,11 @@ def load_scratch(ckpt, ema=False):
     # keeps every earlier checkpoint loadable instead of dying on a shape error.
     tex_in = uni_sd["tex_flow.input_layer.weight"].shape[1]
     cc = tex_in == 2 * uni_sd["geo_flow.input_layer.weight"].shape[1]
+    # pooled_cond likewise: it landed on 2026-08-18 and defaults ON, so every
+    # checkpoint written before it has no cond_pool.* and must build without one.
+    pc = "cond_pool.0.weight" in uni_sd
     m = MMDiT3D(dim=dim, num_heads=dim // 128, depth_double=nd, depth_single=ns,
-                mlp_ratio=mlp_hidden / dim, concat_cond=cc)
+                mlp_ratio=mlp_hidden / dim, concat_cond=cc, pooled_cond=pc)
     m.load_state_dict(uni_sd, strict=True)
     m = m.cuda().eval()
     m.convert_to(torch.bfloat16)   # torso only; the sampler feeds fp32 latents
@@ -157,7 +160,8 @@ def load_scratch(ckpt, ema=False):
 
     dve = sd.get("dino_view_embed")
     dve = dve.cuda().float() if dve is not None else None
-    print(f"[overfit] {ckpt}: dim={dim} {nd} triple + {ns} shared · "
+    print(f"[overfit] {ckpt}: pooled_cond={pc} · "
+          f"dim={dim} {nd} triple + {ns} shared · "
           f"vlm_dim={vlm_dim} · dino_view_embed={'yes' if dve is not None else 'no'}")
     return m, conn, dve
 

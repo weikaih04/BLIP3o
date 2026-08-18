@@ -311,12 +311,16 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 num_heads=int(getattr(config, "geotex_heads", 6)),
                 depth_double=int(getattr(config, "geotex_depth_double", 8)),
                 depth_single=int(getattr(config, "geotex_depth_single", 16)),
-                mlp_ratio=float(getattr(config, "geotex_mlp_ratio", 5.3334)),
+                mlp_ratio=float(getattr(config, "geotex_mlp_ratio", 5.375)),
                 initialization=str(getattr(config, "geotex_init", "scaled")),
                 # False since 2026-08-17 — the per-voxel shape concat is the
                 # cascade's mechanism and measures at 2% here, while it is the
                 # only structural asymmetry between the two generated streams.
-                concat_cond=bool(getattr(config, "geotex_concat_cond", False)))
+                concat_cond=bool(getattr(config, "geotex_concat_cond", False)),
+                # SD3/FLUX's pooled-condition -> adaLN path. Default ON: without
+                # it the image reaches a voxel only through gate_msa, which
+                # opens at |g| ~ 0.026 (see MMDiT3D.__init__).
+                pooled_cond=bool(getattr(config, "geotex_pooled_cond", True)))
             # ONE cond stream ⇒ one connector. It is the standard-named
             # diffusion_connector, built fresh a few dozen lines below by the
             # ordinary (non-geotex) path, so EMA/save/load conventions hold.

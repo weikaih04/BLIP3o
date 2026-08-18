@@ -452,6 +452,7 @@ class NativeArgs:
     geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
     # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
     geotex_concat_cond: bool = field(default=False)  # cascade-legacy shape concat into tex
+    geotex_pooled_cond: bool = field(default=True)   # SD3/FLUX pooled cond -> adaLN modulation
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
@@ -632,6 +633,7 @@ def main():
         geotex_p_corner=native_args.geotex_p_corner,
         geotex_p_corner2=native_args.geotex_p_corner2,
         geotex_concat_cond=native_args.geotex_concat_cond,
+        geotex_pooled_cond=native_args.geotex_pooled_cond,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
         qwen_drop_prob=native_args.qwen_drop_prob,
