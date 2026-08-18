@@ -437,11 +437,8 @@ class NativeArgs:
     geotex_distill_hi: float = field(default=1.0)
     geotex_p_corner: float = field(default=0.4)  # user 2026-08-11: flagship tex|mesh mass; 0.2 = A1
     geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
-    geotex_p_band: float = field(default=0.0)
     # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
     geotex_concat_cond: bool = field(default=False)  # cascade-legacy shape concat into tex
-    geotex_p_lag: float = field(default=0.0)      # t_s~U[0,t_x] over the upper triangle
-    geotex_p_marg_s: float = field(default=0.0)   # t_s=1 edge (tex marginal / free modality-CFG)
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
@@ -621,10 +618,7 @@ def main():
         geotex_distill_hi=native_args.geotex_distill_hi,
         geotex_p_corner=native_args.geotex_p_corner,
         geotex_p_corner2=native_args.geotex_p_corner2,
-        geotex_p_band=native_args.geotex_p_band,
         geotex_concat_cond=native_args.geotex_concat_cond,
-        geotex_p_lag=native_args.geotex_p_lag,
-        geotex_p_marg_s=native_args.geotex_p_marg_s,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
         qwen_drop_prob=native_args.qwen_drop_prob,
@@ -684,7 +678,7 @@ def main():
                 if p.requires_grad and not (n.startswith(_allowed) or n in _exact)]
         assert not _bad, f"[geotex] unexpected trainable params: {_bad[:8]}"
         print(f"[geotex] freeze audit OK — coupling={native_args.geotex_coupling} "
-              f"p_corner={native_args.geotex_p_corner} p_band={native_args.geotex_p_band}")
+              f"p_corner={native_args.geotex_p_corner} p_corner2={native_args.geotex_p_corner2}")
         # dino_view_embed is a FIXED buffer whose scale is an env var at build time
         # (t50b ckpts: sincos × VIEW_EMBED_SCALE=0.2, L2/row 4.531). Restore the tex
         # run's exact table so the warm-started connector sees the values it was

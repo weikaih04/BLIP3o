@@ -18,7 +18,7 @@
 #
 # Usage: bash scripts/train_native_geotex.sh [NPROC=8]
 #   env: PER_GPU_BS(4) MAX_STEPS(3000) LR(5e-5) RUN_TAG(v1) WORKERS(10)
-#        COUPLING(union) P_CORNER(0.2) P_LAG(0.4) DINO_DROP(0.0) EMA(0.9999)
+#        COUPLING(union) P_CORNER(0.2) P_CORNER2(0.3) DINO_DROP(0.0) EMA(0.9999)
 #        MIX(configs/mix_s3_multitask_xgenmm.yaml) REPORT_TO(wandb)
 #        DEEPSPEED(configs/deepspeed_zero1.json) EFF_BS(256) EXTRA_ARGS
 #   Long runs go through sbatch (scripts/geotex_s1.sbatch) — srun-on-a-hold gets
@@ -52,35 +52,55 @@ XATTN_ANNEAL_END="${XATTN_ANNEAL_END:-0}"
 # value. Measured at 50k steps, tex|GT-mesh is the ONLY mode under MSE 1.0
 # (0.971) while joint geo 1.167 / mesh-only 1.171 lag, so the freed 20% is worth
 # more in the joint region than in the mode that is already ahead.
-P_CORNER="${P_CORNER:-0.2}"   # MF-exact; 0.4 = the warm-start-era value (A1 arm)
-P_CORNER2="${P_CORNER2:-0.2}" # t_x=1 corner (mesh-only marginal; bidir design)
-P_BAND="${P_BAND:-0.0}"
-# A6 sampler arms (default OFF = the S1/S2b recipe). Proposed A6 arm:
-#   P_LAG=0.35 P_MARG_S=0.05  → tex-ahead mass 20%→5% (only the t_s=1 CFG edge)
-# The (t_s, t_x) square puts P(t_s > t_x) = 30% of the batch where NO inference
-# mode ever goes (every mode keeps t_s <= t_x). P_LAG draws t_s ~ U[0, t_x]
-# instead, moving that mass onto the manifold. Measured 2026-08-17; lowering
-# P_CORNER 0.4->0.2 had RAISED the waste from 20% to 30%.
-P_LAG="${P_LAG:-0.4}"
-P_MARG_S="${P_MARG_S:-0.0}"
-BIDIR="${BIDIR:-True}"        # corner-masked bidirectional geo<->tex (user topology 2026-08-11)
-FUSED="${FUSED:-True}"        # fused MMDiT attention: 1 native varlen call/lane; MFU 18.7%->30.0%
+# ── (t_s, t_x) 采样：只有两个旋钮 ──────────────────────────────────────────
+# The joint regime is ALWAYS uniform on the upper triangle (t_s <= t_x) — it is
+# the DEFAULT DRAW in sample_timestep_pairs, not something you assemble out of
+# probabilities. Every inference mode keeps t_s <= t_x, so t_s > t_x is a region
+# that is never visited; the old parameterisation reached the triangle only if
+# P_CORNER + P_CORNER2 + P_LAG happened to sum to 1, and the 2026-08-16 run
+# missed it — 33% of every geometry-supervised sample landed at t_s > t_x.
+# P_LAG is deleted: the triangle is now structural.
+#
+# These two only PIN THE TWO EDGES of that triangle; whatever is left over is
+# the triangle's interior.
+P_CORNER="${P_CORNER:-0.2}"   # t_s=0 edge: texture | given geometry, the flagship
+                              # product mode. Geometry gets NO loss here, so this
+                              # is pure cost to the geometry stream — 0.4 (the
+                              # warm-start-era value) left it only 60% supervised.
+P_CORNER2="${P_CORNER2:-0.2}" # t_x=1 edge: texture carries NOTHING. NOT raised above
+                              # 0.2, even though that edge is "the inference
+                              # regime": with rescale_t=3 the alpha=32 rollout has
+                              # t_x > 0.9 for 11 of its 12 steps, but only step 1
+                              # sits at t_x EXACTLY 1 — the other 10 live in the
+                              # BAND (0.9, 1.0), which the triangle interior
+                              # supplies, not this edge. Measured share of
+                              # geometry-supervised samples landing in that band:
+                              # 14% at 0.2/0.2/0.6 vs 11% at 0.2/0.3/0.5, i.e.
+                              # raising this edge SHRINKS the region the
+                              # trajectory actually occupies.
+# Modality dropout, SYMMETRIC at 0.1 each (user 2026-08-18). They are mutually
+# exclusive in flow_heads (`qdrop = rand < p & ~ddrop`), so full conditioning is
+# 0.9 * 0.8 = 72% — the released pipeline has one dropout and 90%, but it has one
+# conditioning source and we have two.
+#   QWEN_DROP forces the flow onto DINO's 1029 patch tokens, the only spatially
+#   precise signal we have and the one geometry needs.
+#   DINO_DROP is the mirror. It is on symmetry grounds, NOT evidence: measured on
+#   checkpoint-60000, removing DINO costs texture 11.4% and geometry only 3.5%,
+#   i.e. the geometry stream is ALREADY ignoring it. 0.3 (what the 60K run
+#   actually trained with) creates a third regime — "Qwen present, DINO absent" —
+#   on 27% of samples, which CFG inference never uses. If the probe shows
+#   cond_sens_geo flat, zero this first.
+DINO_DROP="${DINO_DROP:-0.1}"
+QWEN_DROP="${QWEN_DROP:-0.1}"
 GC="${GC:-1.0}"               # STATIC fallback fraction (only used when ELASTIC=False)
-# Elastic GC = TRELLIS's LinearMemoryController picks how many blocks to
-# checkpoint per step from a fitted memory model (production default for
-# shape/tex; measured 370.8 -> 306.5 ms/sample here). ELASTIC=False falls back
-# to the static GC fraction above.
 ELASTIC="${ELASTIC:-True}"
 ELASTIC_RATIO="${ELASTIC_RATIO:-0.75}"
-# ── S2b: unfreeze geo (geo velocity loss + MF self-distill + G3 red line) ──
 UNFREEZE_GEO="${UNFREEZE_GEO:-False}"
 GEO_LOSS_W="${GEO_LOSS_W:-1.0}"
 DISTILL_W="${DISTILL_W:-1.0}"
-# 0 = released behaviour. TRELLIS.2 has ONE cond dropout (p_uncond 0.1, our
-# mask_drop_prob) and no separate DINO-segment drop; 0.3 left only 0.9*0.7=63%
-# of steps with the full cond (official: 90%). Audited 2026-08-17.
-DINO_DROP="${DINO_DROP:-0.0}"
-MIX="${MIX:-configs/mix_s3_multitask_xgenmm.yaml}"
+BIDIR="${BIDIR:-True}"        # corner-masked bidirectional geo<->tex (user topology 2026-08-11)
+FUSED="${FUSED:-True}"        # fused MMDiT attention: 1 native varlen call/lane; MFU 18.7%->30.0%
+MIX="${MIX:-configs/mix_s3_splits.yaml}"
 SHAPE_INIT="${SHAPE_INIT:-runs/s3_shape_t50b/checkpoint-8000}"
 TEX_INIT="${TEX_INIT:-runs/s3_tex_t50b/checkpoint-8000}"
 # ── FROM SCRATCH: three-stream sparse MMDiT (trellis2_blip3o/mmdit3d.py) ──
@@ -141,14 +161,14 @@ else DS_FLAG="--deepspeed $DS_CFG"; fi
 REPORT="${REPORT_TO:-wandb}"
 OUT="runs/geotex_s1${RUN_TAG:+_$RUN_TAG}"
 echo "[geotex] nproc=$NPROC bs=$PER_GPU_BS ga=$GA (eff $EFF_BS) coupling=$COUPLING"
-echo "         corner=$P_CORNER band=$P_BAND mix=$MIX out=$OUT"
+echo "         corner=$P_CORNER corner2=$P_CORNER2 mix=$MIX out=$OUT"
 echo "         shape=$SHAPE_INIT tex=$TEX_INIT"
 
 torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --vlm_model Qwen/Qwen3.5-2B \
   --mixture_config "$MIX" \
   --build_vlm False \
-  --fuse_dino True --dino_drop_prob "$DINO_DROP" \
+  --fuse_dino True --dino_drop_prob "$DINO_DROP" --qwen_drop_prob "$QWEN_DROP" \
   --cond_max_length 10240 \
   --train_stages geotex \
   --geotex_shape_init "$SHAPE_INIT" --geotex_tex_init "$TEX_INIT" \
@@ -162,8 +182,7 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_bidir "$BIDIR" --geotex_fused "$FUSED" --geotex_gc "$GC" \
   --geotex_unfreeze_geo "$UNFREEZE_GEO" --geotex_geo_loss_w "$GEO_LOSS_W" \
   --geotex_distill_w "$DISTILL_W" \
-  --geotex_p_corner "$P_CORNER" --geotex_p_corner2 "$P_CORNER2" --geotex_p_band "$P_BAND" \
-  --geotex_p_lag "$P_LAG" --geotex_p_marg_s "$P_MARG_S" \
+  --geotex_p_corner "$P_CORNER" --geotex_p_corner2 "$P_CORNER2" \
   --build_slat False --ss_only False --compile_ss_flow False \
   --elastic_slat "$ELASTIC" --elastic_target_ratio "$ELASTIC_RATIO" \
   --freeze_vlm True --flow_tune full \

@@ -35,7 +35,7 @@
 # built for the day the SWH cond cache exists.
 tasks:
   - name: image_to_3d
-    weight: 0.5
+    weight: 0.7
     args:
       manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/pool400k_train.jsonl
       slat_resolution: 512
@@ -44,7 +44,7 @@ tasks:
       cached_hidden_root: /fsx/home/weikai.huang/3dgen/data/vlm_hidden_cache/v22_3dvlm_tok1024_mv1
       fuse_dino: true
   - name: multi_image_to_3d
-    weight: 0.3
+    weight: 0.1
     args:
       manifest: /fsx/home/weikai.huang/3dgen/model/BLIP3o/manifests/splits/pool400k_train.jsonl
       slat_resolution: 512

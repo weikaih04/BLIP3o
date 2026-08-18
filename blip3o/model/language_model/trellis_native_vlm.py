@@ -153,10 +153,7 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         geotex_distill_hi: float = 1.0,         # distill weight at t_x->1 (tex pure noise)
         geotex_p_corner: float = 0.4,           # t_s=0 corner mass (user 2026-08-11: flagship-mode priority; MF-exact 0.2 = A1 arm)
         geotex_p_corner2: float = 0.2,          # t_x=1 corner (mesh-only marginal; MF's second corner, bidir design)
-        geotex_p_band: float = 0.0,             # A6-only leader-biased band (OFF = MF-faithful)
         geotex_concat_cond: bool = False,       # per-voxel shape concat into tex (cascade legacy)
-        geotex_p_lag: float = 0.0,              # A6-primary: uniform over the upper triangle
-        geotex_p_marg_s: float = 0.0,           # t_s=1 edge (tex marginal / free modality-CFG)
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
         flow_sigma_min: float = 1e-5,
@@ -226,10 +223,7 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.geotex_distill_hi = geotex_distill_hi
         self.geotex_p_corner = geotex_p_corner
         self.geotex_p_corner2 = geotex_p_corner2
-        self.geotex_p_band = geotex_p_band
         self.geotex_concat_cond = geotex_concat_cond
-        self.geotex_p_lag = geotex_p_lag
-        self.geotex_p_marg_s = geotex_p_marg_s
         self.fuse_dino = fuse_dino
         self.dino_drop_prob = dino_drop_prob
         self.qwen_drop_prob = qwen_drop_prob
@@ -1023,9 +1017,6 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 cond_max_length=self.config.cond_max_length,
                 p_corner=float(self.config.geotex_p_corner),
                 p_corner2=float(getattr(self.config, "geotex_p_corner2", 0.2)),
-                p_band=float(self.config.geotex_p_band),
-                p_lag=float(getattr(self.config, 'geotex_p_lag', 0.0)),
-                p_marg_s=float(getattr(self.config, 'geotex_p_marg_s', 0.0)),
                 # "unfreeze" gates the geo loss because in a WARM START geo is
                 # frozen by default. From scratch nothing is frozen and the flag
                 # is meaningless — but leaving the gate as-is would silently

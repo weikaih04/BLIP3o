@@ -438,114 +438,53 @@ def build_unified_cond(
     return cond, cond_key_mask, sdpa_mask, drop_mask
 
 
-def sample_timestep_pairs(
-    B: int,
-    device,
-    p_corner: float = 0.4,      # t_s=0 corner (user 2026-08-11: tex|mesh is the
-                                # flagship product mode — double MF's 0.2, which
-                                # is the A1 ablation arm).
-    p_corner2: float = 0.2,     # t_x=1 EXACT corner (bidir design 2026-08-11):
-                                # MF's second corner resurrected as the mesh-only
-                                # MARGINAL config (tex fed pure noise; diffuse at
-                                # t=1 returns ε exactly — no data leakage). Under
-                                # the bidirectional topology geo must learn/see
-                                # "tex = no information"; also trains tex at max
-                                # noise. 0 restores the single-corner scheme.
-    p_band: float = 0.0,        # OFF by default. Verified reference practice
-                                # (paper study jointdit_vs_modality_forcing):
-                                # MF = 60% joint with BOTH t drawn independently
-                                # (logit-normal mu=1.1) + 20% I2D + 20% D2I;
-                                # JointDiT = 50% diagonal + 50% independent, no
-                                # corners; UniDiffuser = 100% independent uniform.
-                                # None of the three restricts the joint region to
-                                # a lag triangle, so the default follows them.
-                                # KNOWN DEVIATION from our own design doc S5,
-                                # which specified 40% t_s~U[0,t_x] (lag) — that
-                                # arm was displaced when corner2 was added for
-                                # the bidirectional topology. Cost of the square:
-                                # p_band=0 puts ~20% of the batch at t_s > t_x,
-                                # which NO inference mode visits (all three stay
-                                # in t_s <= t_x); only the t_s=1 edge earns its
-                                # keep, as UniDiffuser's free modality-CFG uncond
-                                # branch. A6 = turn this band on and A/B it; it
-                                # generalizes JointDiT's diagonal (alpha=1 IS the
-                                # diagonal) up to alpha=32 strong-lead.
-    p_lag: float = 0.0,         # A6-primary: t_s ~ U[0, t_x] — UNIFORM over the
-                                # upper triangle, i.e. over the union of ALL
-                                # alpha-warp trajectories (design doc S5's
-                                # original lag regime). Preferred over p_band:
-                                # the band's log-uniform alpha gives density
-                                # ~1/t_s (t_s ∝ 1/alpha for large alpha), piling
-                                # mass next to the t_s=0 corner that already
-                                # holds 40% — double-investment. Uniform covers
-                                # every alpha the inference sweep may pick.
-    p_marg_s: float = 0.0,      # t_s=1 EXACT (geo = pure noise), t_x ~ U[0,1]:
-                                # the tex marginal, and the uncond branch of
-                                # UniDiffuser's free modality-CFG for geometry
-                                # adherence. The ONE tex-ahead configuration
-                                # with a defined use — keep this edge, drop the
-                                # rest of the lower triangle (user 2026-08-13:
-                                # do not spend capacity on tex leading geo).
-    alpha_lo: float = 1.0,
-    alpha_hi: float = 32.0,
-):
-    """(t_s, t_x) sampler — MF-adapted recipe, JointDiT-style scenario switch.
+def sample_timestep_pairs(B: int, device, p_corner: float = 0.2,
+                          p_corner2: float = 0.2):
+    """Draw (t_s, t_x) — the geometry and texture noise levels. t=0 clean, t=1 noise.
 
-    Semantics = Modality Forcing DUAL-corner (paper; repo is inference-only):
-    p_corner at t_s=0 EXACT (tex|mesh config; geo↔tex reads corner-masked off
-    there in the bidir model), p_corner2 at t_x=1 EXACT (mesh-only marginal —
-    tex carries pure noise = "no information"), remainder independent draws over
-    the full square. Per-branch density = uniform, matching OUR flows'
-    pretraining t-schedule (build_flow_loss_fns: slat uniform) — the same
-    follow-the-base-model logic MF applied by inheriting FLUX's shift.
-    Code shape = JointDiT train.py:515-555 (scenario randint + per-sample select).
-    Convention: t=0 clean, t=1 noise (all reference codebases + ours).
+    TWO KNOBS, because the space has exactly two degenerate edges and they are
+    exactly the two inference modes we ship:
+
+        t_s = 0   geometry given, texture moving   ->  texture | given mesh
+        t_x = 1   texture is pure noise            ->  mesh-only, and the whole
+                                                       geometry leg of joint
+        interior  both moving                      ->  joint's intermediate states
+
+    `t_s <= t_x` (geometry never noisier than texture) is a STRUCTURAL INVARIANT,
+    not a parameter: it is the default draw, and both edges satisfy it. Every
+    inference mode keeps t_s <= t_x, so the lower triangle is a region that is
+    never visited.
+
+    HISTORY, because this cost a 60K run. The joint regime used to be the
+    independent SQUARE, with an opt-in `p_lag` slice carving a triangle out of
+    it, plus `p_band` (a log-uniform alpha band) and `p_marg_s` (t_s=1, which
+    VIOLATES the invariant) — five probabilities laid out cumulatively on one
+    uniform draw with an implicit sixth "remainder" regime. The triangle then
+    held only if the probabilities happened to sum to 1. The 2026-08-16 run
+    missed it: 33% of every geometry-supervised sample landed at t_s > t_x, with
+    nothing in the log to say so. All four extra knobs are deleted; the
+    invariant is now structural.
+
+    Uniform on the triangle = sort two uniforms. The old `t_s = t_x * rand` was
+    NOT uniform despite its docstring: density 1/t_x, mass piled where the
+    TEXTURE IS CLEAN, i.e. exactly where the geometry stream can lean on it.
+    Measured over 1M draws: E[t_x] 0.500 vs 0.667, P(t_x > 0.9) 10.0% vs 19.0%.
+
+    Defaults 0.2 / 0.2 measured over 600k draws: geometry supervised on 80% of
+    samples (the t_s=0 edge gives it no loss), 25% at t_x exactly 1 and 14% in
+    the band (0.9, 1.0). That band, not the edge, is where the alpha=32 rollout
+    spends 10 of its 12 steps, and raising p_corner2 shrinks it.
     """
-    # The segments are laid out on `u` cumulatively, so a total > 1 does NOT
-    # error — the tail segments simply never get drawn. p_lag is the one that
-    # would vanish, and p_lag=0 is exactly the silent failure that cost the
-    # 2026-08-16 60K run: the whole upper triangle (the region every inference
-    # mode actually traverses) went untrained, and nothing in the log said so.
-    _tot = p_corner + p_corner2 + p_band + p_lag + p_marg_s
-    assert _tot <= 1.0 + 1e-6, (
-        f"timestep segments sum to {_tot:.3f} > 1: the tail segments "
-        f"(p_lag={p_lag}, p_marg_s={p_marg_s}) would be silently starved")
-
-    t_x = torch.rand(B, device=device)
-    t_s = torch.rand(B, device=device)                       # joint regime default
+    assert p_corner + p_corner2 <= 1.0 + 1e-6, (
+        f"p_corner {p_corner} + p_corner2 {p_corner2} > 1")
+    a = torch.rand(B, device=device)
+    b = torch.rand(B, device=device)
+    t_s = torch.minimum(a, b)          # geometry: cleaner
+    t_x = torch.maximum(a, b)          # texture: noisier
     u = torch.rand(B, device=device)
-    if p_band > 0:                                           # A6 arm only
-        import math
-        log_a = torch.empty(B, device=device).uniform_(
-            math.log(alpha_lo), math.log(alpha_hi))          # audit: alpha_lo<1 was silently clamped
-        alpha = torch.exp(log_a)
-        t_s_band = t_x / (alpha - (alpha - 1.0) * t_x)       # exact f_alpha inverse
-        band = (u >= p_corner + p_corner2) & (u < p_corner + p_corner2 + p_band)
-        t_s = torch.where(band, t_s_band, t_s)
-    # segments are laid out on u in a fixed cumulative order; anything left over
-    # keeps the independent-square draw. Defaults (p_band=p_lag=p_marg_s=0)
-    # reproduce the shipped S1/S2b recipe exactly.
-    _c = p_corner + p_corner2 + p_band
-    if p_lag > 0:                                            # A6 arm
-        lag = (u >= _c) & (u < _c + p_lag)
-        # UNIFORM on the triangle = draw two uniforms and sort them. The old
-        # `t_s = t_x * rand` with t_x ~ U[0,1] is NOT uniform on the triangle
-        # even though the docstring claimed it was: given t_x, t_s spreads over
-        # [0, t_x] with density 1/t_x, so the joint density goes as 1/t_x and
-        # the mass piles up where the TEXTURE IS CLEAN — the opposite of what
-        # this arm is for. Measured over 1M draws: E[t_x] 0.500 vs 0.667, and
-        # P(t_x > 0.9) 10.0% vs 19.0%. Sorting two uniforms is the textbook
-        # uniform-on-a-simplex draw and costs one extra rand.
-        a = torch.rand(B, device=device)
-        b = torch.rand(B, device=device)
-        t_s = torch.where(lag, torch.minimum(a, b), t_s)
-        t_x = torch.where(lag, torch.maximum(a, b), t_x)
-    _c = _c + p_lag
-    if p_marg_s > 0:                                         # tex-marginal edge
-        marg = (u >= _c) & (u < _c + p_marg_s)
-        t_s = torch.where(marg, torch.ones_like(t_s), t_s)
-    corner2 = (u >= p_corner) & (u < p_corner + p_corner2)
-    t_x = torch.where(corner2, torch.ones_like(t_x), t_x)
+    # pin the two edges; anything not claimed keeps the triangle interior
+    t_x = torch.where((u >= p_corner) & (u < p_corner + p_corner2),
+                      torch.ones_like(t_x), t_x)
     t_s = torch.where(u < p_corner, torch.zeros_like(t_s), t_s)
     return t_s, t_x
 
@@ -568,9 +507,8 @@ def compute_unified_geotex_loss(
     qwen_drop_prob: float = 0.0,
     cond_max_length: int = 8192,
     # unified knobs
-    p_corner: float = 0.4, p_corner2: float = 0.2, p_band: float = 0.0,
-    p_lag: float = 0.0, p_marg_s: float = 0.0,
-    alpha_lo: float = 1.0, alpha_hi: float = 32.0,
+    p_corner: float = 0.2, p_corner2: float = 0.2,
+    probe_every: int = 200,   # cond-sensitivity probe cadence; 0 = off
     # ── S2b: geo unfrozen (the "three-pack" of the design doc) ──
     geo_loss_w: float = 0.0,        # >0 turns on geo's OWN velocity loss
     geo_teacher=None,               # frozen S1-geo (a plain SLatFlowModel) for self-distill
@@ -622,12 +560,10 @@ def compute_unified_geotex_loss(
     cond_x = _masked_list(cond_x, key_x)
 
     # timestep pair + noising (diffuse/get_v = upstream formulas, never re-derived)
-    t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2,
-                                     p_band=p_band, p_lag=p_lag, p_marg_s=p_marg_s,
-                                     alpha_lo=alpha_lo, alpha_hi=alpha_hi)
+    t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2)
     # ONE-TIME REPORT of what was actually sampled, not what was configured.
-    # The 2026-08-16 run trained with p_lag=0 while the launch script said 0.4
-    # (the script was edited mid-run and the launcher reads it only at start),
+    # The 2026-08-16 run trained on the independent square (33% of every
+    # geometry-supervised sample at t_s > t_x) and nothing said so,
     # and nothing anywhere printed the difference. The number that matters is
     # not the config value but the MEASURED share of the batch that lands in
     # the region inference traverses: geometry supervised (t_s != 0) AND
@@ -636,8 +572,8 @@ def compute_unified_geotex_loss(
         compute_unified_geotex_loss._reported = True
         sup = (t_s != 0)
         tri = sup & (t_s <= t_x)
-        print(f"[timestep] corner {p_corner} corner2 {p_corner2} band {p_band} "
-              f"lag {p_lag} marg_s {p_marg_s} | measured on this batch: "
+        print(f"[timestep] corner {p_corner} corner2 {p_corner2} | "
+              f"measured on this batch: "
               f"geo-supervised {sup.float().mean():.0%}, of which "
               f"inference-aligned (t_s<=t_x) "
               f"{(tri.sum() / sup.sum().clamp_min(1)).item():.0%}", flush=True)
@@ -762,5 +698,61 @@ def compute_unified_geotex_loss(
         distill = (d * w_rows).mean()
         loss = loss + distill_w * distill
         logs["geo_distill"] = distill.detach().item()
+
+    # ── CONDITIONING SENSITIVITY PROBE ──────────────────────────────────────
+    # THE diagnostic this project lacked. After 60,000 steps we still could not
+    # say whether the geometry stream was undertrained or structurally unable to
+    # learn, because nothing tracked whether it reads the image AT ALL — and
+    # SAVE_KEEP had deleted every early checkpoint by the time we looked.
+    #
+    # Measure: run the model on PURE NOISE (t=1, the generation regime) once
+    # with this batch's conditioning and once with the conditioning ROLLED by
+    # one sample, so every sample gets a different asset's image. Report
+    #     MSE(x0 | mismatched image) / MSE(x0 | correct image)
+    # 1.0 = the stream ignores its conditioning entirely. Measured 2026-08-17 on
+    # checkpoint-60000: geometry 1.045, texture 1.35, released TRELLIS.2 1.40.
+    # Flat at 1.0 from step 2000 => structural, stop and fix. Climbing => it is
+    # a question of training length.
+    #
+    # Costs two extra forwards every `probe_every` steps, no sampling, no grad.
+    if probe_every > 0 and B > 1:
+        _n = getattr(compute_unified_geotex_loss, "_probe_n", 0)
+        compute_unified_geotex_loss._probe_n = _n + 1
+        if _n % probe_every == 0:
+            with torch.no_grad():
+                one = torch.ones(B, device=dev, dtype=common_dt)
+                ns = x0_s.replace(torch.randn_like(x0_s.feats))
+                nx = x0_x.replace(torch.randn_like(x0_x.feats))
+                # rolling the per-sample cond lists is what makes this a
+                # MISMATCH rather than an ablation: the model still gets a real
+                # image, just the wrong one, so a drop cannot be explained by
+                # the conditioning going out of distribution.
+                # cond_s is None on the from-scratch path (one cond stream,
+                # so cond_x carries it); roll whichever lists exist.
+                roll = lambda c: None if c is None else c[1:] + c[:1]
+                bad_s, bad_x = roll(cond_s), roll(cond_x)
+                out = {}
+                for tag, (cs, cx) in (("ok", (cond_s, cond_x)),
+                                      ("bad", (bad_s, bad_x))):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                                        enabled=x_tx.feats.is_cuda):
+                        ps, px = unified_model(ns, nx, (one * 1000.0), (one * 1000.0),
+                                               cs, cx, tex_concat_cond=ns)
+                    # x0 = x_t - t*v with t = 1
+                    out[tag] = (
+                        float(((ns.feats.float() - ps.feats.float()) - x0_s.feats.float()).pow(2).mean()),
+                        float(((nx.feats.float() - px.feats.float()) - x0_x.feats.float()).pow(2).mean()))
+                compute_unified_geotex_loss._probe_last = (
+                    out["bad"][0] / max(out["ok"][0], 1e-8),
+                    out["bad"][1] / max(out["ok"][1], 1e-8))
+        # CARRY THE LAST VALUE ON EVERY STEP. HF Trainer averages logged
+        # scalars over `logging_steps` and treats a missing key as absent from
+        # only some steps — a probe that fires once per 200 steps came out as
+        # 1.0/5 = 0.2 in a 5-step window, i.e. a number that cannot even be a
+        # ratio. Emitting the cached value every step makes the window mean
+        # equal the value.
+        _last = getattr(compute_unified_geotex_loss, "_probe_last", None)
+        if _last is not None:
+            logs["cond_sens_geo"], logs["cond_sens_tex"] = _last
 
     return loss, logs
