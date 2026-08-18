@@ -58,19 +58,33 @@ def load_tex_flow(ckpt_dir, use_ema=True):
 
 
 @torch.no_grad()
-def sample_tex(flow, cond, uncond, coords, shape_z_feats, steps=25, cfg=3.0, seed=0):
+def sample_tex(flow, cond, uncond, coords, shape_z_feats, steps=None, cfg=None, seed=0):
+    """Cascade/specialist texture sampling on the RELEASED pipeline parameters.
+
+    The old defaults were 25 uniform steps at cfg 3.0. The released texture
+    model is sampled at cfg **1.0**, i.e. no guidance at all
+    (pipeline.json:60-64), so this baseline was being over-guided 3x against a
+    model trained for none — the opposite of a fair reference column."""
+    from trellis2_blip3o.geotex_sampler import TEX_PARAMS, _t_seq, _guided
+    p = dict(TEX_PARAMS)
+    if steps is not None or cfg is not None:
+        p.update(steps=steps or p["steps"],
+                 guidance_strength=cfg if cfg is not None else p["guidance_strength"])
+        print(f"[sample_tex] OVERRIDDEN off the released params: "
+              f"steps={p['steps']} cfg={p['guidance_strength']}", flush=True)
     g = torch.Generator(device="cuda").manual_seed(seed)
     N = coords.shape[0]
     x = torch.randn(N, 32, generator=g, device="cuda", dtype=torch.float32)
     sz = shape_z_feats.float()
-    ts = np.linspace(1.0, 0.0, steps + 1)
-    for i in range(steps):
+    ts = _t_seq(p["steps"], p["rescale_t"])
+    for i in range(p["steps"]):
         t, t_prev = float(ts[i]), float(ts[i + 1])
         tt = torch.tensor([t * 1000.0], device="cuda")
         xin = sp.SparseTensor(torch.cat([x, sz], 1), coords.cuda())
         vp = flow(xin, tt, cond).feats.float()
         vn = flow(xin, tt, uncond).feats.float()
-        v = cfg * vp + (1 - cfg) * vn
+        v = _guided(vp, vn, x, t, p["guidance_strength"],
+                    p["guidance_rescale"], p["guidance_interval"])
         x = x - (t - t_prev) * v
     return x
 

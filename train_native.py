@@ -67,6 +67,12 @@ class EMACallback(TrainerCallback):
 
     def on_train_begin(self, args, state, control, model=None, **kw):
         self._base = self._unwrap(model)
+        if not state.is_world_process_zero:
+            # on_save writes from rank 0 only, so every other rank was keeping an
+            # fp32 shadow of the whole model for nothing: 802.7M x 4B = 3.2 GB of
+            # GPU memory per rank, 31 ranks of it on a 4-node run.
+            self.shadow = None
+            return
         self.shadow = {n: p.detach().clone().float() for n, p in self._trainable()}
         print(f"[EMA] tracking {len(self.shadow)} trainable tensors, decay={self.decay}")
 

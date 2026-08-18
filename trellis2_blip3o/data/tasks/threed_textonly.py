@@ -25,6 +25,7 @@ from typing import Any, Dict
 import numpy as np
 
 from ..registry import register_task
+from ...vlm_cache import entry_path as _entry_path
 from .threed import TextTo3DDataset
 
 
@@ -43,8 +44,15 @@ class WeightedTextTo3DDataset(TextTo3DDataset):
                              "(the t-key cache the weights belong to)")
         meta = json.load(open(os.path.join(self.cached_hidden_root, "_meta.json")))
         w = meta.get("t_sampling_weights") or {}
-        # keys sorted -> t000..t003; empty weights -> uniform over the 4 variants
-        self._t_keys = sorted(w) if w else [f"t{i:03d}" for i in range(4)]
+        if not w:
+            # The v22_3dvlm_tok1024_mv1 _meta.json carries no t_sampling_weights,
+            # so this class silently ran UNIFORM 0.25 each — the one thing it
+            # exists to not do. Uniform triples the short caption (.10 -> .25)
+            # and cuts the two long ones from .70 to .50 combined. Fall back to
+            # the contract in this file's docstring instead of to uniform; a
+            # cache that does specify weights still wins.
+            w = {"t000": 0.35, "t001": 0.20, "t002": 0.10, "t003": 0.35}
+        self._t_keys = sorted(w)
         p = np.asarray([float(w.get(k, 1.0)) for k in self._t_keys], dtype=np.float64)
         self._t_probs = p / p.sum()
         self._t_fallback = dict(meta.get("t_sampling_fallback") or {})
@@ -74,10 +82,18 @@ class WeightedTextTo3DDataset(TextTo3DDataset):
         # builder index space: enumerate over the NON-EMPTY captions (build_vlm_cache_v22
         # --mode captions filters empties the same way; only the LAST variant can be absent)
         caps = [c for c in (rec.get("captions") or []) if c]
+        sha = rec["sha256"]
         key = self._t_keys[int(rng.choice(len(self._t_keys), p=self._t_probs))]
         if int(key[1:]) >= len(caps):              # variant absent for this asset
             key = self._t_fallback.get(key, "t000")
-        sha = rec["sha256"]
+        elif not os.path.exists(_entry_path(self.cached_hidden_root, sha, key)):
+            # The manifest saying an asset has 4 captions does not mean the cache
+            # has 4 t-keys: the t-cache was built 2026-07-13 against v4's capT
+            # list, while capT400k_train.jsonl was re-joined from the caption
+            # store on 2026-08-17. Measured, 149 assets have no t-key at all and
+            # 7 have t000-t002 only; the count-based test above passes them
+            # straight into a FileNotFoundError and a resample.
+            key = self._t_fallback.get(key, "t000")
         entry = self._load_cond(sha, key)          # FileNotFoundError -> __getitem__ resamples
         data: Dict[str, Any] = {
             "_task": "text_to_3d",                 # ride the stock T-batch contract (see docstring)

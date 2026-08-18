@@ -57,7 +57,7 @@ torchrun --nproc_per_node="$NPROC" train_native.py \
   --build_slat True --ss_only False \
   --freeze_vlm True --flow_tune none --distill_dino False \
   --target_tokens_per_view 1024 --slat_resolution 512 --cond_fusion none \
-  --max_slat_tokens 4096 --elastic_slat "${ELASTIC_SLAT:-True}" --elastic_target_ratio "$ELASTIC_RATIO" \
+  --max_slat_tokens 8192 --elastic_slat "${ELASTIC_SLAT:-True}" --elastic_target_ratio "$ELASTIC_RATIO" \
   --compile_ss_flow "${COMPILE_SS:-False}" --compile_mode default \
   --output_dir "$OUT" \
   --max_steps "$MAX_STEPS" --bf16 True \

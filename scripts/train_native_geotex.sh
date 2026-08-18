@@ -63,10 +63,20 @@ XATTN_ANNEAL_END="${XATTN_ANNEAL_END:-0}"
 #
 # These two only PIN THE TWO EDGES of that triangle; whatever is left over is
 # the triangle's interior.
-P_CORNER="${P_CORNER:-0.2}"   # t_s=0 edge: texture | given geometry, the flagship
+P_CORNER="${P_CORNER:-0.1}"   # t_s=0 edge: texture | given geometry, the flagship
                               # product mode. Geometry gets NO loss here, so this
                               # is pure cost to the geometry stream — 0.4 (the
-                              # warm-start-era value) left it only 60% supervised.
+                              # warm-start-era value) left it only 60% supervised,
+                              # 0.2 left it 80%, this leaves it 90%.
+                              # 0.2 -> 0.1 on 2026-08-18: geometry is the weak
+                              # stream by every measurement (its v-loss is 1.5x
+                              # the released model's, texture's only 1.3x), and
+                              # this edge is the one place it learns nothing. The
+                              # edge itself got cheaper to fund at the same time:
+                              # its t_x is now drawn uniform instead of
+                              # -ln(1-t_x), so each sample spent here covers the
+                              # rollout evenly rather than piling 33% of them
+                              # into the first three steps.
 P_CORNER2="${P_CORNER2:-0.2}" # t_x=1 edge: texture carries NOTHING. NOT raised above
                               # 0.2, even though that edge is "the inference
                               # regime": with rescale_t=3 the alpha=32 rollout has
@@ -111,6 +121,17 @@ FROM_SCRATCH="${FROM_SCRATCH:-False}"
 DIM="${DIM:-768}"; HEADS="${HEADS:-6}"          # head_dim must leave a spare rope pair
 DEPTH_DOUBLE="${DEPTH_DOUBLE:-8}"               # triple-stream blocks (own weights)
 DEPTH_SINGLE="${DEPTH_SINGLE:-16}"              # shared-weight blocks (owner's 1:2)
+# mlp hidden = int(DIM * MLP_RATIO) must be a multiple of 64 or bf16 tensor cores
+# fall off a cliff: at DIM=1024 the released ratio 5.3334 gives 5461 = 43*127 and
+# an isolated GEMM runs 129.6 TFLOP/s against 733 for an aligned width, which is
+# 2.27 -> 3.76 s/step end to end. Pick the ratio from DIM rather than shipping one
+# number that is only right at one width.
+if [ -z "${MLP_RATIO:-}" ]; then
+  case "$DIM" in
+    1536) MLP_RATIO=5.3334 ;;  # -> 8192 exactly: the released value IS aligned here
+    *)    MLP_RATIO=5.375  ;;  # -> 5504 = 86*64 at DIM=1024
+  esac
+fi
 
 if ! command -v torchrun >/dev/null 2>&1; then
   source /fsx/home/weikai.huang/miniconda3/bin/activate blip3o_trellis
@@ -174,7 +195,7 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_shape_init "$SHAPE_INIT" --geotex_tex_init "$TEX_INIT" \
   --geotex_from_scratch "$FROM_SCRATCH" \
   --geotex_dim "$DIM" --geotex_heads "$HEADS" \
-  --geotex_mlp_ratio "${MLP_RATIO:-5.3334}" --geotex_init "${INIT:-scaled}" \
+  --geotex_mlp_ratio "$MLP_RATIO" --geotex_init "${INIT:-scaled}" \
   --geotex_depth_double "$DEPTH_DOUBLE" --geotex_depth_single "$DEPTH_SINGLE" \
   --geotex_coupling "$COUPLING" --geotex_cond_mode "$COND_MODE" \
   --geotex_cond_stream_blocks "$COND_STREAM_BLOCKS" \

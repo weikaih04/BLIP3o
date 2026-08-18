@@ -301,6 +301,16 @@ def build_mixture(
     datasets = []
     for s in specs:
         cls = registry.get_task(s.name)
+        # ONLY the yaml's args: reach the dataset. CLI flags that look like they
+        # configure data — --max_slat_tokens, --slat_resolution, --ss_only — are
+        # parsed by train_native.py and then dropped on the floor here. v7 got
+        # away with it because the CLI values matched the defaults; say so rather
+        # than let the next mismatch be silent.
+        for k in ("max_slat_tokens", "slat_resolution", "ss_only"):
+            if k not in s.args:
+                print(f"[mixture] {s.name}: '{k}' not set in the yaml args — the "
+                      f"dataset default applies and any --{k} on the command line "
+                      f"is IGNORED.", flush=True)
         datasets.append(cls(**s.args))
 
     ds = MixtureIterableDataset(

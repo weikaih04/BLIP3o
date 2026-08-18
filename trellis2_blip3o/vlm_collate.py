@@ -110,6 +110,19 @@ def boiler_ids(tok, include_system: bool = False) -> set:
     return base | sys_ids
 
 
+_PARTIAL_TEX_WARNED = False
+
+
+def _warn_partial_tex(n_have: int, n_total: int) -> None:
+    global _PARTIAL_TEX_WARNED
+    if not _PARTIAL_TEX_WARNED:
+        _PARTIAL_TEX_WARNED = True
+        print(f"[collate] WARNING: {n_have}/{n_total} items in this batch carry a "
+              f"texture target, so the whole batch is being collated WITHOUT "
+              f"texture supervision. Every later batch in this shape is silent.",
+              flush=True)
+
+
 def collate_vlm_3d(
     batch: Sequence[Dict],
     processor: Any,
@@ -168,11 +181,20 @@ def collate_vlm_3d(
         # mixed pbr/no-pbr batch would KeyError on batch[0]-keyed collation; old all-pbr
         # manifests are unaffected). Shape/ss stages ignore tex anyway; the tex stage must
         # train on pbr-only data so every batch is homogeneous.
-        if all("target_tex_slat_512_item" in inst for inst in batch):
+        _n_tex = sum("target_tex_slat_512_item" in inst for inst in batch)
+        if _n_tex == len(batch):
             tex_pack = SLatPbr.collate_fn(
                 [inst["target_tex_slat_512_item"] for inst in batch])
             out["target_tex_slat_512"] = tex_pack["x_0"]
             out["tex_concat_cond"] = tex_pack["concat_cond"]
+        elif _n_tex:
+            # One item without pbr silently costs the WHOLE batch its texture
+            # supervision, and the geotex loss then trains geometry only for that
+            # step with nothing in the log to show it. Currently 0 occurrences
+            # (every manifest row has pbr_latent_512), but flipping
+            # slat_resolution to 1024 would make it every batch, because
+            # shape_latent_1024 is None across the pool.
+            _warn_partial_tex(_n_tex, len(batch))
         # REPA SS aux targets (repa.py): the key is present (possibly None per sample)
         # iff the dataset ran with REPA_ROOT set — None-safe stacking: missing samples
         # get a zero row + weight 0. All-missing → no repa_target (model's graceful

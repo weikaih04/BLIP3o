@@ -454,7 +454,19 @@ class _ThreeDTaskBase(Dataset):
                     # loaded combo down to the drawn count by dropping whole view blocks
                     # (same fix as streaming_task.py's IM_VIEW_SUBSET). The qwen segment
                     # still encodes all 4 images — DINO carries the spatial signal.
-                    if self.mode == "IM" and n_want < n:
+                    # DISABLED 2026-08-18. Subsampling DINO alone does not make
+                    # a 2-view or 3-view sample: the Qwen segment of the SAME
+                    # item still encodes all 4 images (the cache packs them
+                    # jointly, so there is nothing to drop without rebuilding
+                    # it). Measured, hidden is a constant 292 tokens while
+                    # dino_hidden was being cut from 1620, so 2/3 of every IM
+                    # batch fed the two conditioning towers a different number
+                    # of views. An incoherent condition is worse than no
+                    # augmentation; set GEOTEX_IM_VIEW_SUBSET=1 to restore the
+                    # old behaviour, and rebuild the cache with per-view Qwen
+                    # entries to do this properly.
+                    if (self.mode == "IM" and n_want < n
+                            and os.environ.get("GEOTEX_IM_VIEW_SUBSET") == "1"):
                         vids = data["dino_view_ids"]
                         uniq = torch.unique(vids)
                         if len(uniq) > n_want:

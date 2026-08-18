@@ -510,6 +510,40 @@ def sample_timestep_pairs(B: int, device, p_corner: float = 0.2,
     return t_s, t_x
 
 
+def _voxel_balanced_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """MSE whose PER-VOXEL weight does not depend on how many voxels this rank drew.
+
+    `F.mse_loss` over a sparse batch is a mean over every voxel the rank happens
+    to hold, and each rank contributes equally to the averaged gradient, so a
+    voxel's weight is 1/(R * N_r). Voxel counts are wildly uneven — measured over
+    2883 assets: median 2039, p95 5597, max 13856 under the 8192 cap — and a
+    micro-batch of 4 lands anywhere from 4713 to 14363 voxels, so the same voxel
+    carries ~3x more gradient in a light batch than a heavy one. That is not bias
+    (both directions are equally likely); it is variance injected straight into
+    the effective learning rate.
+
+    TRELLIS.2 removes it on the data side, twice: load_balanced_group_indices
+    (datasets/structured_latent.py:166) equalises voxels across the gradient
+    accumulation slices, and BalancedResumableSampler (utils/data_utils.py:213)
+    equalises them across ranks. Neither is reachable from an IterableDataset
+    mixture, so this does the same thing on the loss side instead — the fix
+    HuggingFace shipped for the identical problem in token-level LM losses:
+    normalise by the GLOBAL count rather than the local mean.
+
+    Scaling by world_size makes DDP's gradient averaging cancel exactly, leaving
+    every voxel at weight 1/N_global and the loss numerically equal to the mean
+    over all voxels on all ranks. Falls back to a plain mean when distributed is
+    not initialised, which is every eval path."""
+    per_voxel = (pred - target).pow(2).mean(-1)          # (N,) — mean over channels
+    n_local = per_voxel.numel()
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return per_voxel.mean() if n_local else per_voxel.sum()
+    n = torch.tensor([float(n_local)], device=per_voxel.device)
+    torch.distributed.all_reduce(n, op=torch.distributed.ReduceOp.SUM)
+    world = torch.distributed.get_world_size()
+    return per_voxel.sum() * world / n.clamp_min(1.0).squeeze()
+
+
 def compute_unified_geotex_loss(
     *,
     unified_model,                    # UnifiedGeoTexFlow
@@ -629,7 +663,7 @@ def compute_unified_geotex_loss(
             (t_x * 1000.0).to(x_tx.feats.dtype), cond_s, cond_x,
             tex_concat_cond=cc)
 
-    loss = F.mse_loss(v_x_pred.feats.float(), v_target.feats.float())
+    loss = _voxel_balanced_mse(v_x_pred.feats.float(), v_target.feats.float())
     logs = {"tex_flow_loss": loss.detach().item(),
             "t_s_mean": t_s.mean().item(), "t_x_mean": t_x.mean().item(),
             "corner_frac": (t_s == 0).float().mean().item(),
@@ -693,8 +727,8 @@ def compute_unified_geotex_loss(
                 torch.ones(sl.stop - sl.start, dtype=torch.bool, device=dev) if keep[b]
                 else torch.zeros(sl.stop - sl.start, dtype=torch.bool, device=dev)
                 for b, sl in enumerate(x0_s.layout)])
-            geo_loss = F.mse_loss(v_s_pred.feats[rows].float(),
-                                  v_s_target.feats[rows].float())
+            geo_loss = _voxel_balanced_mse(v_s_pred.feats[rows].float(),
+                                           v_s_target.feats[rows].float())
             loss = loss + geo_loss_w * geo_loss
             logs["geo_flow_loss"] = geo_loss.detach().item()
 

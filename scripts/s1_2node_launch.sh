@@ -30,7 +30,7 @@ torchrun --nnodes="$NN" --node-rank="$NID" --nproc-per-node=8 \
   --build_vlm False --fuse_dino False \
   --build_slat True --ss_only False --freeze_vlm True --flow_tune none --distill_dino False \
   --target_tokens_per_view 1024 --slat_resolution 512 --cond_fusion none \
-  --max_slat_tokens 4096 --elastic_slat True --elastic_target_ratio 0.75 \
+  --max_slat_tokens 8192 --elastic_slat True --elastic_target_ratio 0.75 \
   --output_dir runs/s1_2node --max_steps 3000 --bf16 True \
   --per_device_train_batch_size 2 --gradient_accumulation_steps 8 \
   --learning_rate 1e-4 --warmup_steps 100 --weight_decay 0.01 \

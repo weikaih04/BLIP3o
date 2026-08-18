@@ -85,18 +85,36 @@ def build_cond(conn, dve, entry_dir, qwen_only=False):
 
 
 @torch.no_grad()
-def sample_shape(flow, cond, uncond, coords, steps=25, cfg=3.0, sigma_min=1e-5, seed=0):
+def sample_shape(flow, cond, uncond, coords, steps=None, cfg=None, sigma_min=1e-5,
+                 seed=0):
+    """Cascade/specialist shape sampling on the RELEASED pipeline parameters.
+
+    Until 2026-08-18 this ran 25 uniform steps at a flat cfg 3.0 with no
+    rescale_t, no guidance_rescale and no guidance interval, while our own
+    GeoTexSampler ran the released 12 / 7.5 / 0.5 / [0.6,1.0] / 3.0. Every
+    "unified vs cascade" comparison drawn from those two was therefore a
+    comparison of two different samplers as much as of two models. The released
+    values are the defaults now; passing steps/cfg still overrides them, and
+    says so, for the ablations that want a sweep."""
+    from trellis2_blip3o.geotex_sampler import SHAPE_PARAMS, _t_seq, _guided
+    p = dict(SHAPE_PARAMS)
+    if steps is not None or cfg is not None:
+        p.update(steps=steps or p["steps"],
+                 guidance_strength=cfg if cfg is not None else p["guidance_strength"])
+        print(f"[sample_shape] OVERRIDDEN off the released params: "
+              f"steps={p['steps']} cfg={p['guidance_strength']}", flush=True)
     g = torch.Generator(device="cuda").manual_seed(seed)
     N = coords.shape[0]
     x = sp.SparseTensor(torch.randn(N, flow.in_channels, generator=g,
                                     device="cuda", dtype=torch.float32), coords.cuda())
-    ts = np.linspace(1.0, 0.0, steps + 1)
-    for i in range(steps):
+    ts = _t_seq(p["steps"], p["rescale_t"])
+    for i in range(p["steps"]):
         t, t_prev = float(ts[i]), float(ts[i + 1])
         tt = torch.tensor([t * 1000.0], device="cuda")
         vp = flow(x, tt, cond).feats.float()
         vn = flow(x, tt, uncond).feats.float()
-        v = cfg * vp + (1 - cfg) * vn
+        v = _guided(vp, vn, x.feats.float(), t, p["guidance_strength"],
+                    p["guidance_rescale"], p["guidance_interval"])
         x = x.replace(x.feats - (t - t_prev) * v)
     return x
 

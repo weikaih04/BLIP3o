@@ -19,7 +19,7 @@ torchrun --nnodes=2 --node-rank="${SLURM_NODEID:-0}" --nproc-per-node=8 \
   --build_slat True --ss_only False --freeze_vlm True --flow_tune none --distill_dino False \
   --compile_ss_flow False \
   --target_tokens_per_view 1024 --slat_resolution 512 --cond_fusion none \
-  --max_slat_tokens 4096 --elastic_slat True --elastic_target_ratio 0.75 \
+  --max_slat_tokens 8192 --elastic_slat True --elastic_target_ratio 0.75 \
   --output_dir runs/hold_dbg --max_steps 25 --bf16 True \
   --per_device_train_batch_size 2 --gradient_accumulation_steps 8 \
   --learning_rate 1e-4 --warmup_steps 100 --weight_decay 0.01 \
