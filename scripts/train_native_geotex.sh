@@ -204,6 +204,7 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_unfreeze_geo "$UNFREEZE_GEO" --geotex_geo_loss_w "$GEO_LOSS_W" \
   --geotex_distill_w "$DISTILL_W" \
   --geotex_p_corner "$P_CORNER" --geotex_p_corner2 "$P_CORNER2" \
+  --adaptive_grad_clip "${ADAPTIVE_CLIP:-True}" \
   --build_slat False --ss_only False --compile_ss_flow False \
   --elastic_slat "$ELASTIC" --elastic_target_ratio "$ELASTIC_RATIO" \
   --freeze_vlm True --flow_tune full \

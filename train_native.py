@@ -31,6 +31,7 @@ from typing import Optional
 
 import time
 
+import numpy as np
 import torch
 import transformers
 from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
@@ -105,6 +106,72 @@ class EMACallback(TrainerCallback):
             save_file({k: v.detach().cpu() for k, v in self.shadow.items()},
                       os.path.join(ckpt, "ema.safetensors"))
             print(f"[EMA] wrote ema.safetensors → {ckpt}")
+
+class AdaptiveGradClipCallback(TrainerCallback):
+    """TRELLIS.2's AdaptiveGradClipper (utils/grad_clip_utils.py:7-81), wired into
+    the DeepSpeed path.
+
+    The released 512 shape/tex configs both clip with
+    AdaptiveGradClipper(max_norm=1.0, clip_percentile=95): a rolling 1000-step
+    buffer of pre-clip norms, after which the threshold becomes
+    min(p95(buffer), 1.0). By construction that clips about 5% of steps. Our flat
+    1.0 clipped 0.6% of v7's steps, and the p95 of its last 1000 was ~0.44 — so
+    the released recipe clips considerably HARDER than we were, and this is the
+    one trainer knob that was still off.
+
+    DeepSpeed owns the clip under bf16 + ZeRO-1 (bf16_optimizer.py:311 reads
+    self.clip_grad fresh on every step), so the threshold is written there rather
+    than by calling clip_grad_norm_ ourselves, and the norm read back is the
+    PRE-clip one DeepSpeed stashes at :308 — the same quantity the official
+    buffer stores."""
+
+    def __init__(self, max_norm: float = 1.0, percentile: float = 95.0,
+                 buffer_size: int = 1000):
+        self.max_norm, self.percentile, self.buffer_size = max_norm, percentile, buffer_size
+        self._buf = np.zeros(buffer_size, dtype=np.float32)
+        self._ptr = self._len = 0
+        self._engine = None
+        self._cur = max_norm
+
+    def state_dict(self):
+        return {"buf": self._buf, "ptr": self._ptr, "len": self._len, "cur": self._cur}
+
+    def load_state_dict(self, sd):
+        self._buf, self._ptr = sd["buf"], sd["ptr"]
+        self._len, self._cur = sd["len"], sd["cur"]
+
+    def _opt(self):
+        e = self._engine
+        return getattr(e, "optimizer", None) if e is not None else None
+
+    def on_train_begin(self, args, state, control, **kw):
+        if self._engine is None:
+            print("[gradclip] no DeepSpeed engine attached — flat clipping stays in force")
+        else:
+            print(f"[gradclip] adaptive: p{self.percentile:.0f} of the last "
+                  f"{self.buffer_size} steps, capped at {self.max_norm}")
+
+    def on_step_end(self, args, state, control, **kw):
+        e = self._engine
+        if e is None or not hasattr(e, "get_global_grad_norm"):
+            return
+        gn = e.get_global_grad_norm()
+        if gn is None:
+            return
+        gn = float(gn)
+        if not np.isfinite(gn):
+            return                                  # official skips non-finite too
+        self._buf[self._ptr] = gn
+        self._ptr = (self._ptr + 1) % self.buffer_size
+        self._len = min(self._len + 1, self.buffer_size)
+        if self._len < self.buffer_size:
+            return                                  # warm-up: flat max_norm, as upstream
+        self._cur = min(float(np.percentile(self._buf, self.percentile)), self.max_norm)
+        opt = self._opt()
+        if opt is not None and hasattr(opt, "clip_grad"):
+            opt.clip_grad = self._cur
+        if state.global_step % 500 == 0 and state.is_world_process_zero:
+            print(f"[gradclip] step {state.global_step}: threshold {self._cur:.4f}", flush=True)
 
 import trellis2_blip3o._paths  # noqa: F401
 from trellis2_blip3o.dataset_native import TR2NativeVLMDataset, NativeVLMCollator
@@ -459,6 +526,7 @@ class NativeArgs:
     # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
     geotex_concat_cond: bool = field(default=False)  # cascade-legacy shape concat into tex
     geotex_pooled_cond: bool = field(default=True)   # SD3/FLUX pooled cond -> adaLN modulation
+    adaptive_grad_clip: bool = field(default=True)   # TRELLIS.2's p95 rolling clip
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
     dino_drop_prob: float = field(default=0.1)
@@ -885,6 +953,10 @@ def main():
     callbacks = [WandbFineGrainedCallback()]
     if native_args.ema_decay and native_args.ema_decay > 0:
         callbacks.append(EMACallback(decay=native_args.ema_decay))
+    gclip = None
+    if native_args.adaptive_grad_clip:
+        gclip = AdaptiveGradClipCallback(max_norm=training_args.max_grad_norm)
+        callbacks.append(gclip)
     trainer = NativeTrainer(
         model=model,
         args=training_args,
@@ -892,6 +964,17 @@ def main():
         data_collator=collator,
         callbacks=callbacks,
     )
+    if gclip is not None:
+        # model_wrapped is the DeepSpeedEngine and is not handed to callbacks;
+        # it only exists once accelerate has prepared it, i.e. inside train(),
+        # so bind lazily on the first step instead of here.
+        _orig_ts = trainer.training_step
+
+        def _bind_then_step(*a, **k):
+            if gclip._engine is None:
+                gclip._engine = trainer.model_wrapped
+            return _orig_ts(*a, **k)
+        trainer.training_step = _bind_then_step
     trainer.train(resume_from_checkpoint=bool(list(__import__("pathlib").Path(training_args.output_dir).glob("checkpoint-*"))) or None)
     trainer.save_state()
 
