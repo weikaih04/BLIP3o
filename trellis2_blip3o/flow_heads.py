@@ -543,6 +543,142 @@ def sample_timestep_pairs(B: int, device, p_corner: float = 0.2,
     return t_s, t_x
 
 
+# ── v10: the triple (t_ss, t_s, t_x) ────────────────────────────────────────
+# Row CLASSES, not corners. A corner pins one coordinate of one draw; a class
+# decides which of three OPERATING REGIMES the row rehearses, and the three
+# regimes need different pins, different masks and different reads:
+#
+#   solo   SS alone       t_ss ~ logitNormal(1,1) (the official SS schedule),
+#                         slat pinned to pure noise and its losses masked.
+#                         Trains SS's own marginal, so SS-only sampling stays
+#                         exactly the specialist's.
+#   clean  SS finished    t_ss = 0 EXACTLY (the raw latent, not diffused),
+#                         (t_s, t_x) from sample_timestep_pairs UNCHANGED.
+#                         This is leader-first inference, i.e. the flagship,
+#                         and keeping the inner rule bit-identical is what
+#                         makes the v9 arm a valid control.
+#   lag    both moving    (t_ss, t_s) walk the node-pairing curve family; the
+#                         only class where SS may read the slat lanes.
+#
+# p_solo = p_lag = 0 collapses the whole thing back to v9 exactly — the retreat
+# path, and the reason the clean class calls the v9 function rather than
+# reimplementing it.
+CLS_CLEAN, CLS_SOLO, CLS_LAG = 0, 1, 2
+
+
+def _shift_grid(rescale_t: float, u: torch.Tensor) -> torch.Tensor:
+    """flow_euler's node transform t' = r·u / (1 + (r−1)·u), as a CONTINUOUS map.
+
+    geotex_sampler._t_seq is this same function sampled at u = 1 − j/steps. Using
+    the continuous form lets the lag class draw anywhere on the curve instead of
+    only at the 12 released nodes, which matters because training sees far more
+    rows than a trajectory has steps.
+    """
+    return rescale_t * u / (1.0 + (rescale_t - 1.0) * u)
+
+
+def sample_timestep_triples(B: int, device,
+                            p_corner: float = 0.1, p_corner2: float = 0.2,
+                            p_solo: float = 0.20, p_lag: float = 0.20,
+                            k0_lo: int = 3, k0_hi: int = 11,
+                            ss_logit_mean: float = 1.0, ss_logit_std: float = 1.0):
+    """Draw (t_ss, t_s, t_x) + the row class. Invariant t_ss <= t_s <= t_x.
+
+    THE INVARIANT IS STRUCTURAL. Every class constructs its triple by a formula
+    that cannot violate it; nothing is rejected or re-drawn. This is the direct
+    lesson of the 2026-08-16 run, where five cumulative probabilities had to sum
+    to 1 for `t_s <= t_x` to hold, they did not, and 33% of geometry-supervised
+    rows trained at t_s > t_x with nothing in the log to say so.
+
+    RNG DISCIPLINE: every primitive is drawn UNCONDITIONALLY for every row and
+    the classes are composed with torch.where. Class-dependent draw counts would
+    (a) make a fixed seed non-reproducible across knob changes, and (b) correlate
+    every downstream noise draw with the class — and, across ranks whose batches
+    drew different class mixes, desynchronise the RNG streams entirely.
+
+    LAG PAIRING. Both released grids are the same shift map on a uniform node
+    coordinate: node j of grid r is _shift_grid(r, 1 − j/steps). Pairing "slat
+    step j with SS node j+k0" is therefore the curve family
+
+        t_s  = _shift_grid(3.0, u)                       (SHAPE_PARAMS rescale_t)
+        t_ss = _shift_grid(5.0, max(u − k0/12, 0))       (SS_PARAMS rescale_t)
+
+    Swept at 10001 points: max(t_ss − t_s) = +0.127 at k0=0, +0.0328 at k0=1, and
+    exactly 0 for every k0 >= 2. k0_lo=3 therefore keeps a full node of margin
+    and needs no clamping. Sampling the FAMILY (k0 ~ U{k0_lo..k0_hi}) rather than
+    filling the (t_ss, t_s) triangle uniformly means one training run covers
+    every spawn point B-lite through B-full might want, so k0 stays an inference
+    knob instead of a retraining decision.
+
+    u_lag IS DRAWN ABOVE k0/steps, NOT ON [0,1]. The discrete pairing is "slat
+    step j with SS node j+k0", which only exists for j <= steps-k0, i.e.
+    u = 1 - j/steps >= k0/steps. Drawing u on [0,1] and clamping instead puts
+    P(u <= k0/steps) = E[k0]/steps of the class at t_ss EXACTLY 0 — at
+    k0 ~ U{3..12} that is 62.5% of the lag class, which then (a) is not lag at
+    all, and (b) carries a (t_s, t_x) law that is NOT the v9 one, quietly
+    breaking the clean class's standing as a bit-identical v9 control. k0_hi is
+    steps-1 for the same reason: k0 = steps leaves no slat step to pair.
+
+    t_x for the lag class is RE-DERIVED above t_s_lag. Reusing the v9 draw would
+    silently break t_s <= t_x, because that draw was taken above the v9 t_s.
+    """
+    assert 0.0 <= p_solo and 0.0 <= p_lag and p_solo + p_lag <= 1.0 + 1e-6, (
+        f"p_solo {p_solo} + p_lag {p_lag} > 1")
+    assert k0_lo >= 2, (
+        f"k0_lo={k0_lo}: t_ss <= t_s fails for k0 < 2 (max violation +0.033 at "
+        "k0=1, +0.127 at k0=0) — see the sweep in this docstring")
+    assert k0_hi >= k0_lo
+
+    # ── every primitive, every row, fixed order — no branching above this line ──
+    u_cls = torch.rand(B, device=device)
+    g_solo = torch.randn(B, device=device)                     # -> logitNormal
+    u_lag = torch.rand(B, device=device)
+    k0 = torch.randint(k0_lo, k0_hi + 1, (B,), device=device).float()
+    w_lag = torch.rand(B, device=device)
+    t_s9, t_x9 = sample_timestep_pairs(B, device, p_corner=p_corner,
+                                       p_corner2=p_corner2)
+
+    # logitNormal(mean, std) — the official SS t-schedule (flow_matching.py's
+    # "logitNormal" branch), reproduced on THIS generator on purpose: calling
+    # loss_fn_ss.sample_t would draw on the CPU stream and split the run's RNG.
+    t_solo = torch.sigmoid(ss_logit_mean + ss_logit_std * g_solo)
+
+    steps = float(len(_t_seq_len_probe()) - 1)                 # 12
+    assert k0_hi <= steps - 1, (
+        f"k0_hi={k0_hi} > steps-1={steps - 1:.0f}: k0=steps leaves no slat step "
+        "to pair with, so the lag class would be empty by construction")
+    # u restricted to (k0/steps, 1] — the range where the pairing exists at all.
+    lo = k0 / steps
+    u_eff = lo + (1.0 - lo) * u_lag
+    t_s_lag = _shift_grid(3.0, u_eff)
+    t_ss_lag = _shift_grid(5.0, u_eff - lo)                    # > 0 a.s., no clamp
+    t_x_lag = t_s_lag + (1.0 - t_s_lag) * w_lag
+
+    solo = u_cls < p_solo
+    lag = (u_cls >= p_solo) & (u_cls < p_solo + p_lag)
+    cls = torch.where(solo, torch.full_like(u_cls, CLS_SOLO, dtype=torch.long),
+                      torch.where(lag, torch.full_like(u_cls, CLS_LAG, dtype=torch.long),
+                                  torch.full_like(u_cls, CLS_CLEAN, dtype=torch.long)))
+
+    zero, one = torch.zeros_like(t_s9), torch.ones_like(t_s9)
+    t_ss = torch.where(solo, t_solo, torch.where(lag, t_ss_lag, zero))
+    t_s = torch.where(solo, one, torch.where(lag, t_s_lag, t_s9))
+    t_x = torch.where(solo, one, torch.where(lag, t_x_lag, t_x9))
+
+    # Structural, so this can only fire if someone edits the construction above.
+    assert bool((t_ss <= t_s + 1e-6).all()) and bool((t_s <= t_x + 1e-6).all()), \
+        "triple order invariant violated — the composition above is wrong"
+    return t_ss, t_s, t_x, cls
+
+
+def _t_seq_len_probe():
+    """The released node count (12 steps -> 13 nodes), read from the sampler so a
+    change there cannot silently desync the lag pairing from the trajectory it is
+    supposed to rehearse."""
+    from .geotex_sampler import SS_PARAMS, _t_seq
+    return _t_seq(SS_PARAMS["steps"], SS_PARAMS["rescale_t"])
+
+
 def _voxel_balanced_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """MSE whose PER-VOXEL weight does not depend on how many voxels this rank drew.
 

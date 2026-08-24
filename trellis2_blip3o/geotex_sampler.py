@@ -51,6 +51,12 @@ SHAPE_PARAMS = dict(steps=12, guidance_strength=7.5, guidance_rescale=0.5,
                     guidance_interval=(0.6, 1.0), rescale_t=3.0)
 TEX_PARAMS = dict(steps=12, guidance_strength=1.0, guidance_rescale=0.0,
                   guidance_interval=(0.6, 0.9), rescale_t=3.0)
+# SS (sparse-structure) stage. Same released-config provenance as the two above;
+# it lived only in the eval scripts (benchmarks/run_wild3dgen.py, eval_ss_*.py,
+# demo_pipeline.py) until v10's lag scheduler needed the grid at TRAIN time.
+# Retyping the constant is how the two arms drift apart, so it lives here now.
+SS_PARAMS = dict(steps=12, guidance_strength=7.5, guidance_rescale=0.7,
+                 guidance_interval=(0.6, 1.0), rescale_t=5.0)
 SIGMA_MIN = 1e-5
 
 
