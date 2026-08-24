@@ -124,14 +124,13 @@ def build_variant(mode, a, dve, cq, c0):
         for _v in range(4):
             _qv[10 + 66 * _v: 10 + 66 * _v + 64] = _v
         cq = cq + (dve[_qv.clamp_min(0)].float() * (_qv >= 0).unsqueeze(-1).float())[None]
-    dseg = d_dino[None]
-    if dve is not None:
-        dseg = dseg + dve[d_vids][None].float()          # per-view identity embedding
-    cond = torch.cat([dseg, cq], 1)
-    mask = torch.cat([d_dmask, qmask])[None]
-    uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
-    keep = mask[0]
-    return cond[:, keep], uncond[:, keep], d_dino, d_vids
+    # trellis2_blip3o.eval_cond wraps build_unified_cond — the training loop's own
+    # builder — so eval and training cannot disagree about the dino segment, the
+    # view embedding, or which drop is CFG.
+    from trellis2_blip3o.eval_cond import cond_uncond_from_tensors
+    cond, uncond = cond_uncond_from_tensors(conn, qwen, qmask, d_dino, d_dmask, dve,
+                                            dino_view_ids=d_vids, qwen_view_ids=_qv)
+    return cond, uncond, d_dino, d_vids
 
 
 @torch.no_grad()

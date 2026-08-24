@@ -92,13 +92,14 @@ def build_cond_mv(conn, dve, sha, combo=0):
         if getattr(conn, "pos_stamp", None) is not None:
             from trellis2_blip3o.pos_stamp import IMG_SPAN_FULL
             cq, c0 = conn.pos_stamp(cq, IMG_SPAN_FULL), conn.pos_stamp(c0, IMG_SPAN_FULL)
-        dseg = dino[None]
-        if dve is not None:
-            dseg = dseg + dve[vids.clamp(max=dve.shape[0] - 1)][None].float()
-        cond = torch.cat([dseg, cq], 1)
-        uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
-    m = torch.cat([dmask, qmask]).bool()
-    return [cond[0][m]], [uncond[0][m]]
+    # trellis2_blip3o.eval_cond wraps build_unified_cond — the training loop's own
+    # builder — so eval and training cannot disagree about the dino segment, the
+    # view embedding, or which drop is CFG.
+    from trellis2_blip3o.eval_cond import cond_uncond_from_tensors
+    cond, uncond = cond_uncond_from_tensors(
+        conn, qwen, qmask, dino, dmask, dve,
+        dino_view_ids=vids.clamp(max=dve.shape[0] - 1) if dve is not None else vids)
+    return [cond[0]], [uncond[0]]
 
 
 def load_scratch(ckpt, ema=False):

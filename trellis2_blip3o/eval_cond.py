@@ -111,7 +111,37 @@ def cond_uncond(connector, rec: Dict[str, torch.Tensor],
             qwen_drop_prob=0.0, ext_drops=(drop, ddrop, qdrop), **kw)
         return c[0][k[0]][None]
 
+    dd = o if drop_dino else z
+    qd = o if drop_qwen else z
     with torch.no_grad():
-        cond = build(z, o if drop_dino else z, o if drop_qwen else z)
-        uncond = build(o, z, z)          # CFG: values zeroed, keys kept
+        cond = build(z, dd, qd)
+        # The uncond stays in the SAME modality regime as the cond: guidance is
+        # cond - uncond, so a uncond that carries keys the cond does not have
+        # would put the difference partly in tokens the conditional never saw.
+        uncond = build(o, dd, qd)        # CFG: values zeroed, keys as in cond
     return cond, uncond
+
+
+def cond_uncond_from_tensors(connector, qwen, qwen_mask, dino=None, dino_mask=None,
+                             dino_view_embed=None, dino_view_ids=None,
+                             qwen_view_ids=None, **kw):
+    """Tensor-level entry point, for callers holding a cond CACHE rather than a
+    live record (the npz stores the same four/five arrays under other names).
+
+    Exists so cache-based evals stop reimplementing the concat/view-embed/uncond
+    logic. dino=None takes the plain (text) branch, which is why text
+    conditioning no longer needs a hand-rolled path either.
+    """
+    rec = {"cond_hidden": qwen, "cond_keep_mask": qwen_mask}
+    if dino is not None:
+        rec["dino_hidden"] = dino
+        rec["dino_keep_mask"] = (dino_mask if dino_mask is not None else
+                                 torch.ones(dino.shape[0], dtype=torch.bool,
+                                            device=dino.device))
+        rec["dino_view_ids"] = (dino_view_ids if dino_view_ids is not None else
+                                torch.zeros(dino.shape[0], dtype=torch.long,
+                                            device=dino.device))
+    if qwen_view_ids is not None:
+        rec["qwen_view_ids"] = qwen_view_ids
+    return cond_uncond(connector, rec, dino_view_embed=dino_view_embed,
+                       device=str(qwen.device), **kw)

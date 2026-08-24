@@ -107,17 +107,6 @@ QV_START, QV_STRIDE, QV_NTOK, QV_NVIEW = 10, 66, 64, 4
 
 
 # ─────────────────────────── conditioning builders ───────────────────────────
-def _conn_qwen(conn, qwen):
-    """connector(qwen) and connector(0) — the CFG cond/uncond qwen segments."""
-    cq = conn(qwen[None])
-    c0 = conn(torch.zeros_like(qwen)[None])
-    if getattr(conn, "pos_stamp", None) is not None:
-        from trellis2_blip3o.pos_stamp import IMG_SPAN_FULL
-        cq = conn.pos_stamp(cq, IMG_SPAN_FULL)
-        c0 = conn.pos_stamp(c0, IMG_SPAN_FULL)
-    return cq, c0
-
-
 @torch.no_grad()
 def build_cond_i1(conn, dve, entry_dir):
     """Single-image fusion cond (eval_fusion_v22.build_cond): DINO + dve[0] ; connector(qwen).
@@ -132,14 +121,9 @@ def build_cond_i1(conn, dve, entry_dir):
         b = np.load(os.path.join(entry_dir, "d000.npz"))
         dino = torch.from_numpy(b["hidden"]).float().cuda()
         dmask = torch.from_numpy(b["keep_mask"]).cuda()
-    cq, c0 = _conn_qwen(conn, qwen)
-    dseg = dino[None]
-    if dve is not None:
-        dseg = dseg + dve[0][None, None].float()
-    cond = torch.cat([dseg, cq], 1)
-    uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
-    keep = torch.cat([dmask, qmask])
-    return cond[:, keep], uncond[:, keep], {"n_tok": int(keep.sum())}
+    from trellis2_blip3o.eval_cond import cond_uncond_from_tensors
+    cond, uncond = cond_uncond_from_tensors(conn, qwen, qmask, dino, dmask, dve)
+    return cond, uncond, {"n_tok": int(cond.shape[1])}
 
 
 @torch.no_grad()
@@ -153,23 +137,19 @@ def build_cond_im(conn, dve, m00_path):
     dino = torch.from_numpy(a["dino_hidden"]).float().cuda()     # (4*405, 1024)
     dmask = torch.from_numpy(a["dino_keep_mask"]).cuda()
     vids = torch.from_numpy(a["dino_view_ids"]).long().cuda()
-    cq, c0 = _conn_qwen(conn, qwen)
-    if dve is not None and qwen.shape[0] >= QV_START + QV_STRIDE * (QV_NVIEW - 1) + QV_NTOK:
-        qv = torch.full((qwen.shape[0],), -1, dtype=torch.long, device=cq.device)
-        for v in range(QV_NVIEW):
-            qv[QV_START + QV_STRIDE * v: QV_START + QV_STRIDE * v + QV_NTOK] = v
-        add = dve[qv.clamp_min(0)].float() * (qv >= 0).unsqueeze(-1).float()
-        cq = cq + add[None]
-    else:
+    # The CACHE does not store qwen_view_ids (the live encoder does), so the
+    # fixed image-block layout is still derived here — but only to hand the
+    # shared builder the same array a live record would carry.
+    if not (dve is not None and qwen.shape[0] >= QV_START + QV_STRIDE * (QV_NVIEW - 1) + QV_NTOK):
         raise RuntimeError(f"unexpected qwen layout T_q={qwen.shape[0]} in {m00_path}")
-    dseg = dino[None]
-    if dve is not None:
-        dseg = dseg + dve[vids][None].float()
-    cond = torch.cat([dseg, cq], 1)
-    uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
-    keep = torch.cat([dmask, qmask])
-    return cond[:, keep], uncond[:, keep], {"views": [int(v) for v in a["views"]],
-                                            "n_tok": int(keep.sum())}
+    qv = torch.full((qwen.shape[0],), -1, dtype=torch.long, device=qwen.device)
+    for v in range(QV_NVIEW):
+        qv[QV_START + QV_STRIDE * v: QV_START + QV_STRIDE * v + QV_NTOK] = v
+    from trellis2_blip3o.eval_cond import cond_uncond_from_tensors
+    cond, uncond = cond_uncond_from_tensors(conn, qwen, qmask, dino, dmask, dve,
+                                            dino_view_ids=vids, qwen_view_ids=qv)
+    return cond, uncond, {"views": [int(v) for v in a["views"]],
+                          "n_tok": int(cond.shape[1])}
 
 
 @torch.no_grad()
@@ -179,8 +159,9 @@ def build_cond_t(conn, dve, entry_dir, cap_idx=CAP_IDX):
     a = np.load(os.path.join(entry_dir, f"t{cap_idx:03d}.npz"))
     qwen = torch.from_numpy(a["hidden"]).float().cuda()
     qmask = torch.from_numpy(a["keep_mask"]).cuda()
-    cq, c0 = _conn_qwen(conn, qwen)
-    return cq[:, qmask], c0[:, qmask], {"n_tok": int(qmask.sum())}
+    from trellis2_blip3o.eval_cond import cond_uncond_from_tensors
+    cond, uncond = cond_uncond_from_tensors(conn, qwen, qmask)   # dino=None -> plain branch
+    return cond, uncond, {"n_tok": int(cond.shape[1])}
 
 
 BUILDERS = {"i1": build_cond_i1, "im": build_cond_im, "t": build_cond_t}

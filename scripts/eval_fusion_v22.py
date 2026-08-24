@@ -55,33 +55,66 @@ def load_flow_and_connector(ckpt_dir, use_ema=True):
     return flow.cuda().eval(), conn.cuda().eval().float(), (dve.cuda() if dve is not None else None)
 
 
+_LIVE_ENC = None
+
+
+def build_cond_live(conn, dve, renders_dir, view, qwen_only=False):
+    """build_cond from a RENDER instead of a cache entry.
+
+    The cond cache was retired 2026-08-21 (all three training tasks now encode live), so
+    eval has to encode too — and should anyway: this way eval and training go through the
+    exact same encoder, which is the only way a conditioning bug can no longer hide in the
+    gap between them. Same four tensors, same downstream path.
+    """
+    global _LIVE_ENC
+    if _LIVE_ENC is None:
+        from trellis2_blip3o.live_cond_batch import TrainCondEncoder
+        _LIVE_ENC = TrainCondEncoder()
+    from trellis2_blip3o.live_cond_batch import prep_i1
+    c = _LIVE_ENC.encode([prep_i1(renders_dir, view)])[0]
+    return _build_cond_from(conn, dve, c["cond_hidden"].float().cuda(),
+                            c["cond_keep_mask"].cuda(),
+                            c["dino_hidden"].float().cuda(),
+                            c["dino_keep_mask"].cuda(), qwen_only)
+
+
 def build_cond(conn, dve, entry_dir, qwen_only=False):
     a = np.load(os.path.join(entry_dir, "v000.npz"))
-    qwen = torch.from_numpy(a["hidden"]).float().cuda()          # (Tq, 2048)
-    qmask = torch.from_numpy(a["keep_mask"]).cuda()
-    dino = torch.from_numpy(a["dino_hidden"]).float().cuda()     # (Td, 1024)
-    dmask = torch.from_numpy(a["dino_keep_mask"]).cuda()
-    with torch.no_grad():
-        cq = conn(qwen[None])                                    # (1, Tq, 1024)
-        c0 = conn(torch.zeros_like(qwen)[None])
-        if getattr(conn, "pos_stamp", None) is not None:         # dpos stamp (pos_stamp.py) —
-            from trellis2_blip3o.pos_stamp import IMG_SPAN_FULL  # full-seq span, BEFORE keep-indexing
-            cq = conn.pos_stamp(cq, IMG_SPAN_FULL)
-            c0 = conn.pos_stamp(c0, IMG_SPAN_FULL)               # uncond stamped too (train parity)
-        dseg = dino[None]
-        if dve is not None:
-            dseg = dseg + dve[0][None, None].float()
-        cond = torch.cat([dseg, cq], 1)                          # (1, Td+Tq, 1024)
-        mask = torch.cat([dmask, qmask])[None]                   # (1, Td+Tq)
-        # CFG uncond: zeros-DINO ; connector(0)  (flow_heads convention)
-        uncond = torch.cat([torch.zeros_like(dseg), c0], 1)
-    if qwen_only:
-        # DINO segment ABSENT — the dino_drop training regime (keys masked off entirely)
-        keep = qmask
-        return cq[:, keep], c0[:, keep]
-    # keep only masked-in tokens (bs=1 → simply index, no padding needed)
-    keep = mask[0]
-    return cond[:, keep], uncond[:, keep]
+    return _build_cond_from(conn, dve,
+                            torch.from_numpy(a["hidden"]).float().cuda(),
+                            torch.from_numpy(a["keep_mask"]).cuda(),
+                            torch.from_numpy(a["dino_hidden"]).float().cuda(),
+                            torch.from_numpy(a["dino_keep_mask"]).cuda(), qwen_only)
+
+
+def _build_cond_from(conn, dve, qwen, qmask, dino, dmask, qwen_only=False):
+    """Delegates to trellis2_blip3o.eval_cond, which calls build_unified_cond —
+    the builder the training loop uses.
+
+    This used to be a second, parallel implementation. Verified bitwise identical
+    to the delegated path on single-image records (max|d| = 0.0 for both cond and
+    uncond, full and partial keep-masks), so no number produced by this file
+    changes. What the delegation fixes is the case it was never called with: a
+    record carrying qwen_view_ids (multi-image) also gets the view embedding on
+    the QWEN segment in training, which the old body did not add — measured 3.3
+    absolute divergence. Single-image records have no qwen_view_ids, which is why
+    the two agreed.
+
+    qwen_only maps onto the ddrop modality regime (dino keys masked out), and the
+    uncond now stays in that same regime rather than reintroducing dino keys the
+    conditional does not have.
+    """
+    from trellis2_blip3o.eval_cond import cond_uncond
+    rec = {
+        "cond_hidden": qwen,
+        "cond_keep_mask": qmask,
+        "dino_hidden": dino,
+        "dino_keep_mask": dmask,
+        "dino_view_ids": torch.zeros(dino.shape[0], dtype=torch.long,
+                                     device=dino.device),
+    }
+    return cond_uncond(conn, rec, dino_view_embed=dve,
+                       device=str(qwen.device), drop_dino=qwen_only)
 
 
 @torch.no_grad()
