@@ -35,20 +35,13 @@ from trellis2_blip3o import _paths  # noqa: F401
 from trellis2 import models as t2models
 from trellis2.pipelines.samplers import FlowEulerGuidanceIntervalSampler
 from trellis2_blip3o.geotex_sampler import SS_PARAMS
-from trellis2_blip3o.flow_heads import build_unified_cond
+from trellis2_blip3o.eval_cond import cond_uncond, good_view as good_view_idx
 from trellis2_blip3o.live_cond_batch import TrainCondEncoder, prep_i1, prep_t
 from trellis2_blip3o.occ_metrics import (aggregate, occ64_from_latent, occ_metrics,
                                          trivial_baselines)
 from trellis2_blip3o.tr2_modules import SS_FLOW_CONFIG_PATH, load_norm_stats
 from scripts.export_glb_fullchain import SSDEC, load_ss_flow
-from scripts.eval_fusion_v22 import good_view_b  # noqa: F401 (kept for parity)
 
-
-def good_view_idx(sha: str) -> int:
-    """The INTEGER view index behind eval_fusion_v22.good_view_b, which returns a
-    filename. prep_i1 takes an index, so deriving it from the same formula keeps
-    this eval on the exact view every other eval in the repo uses."""
-    return 5 + (int(sha[:8], 16) + 3) % 7
 
 SS_CKPT = os.environ.get("SS_CKPT", "runs/s3_ss_t50b/checkpoint-14000")
 N = int(os.environ.get("N", "32"))
@@ -74,38 +67,11 @@ print(f"[occ] ss normalization: {'ACTIVE' if _nrm else 'none (raw latent)'}", fl
 
 
 def cond_pair(rec):
-    """(cond, uncond) through build_unified_cond — the TRAINING builder.
-
-    Using connector(cond_hidden) alone would silently run the qwen-only arm: the
-    s3 SS runs are fuse_dino=True, so their cond is cat([dino_segment,
-    qwen_segment]) with a per-view embedding on the dino side, and dropping the
-    dino half costs ~1029 of ~2053 tokens. It is not a crash, it is a much worse
-    number — measured 0.156 iou64 qwen-only vs the fusion arm below.
-
-    uncond forces the SAME masks CFG uses at inference: qwen zeroed BEFORE the
-    connector (connector(0) is the model's learned uncond; zeros after it is an
-    unconditional the model never saw) and the dino segment masked out. Forcing
-    them through ext_drops rather than probabilities also keeps this
-    deterministic.
-    """
-    h = rec["cond_hidden"].float().cuda()[None]
-    km = rec["cond_keep_mask"].cuda().bool()[None]
-    dh = rec["dino_hidden"].float().cuda()[None]
-    dkm = rec["dino_keep_mask"].cuda().bool()[None]
-    dvi = rec["dino_view_ids"].cuda()[None]
-    qvi = rec.get("qwen_view_ids")
-    qvi = qvi.cuda()[None] if qvi is not None else None
-    kw = dict(dino_hidden=dh, dino_key_mask=dkm, dino_view_ids=dvi,
-              qwen_view_ids=qvi, dino_view_embed=dve, cond_max_length=10240)
-    one = torch.ones(1, dtype=torch.bool, device="cuda")
-    zero = torch.zeros(1, dtype=torch.bool, device="cuda")
-    c, kc, _, _ = build_unified_cond(conn, h, km, mask_drop_prob=0.0,
-                                     dino_drop_prob=0.0, qwen_drop_prob=0.0,
-                                     ext_drops=(zero, zero, zero), **kw)
-    u, ku, _, _ = build_unified_cond(conn, h, km, mask_drop_prob=0.0,
-                                     dino_drop_prob=0.0, qwen_drop_prob=0.0,
-                                     ext_drops=(one, one, zero), **kw)
-    return c[0][kc[0]][None], u[0][ku[0]][None]
+    """Delegates to trellis2_blip3o.eval_cond — the one builder, shared with
+    training. Everything that used to be hand-rolled here (the dino segment, the
+    view embed, connector(0) vs zeros, and which drop is CFG) lives there now,
+    with its own tests."""
+    return cond_uncond(conn, rec, dino_view_embed=dve, cond_max_length=10240)
 
 
 rows = [json.loads(l) for l in open(MANI)]
