@@ -60,6 +60,8 @@ import torch.nn.functional as F
 
 import trellis2_blip3o._paths  # noqa: F401  (repo path injection, existing convention)
 from trellis2.modules import sparse as sp
+from trellis2.modules.attention import RotaryPositionEmbedder
+from trellis2.modules.attention.full_attn import scaled_dot_product_attention as _dense_sdpa
 from trellis2.modules.sparse.attention.full_attn import sparse_scaled_dot_product_attention
 # the block's OWN fused kernels (modulated.py:149-160 calls these; G0 bisect
 # proved eager-equivalent math lands 1 ULP off the Triton path at real scale)
@@ -107,6 +109,46 @@ def _rotate_pad_pair(k_sp):
     f = k_sp.feats
     x, y = f[..., -2:-1], f[..., -1:]
     return k_sp.replace(torch.cat([f[..., :-2], -y, x], dim=-1))
+
+
+# ── v10: dense (SS) lane helpers ─────────────────────────────────────────────
+# The sparse helpers above cannot be reused: the dense block broadcasts its
+# modulation with .unsqueeze(1) over a (B, L, C) tensor, while the sparse call
+# sites broadcast per-sample over a flat voxel list. Same formula, different
+# shape discipline — reusing one for the other is a silent, plausible-looking bug.
+def _dense_mod_params(block, mod: torch.Tensor):
+    """modulated.py:148-149, share_mod branch. Six (B, C) tensors."""
+    assert block.share_mod, "SS blocks are share_mod=True; the adaLN branch is untested here"
+    return (block.modulation + mod).type(mod.dtype).chunk(6, dim=1)
+
+
+def _dense_attn_qkv(attn, h: torch.Tensor, phases: torch.Tensor):
+    """modules.py:73-87 for type='self'. Returns (q, k, v, k_pre_rope).
+
+    k_pre_rope is the EXPORT POINT for the cross-tower read: post-qk_rms_norm,
+    PRE-rope. It has to be pre-rope because a borrowed key is re-roped into the
+    32^3 frame at the consumer; handing over the already-roped k would rotate it
+    twice and quietly destroy every relative position it encodes. The rms-then-
+    rope order here is identical to the sparse path, so the two towers export
+    the same object.
+    """
+    B, L, _ = h.shape
+    qkv = attn.to_qkv(h).reshape(B, L, 3, attn.num_heads, -1)
+    q, k, v = qkv.unbind(dim=2)
+    if attn.qk_rms_norm:
+        q = attn.q_rms_norm(q)
+        k = attn.k_rms_norm(k)
+    k_pre = k
+    if attn.use_rope:
+        q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
+        k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
+    return q, k, v, k_pre
+
+
+def _dense_attn_out(attn, h: torch.Tensor):
+    """modules.py:109-110."""
+    B, L = h.shape[:2]
+    return attn.to_out(h.reshape(B, L, -1))
 
 
 def _fusion_plan(layout, corner_on, device):
@@ -170,7 +212,9 @@ class UnifiedGeoTexFlow(nn.Module):
                  cond_mode: str = "cross_attn",
                  cond_stream_blocks: int = 10,
                  coupling: str = "union",
-                 bidirectional: bool = False):
+                 bidirectional: bool = False,
+                 ss_flow: nn.Module = None,
+                 all_trainable: bool = False):
         """coupling: "union" (DEFAULT — MF-faithful bare single-softmax union,
         dit.py:137-148; user decision 2026-08-11: try MF first, measure) or
         "gated" (in-house mmdit_slat.py:190-196 two-softmax + per-head zero-init
@@ -205,15 +249,49 @@ class UnifiedGeoTexFlow(nn.Module):
         assert ga.use_rope and ta.use_rope, "both streams must use rope"
         assert ga.rope.rope_freq == ta.rope.rope_freq, "rope_freq mismatch"
         assert ga.rope.head_dim == ta.rope.head_dim, "rope head_dim mismatch"
+        if ss_flow is not None:
+            # The SS tower is DENSE (16^3 = 4096 tokens, full attention), so its
+            # phases live in a precomputed buffer rather than in a rope module,
+            # and its rope_freq is NOT stored anywhere: sparse_structure_flow.py
+            # builds the table with RotaryPositionEmbedder(head_dim, 3) and no
+            # rope_freq argument, so it is always the (1.0, 10000.0) default and
+            # the slat towers must match that LITERAL, not a sibling attribute.
+            assert getattr(ss_flow, "pe_mode", None) == "rope", "ss: pe_mode must be rope"
+            assert getattr(ss_flow, "rope_phases", None) is not None, "ss: no rope_phases"
+            assert ss_flow.rope_phases.is_complex(), (
+                "ss.rope_phases lost its imaginary part — something cast the whole "
+                "module to bf16 instead of going through to_bf16_keep_complex; the "
+                "model still runs and the geometry is garbage")
+            assert tuple(ga.rope.rope_freq) == (1.0, 10000.0), (
+                f"slat rope_freq {tuple(ga.rope.rope_freq)} != the (1.0, 10000.0) the "
+                "SS phase table is hard-wired to (sparse_structure_flow.py)")
+            _ss_hd = ss_flow.model_channels // ss_flow.num_heads
+            assert _ss_hd == ga.rope.head_dim, f"ss head_dim {_ss_hd} != slat {ga.rope.head_dim}"
+            assert ss_flow.num_heads == ga.num_heads == ta.num_heads, "head count mismatch"
+            assert ss_flow.blocks[0].self_attn.qk_rms_norm == ga.qk_rms_norm, "qk_rms mismatch"
+            assert len(ss_flow.blocks) == len(geo_flow.blocks), "ss block count mismatch"
 
         self.cond_mode = cond_mode
         self.geo_flow = geo_flow
         self.tex_flow = tex_flow
 
-        # geo: frozen forever (one-way spec makes this exact, not approximate)
-        for p in self.geo_flow.parameters():
-            p.requires_grad_(False)
-        self.geo_flow.eval()
+        # ── v10: the SS tower as a THIRD stream ──
+        # Registered here (prefix unified_geotex.ss_flow.) and NOT also on
+        # TrellisNativeVLM: a second registration would duplicate 1.3B in the
+        # state dict and double-count it in the EMA shadow.
+        self.ss_flow = ss_flow
+        # all_trainable is v10's "nothing is frozen" switch. It cannot be
+        # expressed with --flow_tune: that flag's "full" mode returns without
+        # unfreezing anything, and its tag list never matches a unified_geotex.*
+        # parameter, so it is a silent no-op on this path.
+        self.all_trainable = bool(all_trainable)
+        self._geo_unfrozen = self.all_trainable
+
+        # geo: frozen unless v10 says otherwise (one-way spec makes this exact)
+        if not self.all_trainable:
+            for p in self.geo_flow.parameters():
+                p.requires_grad_(False)
+            self.geo_flow.eval()
 
         # ── bidirectional (user topology decision 2026-08-11): geo ALSO reads
         # tex in the joint region, CORNER-MASKED off at t_s=0 per sample (the
@@ -348,6 +426,45 @@ class UnifiedGeoTexFlow(nn.Module):
             # direction): [:, 0] = geo, [:, 1] = tex. Zero-init, so at warm
             # start the cond lane is exactly the old read-only lane.
             self.cond_reads_gate = nn.Parameter(torch.zeros(n_cs, 2, n_heads))
+
+        # ── v10 cross-tower reads (both directions), all zero-init ──
+        # These are SEPARATE gated attentions whose output is ADDED before
+        # to_out, not extra keys in the shared union softmax. That is not a
+        # stylistic choice: a bare union has NO init identity for a new segment
+        # (even all-zero keys enter the softmax denominator and dilute every
+        # existing attention), so concatenating SS keys would move the model on
+        # step 0 and forfeit the only thing that makes the three-tower assembly
+        # certifiable against the two-tower one. Being a separate softmax is
+        # also why this composes with the fused union path unchanged.
+        if ss_flow is not None:
+            n_b = len(tex_flow.blocks)
+            self.ss_gates_geo = nn.Parameter(torch.zeros(n_b, n_heads))
+            self.ss_gates_tex = nn.Parameter(torch.zeros(n_b, n_heads))
+            # SS <- slat. Present so v10 trains it, DORMANT at inference until a
+            # later phase turns it on; [:, 0] = geo, [:, 1] = tex.
+            self.ss_reads_gate = nn.Parameter(torch.zeros(n_b, 2, n_heads))
+            self.ss_reads_enabled = True     # plain attr: inference flips it, not a Parameter
+
+            # Re-rope table: the SS grid mapped into the slat frame, c -> 2c+0.5.
+            # SS cell c covers slat voxels 2c and 2c+1, so 2c+0.5 is their exact
+            # midpoint — the position a slat query should see the SS key at. The
+            # table depends only on the fixed 16^3 grid, so it is built once and
+            # reused by all 30 blocks and both consumer lanes.
+            # persistent=False keeps a complex64 tensor out of every state_dict
+            # and strict-load path (and out of reach of a future whole-model
+            # .to(bf16), which would silently zero its imaginary part).
+            from trellis2.modules.attention import RotaryPositionEmbedder
+            _res = ss_flow.resolution
+            _c = torch.stack(torch.meshgrid(
+                *[torch.arange(_res, dtype=torch.float32)] * 3, indexing="ij"),
+                dim=-1).reshape(-1, 3)          # SAME order as the SS token flatten
+            _rp = RotaryPositionEmbedder(ga.rope.head_dim, 3, rope_freq=(1.0, 10000.0))
+            self.register_buffer("ss_phases_slat", _rp(2.0 * _c + 0.5), persistent=False)
+        else:
+            self.ss_gates_geo = None
+            self.ss_gates_tex = None
+            self.ss_reads_gate = None
+            self.ss_reads_enabled = False
 
     # ── coupling A (DEFAULT): MF-faithful bare union softmax ────────────────
     def _union_attn(self, q_x, k_x, v_x, k_s, v_s, k_c=None, v_c=None,
@@ -788,6 +905,85 @@ class UnifiedGeoTexFlow(nn.Module):
         for b in blocks:                       # restore (their convention)
             b.use_checkpoint = False
 
+    # ── v10: the SS lane, block by block ────────────────────────────────────
+    def ss_prologue(self, x_ss, t_ss, cond_ss):
+        """sparse_structure_flow.py:234-241 — everything before the block loop.
+
+        Returns (h, mod_ss, cond_ss) in the tower's own dtype. Split out from the
+        loop so the caller can interleave SS blocks with the slat pair rather
+        than running the tower to completion first: pre-running it would mean
+        holding all 30 blocks' (k, v) live across the whole slat pass, which is
+        755 MB per sample at 4096 tokens.
+        """
+        ss = self.ss_flow
+        assert list(x_ss.shape) == [x_ss.shape[0], ss.in_channels] + [ss.resolution] * 3, \
+            f"SS input {tuple(x_ss.shape)} != (B, {ss.in_channels}, {ss.resolution}^3)"
+        h = x_ss.view(*x_ss.shape[:2], -1).permute(0, 2, 1).contiguous()
+        h = ss.input_layer(h)
+        t_emb = ss.t_embedder(t_ss)
+        if ss.share_mod:
+            t_emb = ss.adaLN_modulation(t_emb)
+        return (manual_cast(h, ss.dtype), manual_cast(t_emb, ss.dtype),
+                manual_cast(cond_ss, ss.dtype))
+
+    def _run_ss_block(self, idx, h, mod_ss, cond_ss, ss_cond_mask=None,
+                      want_kv: bool = False, ss_read=None):
+        """modulated.py:148-165 replicated op-for-op for one dense SS block.
+
+        want_kv returns (k_pre_rope, v) for the slat lanes to borrow.
+        ss_read is the SS<-slat term (v10 keeps it dormant); it is ADDED to the
+        attention output before to_out, the same place the slat lanes add theirs.
+        """
+        ss = self.ss_flow
+        blk = ss.blocks[idx]
+        sh1, sc1, g1, sh2, sc2, g2 = _dense_mod_params(blk, mod_ss)
+
+        hn = blk.norm1(h)
+        hn = hn * (1 + sc1.unsqueeze(1)) + sh1.unsqueeze(1)
+        q, k, v, k_pre = _dense_attn_qkv(blk.self_attn, hn, ss.rope_phases)
+        a = _dense_sdpa(q, k, v)
+        if ss_read is not None:
+            a = a + ss_read
+        a = _dense_attn_out(blk.self_attn, a)
+        h = h + a * g1.unsqueeze(1)
+
+        h = h + blk.cross_attn(blk.norm2(h), cond_ss, attn_mask=ss_cond_mask)
+
+        hm = blk.norm3(h)
+        hm = hm * (1 + sc2.unsqueeze(1)) + sh2.unsqueeze(1)
+        h = h + blk.mlp(hm) * g2.unsqueeze(1)
+        return (h, k_pre, v) if want_kv else (h, None, None)
+
+    def ss_epilogue(self, h, out_dtype):
+        """sparse_structure_flow.py:243-247 — layer_norm, out_layer, reshape back
+        to (B, C, res, res, res)."""
+        ss = self.ss_flow
+        h = manual_cast(h, out_dtype)
+        h = F.layer_norm(h, h.shape[-1:])
+        h = ss.out_layer(h)
+        return h.permute(0, 2, 1).view(
+            h.shape[0], h.shape[2], *[ss.resolution] * 3).contiguous()
+
+    def ss_forward(self, x_ss, t_ss, cond_ss, ss_cond_mask=None):
+        """The SS tower run standalone THROUGH the replicated lane. Exists so the
+        replication can be certified against ss_flow(...) directly; the joint
+        forward uses the same three pieces interleaved with the slat blocks."""
+        h, mod_ss, c = self.ss_prologue(x_ss, t_ss, cond_ss)
+        for i in range(len(self.ss_flow.blocks)):
+            h, _, _ = self._run_ss_block(i, h, mod_ss, c, ss_cond_mask)
+        return self.ss_epilogue(h, x_ss.dtype)
+
+    def ss_kv_for_slat(self, k_pre, v):
+        """Re-rope a borrowed SS key into the 32^3 slat frame.
+
+        The key is rotated by the SS grid mapped through c -> 2c+0.5, so a slat
+        query at voxel p and an SS key at cell c see the relative position
+        (p - (2c+0.5)) that they would if both lived in the 32^3 grid. v is never
+        roped anywhere in TRELLIS, so it passes through untouched.
+        """
+        ph = self.ss_phases_slat.to(k_pre.device)
+        return RotaryPositionEmbedder.apply_rotary_embedding(k_pre, ph), v
+
     def unfreeze_geo(self):
         """Stage-2 switch: geo joins training (three-pack per design doc —
         tri-modal data + self-distill + real G3 must ride along)."""
@@ -803,6 +999,19 @@ class UnifiedGeoTexFlow(nn.Module):
         if not getattr(self, "_geo_unfrozen", False):
             self.geo_flow.eval()
         return self
+
+    def trainable_towers(self):
+        """(names, param counts) of every tower that will receive gradient — the
+        one place to read what `all_trainable` actually did."""
+        out = {}
+        for nm in ("ss_flow", "geo_flow", "tex_flow"):
+            m = getattr(self, nm, None)
+            if m is not None:
+                out[nm] = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        out["gates"] = sum(p.numel() for n, p in self.named_parameters()
+                           if p.requires_grad and ("gates" in n or "mixer" in n
+                                                   or "alpha" in n))
+        return out
 
     # ── full forward ────────────────────────────────────────────────────────
     def forward(self, x_s, x_x, t_s, t_x, cond_s, cond_x, tex_concat_cond=None):
@@ -1058,6 +1267,73 @@ def assemble_unified(shape_run_ckpt: str, tex_run_ckpt: str,
         tex_run_ckpt, "tex_slat_512.", weights_file), strict=True)
     return UnifiedGeoTexFlow(geo, tex, cond_mode=cond_mode, coupling=coupling,
                              bidirectional=bidirectional)
+
+
+def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,
+                         cond_mode: str = "cross_attn", coupling: str = "union",
+                         bidirectional: bool = True, all_trainable: bool = True,
+                         weights_file: str = "model.safetensors") -> UnifiedGeoTexFlow:
+    """v10: the THREE-tower assembly, warm from the s3_t50 specialists.
+
+    Warm rather than official on purpose. This project's own adaptation
+    curriculum was connector-only -> --flow_tune last20 -> full, and the s3_*
+    towers are the output of the first two steps: they already read our v2.2
+    conditioning. Starting from official weights would additionally require a
+    fresh connector, i.e. breaking two priors at once on the tower that leads the
+    cascade. (The s3_ss EMA holding ~132 tensors against a 641-tensor tower is
+    what `last20` looks like from the outside — blocks 24-29 plus the connector.)
+
+    STRICT loading everywhere: a prefix that matches nothing raises, and a
+    partial match would be the silent-misload this repo has paid for before.
+    """
+    from blip3o.model.multimodal_decoder.builder import (
+        build_shape_slat_512, build_ss_flow, build_tex_slat_512)
+
+    class _Cfg:                                    # builders read only these attrs
+        trellis_shape_slat_ckpt = None
+        trellis_tex_slat_ckpt = None
+        trellis_ss_flow_ckpt = None
+
+    geo = build_shape_slat_512(_Cfg())
+    tex = build_tex_slat_512(_Cfg())
+    ss = build_ss_flow(_Cfg())
+    geo.load_state_dict(_load_prefixed_state(
+        shape_run_ckpt, "shape_slat_512.", weights_file), strict=True)
+    tex.load_state_dict(_load_prefixed_state(
+        tex_run_ckpt, "tex_slat_512.", weights_file), strict=True)
+    # `ss_flow.` and NOT `ss_flow._orig_mod.`: whether the run was torch.compiled
+    # is a property of that run, not of the weights, so strip the wrapper prefix
+    # if it is there and let strict=True catch anything else.
+    ss_sd = _load_prefixed_state(ss_run_ckpt, "ss_flow.", weights_file)
+    ss_sd = {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+             for k, v in ss_sd.items()}
+    ss.load_state_dict(ss_sd, strict=True)
+    return UnifiedGeoTexFlow(geo, tex, cond_mode=cond_mode, coupling=coupling,
+                             bidirectional=bidirectional, ss_flow=ss,
+                             all_trainable=all_trainable)
+
+
+def load_tri_connectors(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,
+                        weights_file: str = "model.safetensors"):
+    """(geo, tex, ss) connectors — each stream keeps the one it was trained with.
+
+    Every s3 run stores its own under `diffusion_connector.` (that name is the
+    stage-agnostic convention, not a claim about which stream it serves), so all
+    three come from the same prefix in three different run dirs.
+    """
+    from trellis2_blip3o.connector import TRELLIS2Connector
+    conns = []
+    for ck in (shape_run_ckpt, tex_run_ckpt, ss_run_ckpt):
+        cfg = json.load(open(os.path.join(ck, "config.json")))
+        assert cfg.get("cond_adapter") == "mlp", \
+            f"{ck}: cond_adapter={cfg.get('cond_adapter')!r} — arch-flag mismatch"
+        assert not cfg.get("cond_pos_stamp", False), f"{ck}: unexpected pos_stamp"
+        sd = _load_prefixed_state(ck, "diffusion_connector.", weights_file)
+        cond_dim, vlm_dim = sd["fc1.weight"].shape
+        conn = TRELLIS2Connector(vlm_hidden_dim=vlm_dim, trellis_cond_dim=cond_dim)
+        conn.load_state_dict(sd, strict=True)
+        conns.append(conn)
+    return conns[0], conns[1], conns[2]
 
 
 def assemble_unified_from_run(run_ckpt: str, cond_mode: str = "cross_attn",
