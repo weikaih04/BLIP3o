@@ -357,29 +357,50 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             if _kw["cond_mode"] == "stream":
                 _kw["cond_stream_blocks"] = int(
                     getattr(config, "geotex_cond_stream_blocks", 10))
+            _ss_init = getattr(config, "geotex_ss_init", None)
             if _resume:
                 self.unified_geotex = assemble_unified_from_run(_resume, **_kw)
                 rank0_print(f"[geotex] RESUMED unified model from run ckpt {_resume}")
+            elif _ss_init:
+                # v10: three towers, nothing frozen. all_trainable is a
+                # constructor argument rather than a --flow_tune value because
+                # that flag's "full" mode unfreezes nothing and its tag list
+                # never matches a unified_geotex.* parameter.
+                from trellis2_blip3o.unified_geotex import (assemble_unified_tri,
+                                                            load_tri_connectors)
+                self.unified_geotex = assemble_unified_tri(
+                    config.geotex_shape_init, config.geotex_tex_init, _ss_init,
+                    all_trainable=True, **_kw)
+                rank0_print(f"[geotex] v10 THREE-TOWER assembly: ss={_ss_init}")
             else:
                 self.unified_geotex = assemble_unified(
                     config.geotex_shape_init, config.geotex_tex_init, **_kw)
             self.unified_geotex.fused_attn = bool(getattr(config, "geotex_fused", True))
             # connectors follow the same resume/fresh split (a run ckpt stores
             # them as geo_connector.* / diffusion_connector.*)
+            self.ss_connector = None
             if _resume:
                 self.geo_connector, self.diffusion_connector = load_run_connectors(_resume)
+            elif _ss_init:
+                self.geo_connector, self.diffusion_connector, self.ss_connector = \
+                    load_tri_connectors(config.geotex_shape_init,
+                                        config.geotex_tex_init, _ss_init)
             else:
                 self.geo_connector, self.diffusion_connector = load_connectors(
                     config.geotex_shape_init, config.geotex_tex_init)
-            self.geo_connector.requires_grad_(False)
-            self.geo_connector.eval()
+            if not _ss_init:
+                # v10 trains all three connectors; before it, geo's stayed frozen
+                # on purpose (one variable at a time).
+                self.geo_connector.requires_grad_(False)
+                self.geo_connector.eval()
             # geo_flow is a PRETRAINED specialist on this branch and S1 freezes
             # it on purpose. Doing the same to a from-scratch MMDiT3D would pin
             # a RANDOM geo tower with a zero-init out_layer for the whole run
             # (v_s == 0 forever, S2b's geo/distill terms constant with no
             # gradient) — and the freeze audit could not catch it, since it only
             # inspects params that still require grad. Hence the branch.
-            self.unified_geotex.geo_flow.requires_grad_(False)
+            if not _ss_init:
+                self.unified_geotex.geo_flow.requires_grad_(False)
 
         if _stages == "geotex":
             # Activation checkpointing. In the bidir path the WHOLE block pair is
@@ -402,11 +423,24 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                             f"{'ON' if _gc > 0 else 'OFF'} for all {_nb} joint blocks "
                             f"(geotex_gc={_gc}; elastic GC overrides per step)")
             else:
-                _nb = len(self.unified_geotex.tex_flow.blocks)
-                _n_ckpt = int(round(_gc * _nb))
-                for _i, _b in enumerate(self.unified_geotex.tex_flow.blocks):
-                    _b.use_checkpoint = (_i < _n_ckpt)
-                rank0_print(f"[geotex] gradient checkpointing on {_n_ckpt}/{_nb} block pairs "
+                # EVERY trainable tower, not just tex. Before v10 the geo tower
+                # was frozen and there was no SS tower, so walking tex_flow alone
+                # was complete; with three trainable towers the two it skips are
+                # 2.6B of un-checkpointed activations, i.e. an OOM rather than a
+                # wrong number. The SS tower is 30 dense blocks x 4096 tokens.
+                _towers = [("tex", self.unified_geotex.tex_flow)]
+                if getattr(self.unified_geotex, "all_trainable", False):
+                    _towers.append(("geo", self.unified_geotex.geo_flow))
+                if getattr(self.unified_geotex, "ss_flow", None) is not None:
+                    _towers.append(("ss", self.unified_geotex.ss_flow))
+                _rep = []
+                for _nm, _tw in _towers:
+                    _nb = len(_tw.blocks)
+                    _n_ckpt = int(round(_gc * _nb))
+                    for _i, _b in enumerate(_tw.blocks):
+                        _b.use_checkpoint = (_i < _n_ckpt)
+                    _rep.append(f"{_nm} {_n_ckpt}/{_nb}")
+                rank0_print(f"[geotex] gradient checkpointing {' '.join(_rep)} "
                             f"(geotex_gc={_gc})")
             # ── S2b: unfreeze geo ──
             if getattr(config, "geotex_unfreeze_geo", False):
@@ -1012,6 +1046,18 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                                 or getattr(self.config, "geotex_from_scratch", False))
                             else 0.0),
                 joint_cond_drop=bool(getattr(self.config, "geotex_joint_cond_drop", False)),
+                # ── v10. ss_flow_present is CONFIG-derived and therefore
+                # rank-uniform: it gates the collectives and the log-key set,
+                # which must never depend on what a given batch drew.
+                ss_flow_present=getattr(self.unified_geotex, "ss_flow", None) is not None,
+                target_ss_latent=target_ss_latent,
+                connector_ss=getattr(self, "ss_connector", None),
+                loss_fn_ss=self._loss_fn_ss,
+                ss_loss_w=float(getattr(self.config, "geotex_ss_loss_w", 1.0)),
+                p_solo=float(getattr(self.config, "geotex_p_solo", 0.20)),
+                p_lag=float(getattr(self.config, "geotex_p_lag", 0.20)),
+                k0_lo=int(getattr(self.config, "geotex_k0_lo", 3)),
+                k0_hi=int(getattr(self.config, "geotex_k0_hi", 11)),
             )
             loss = loss * float(self.config.flow_weight)
             self._last_diag = {f"per_stage/{k}": float(v) for k, v in glogs.items()}

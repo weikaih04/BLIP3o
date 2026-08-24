@@ -204,6 +204,9 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_bidir "$BIDIR" --geotex_fused "$FUSED" --geotex_gc "$GC" \
   --geotex_unfreeze_geo "$UNFREEZE_GEO" --geotex_geo_loss_w "$GEO_LOSS_W" \
   --geotex_p_corner "$P_CORNER" --geotex_p_corner2 "$P_CORNER2" \
+  --geotex_ss_init "${SS_INIT:-}" --geotex_ss_loss_w "${SS_LOSS_W:-1.0}" \
+  --geotex_p_solo "${P_SOLO:-0.20}" --geotex_p_lag "${P_LAG:-0.20}" \
+  --geotex_k0_lo "${K0_LO:-3}" --geotex_k0_hi "${K0_HI:-11}" \
   --adaptive_grad_clip "${ADAPTIVE_CLIP:-True}" \
   --geotex_mismatch_w "${MISMATCH_W:-0.0}" --geotex_mismatch_margin "${MISMATCH_MARGIN:-0.15}" \
   --geotex_joint_cond_drop "${JOINT_COND_DROP:-False}" \

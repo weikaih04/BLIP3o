@@ -699,6 +699,13 @@ class NativeArgs:
     geotex_gc: float = field(default=1.0)      # fraction of block pairs gradient-checkpointed (1=all, 0=none)
     # S2b — unfreeze geo (three-pack: geo loss + self-distill + G3 red line)
     geotex_unfreeze_geo: bool = field(default=False)
+    # ── v10: the third tower. Setting geotex_ss_init is what turns v10 on. ──
+    geotex_ss_init: str = field(default="")            # s3_ss run ckpt; "" = two-tower
+    geotex_ss_loss_w: float = field(default=1.0)
+    geotex_p_solo: float = field(default=0.20)         # SS-solo rows
+    geotex_p_lag: float = field(default=0.20)          # lag-band rows
+    geotex_k0_lo: int = field(default=3)               # t_ss<=t_s fails below 2
+    geotex_k0_hi: int = field(default=11)              # k0=steps leaves no slat step
     geotex_geo_loss_w: float = field(default=1.0)
     geotex_p_corner: float = field(default=0.4)  # user 2026-08-11: flagship tex|mesh mass; 0.2 = A1
     geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
@@ -885,6 +892,12 @@ def main():
         geotex_fused=native_args.geotex_fused,
         geotex_gc=native_args.geotex_gc,
         geotex_unfreeze_geo=native_args.geotex_unfreeze_geo,
+        geotex_ss_init=native_args.geotex_ss_init,
+        geotex_ss_loss_w=native_args.geotex_ss_loss_w,
+        geotex_p_solo=native_args.geotex_p_solo,
+        geotex_p_lag=native_args.geotex_p_lag,
+        geotex_k0_lo=native_args.geotex_k0_lo,
+        geotex_k0_hi=native_args.geotex_k0_hi,
         geotex_geo_loss_w=native_args.geotex_geo_loss_w,
         geotex_p_corner=native_args.geotex_p_corner,
         geotex_p_corner2=native_args.geotex_p_corner2,
@@ -950,6 +963,17 @@ def main():
             # variable at a time; geo's blocks 0-23 have never seen our cond, so
             # let them adapt to the existing cond distribution first.
             _allowed = _allowed + ("unified_geotex.geo_flow.",)
+        if getattr(getattr(model, "unified_geotex", None), "ss_flow", None) is not None:
+            # v10: three towers, three connectors, and the cross-tower gates.
+            # Listed EXPLICITLY rather than by widening the audit to a bare
+            # "unified_geotex." prefix — the audit's whole value is that it fails
+            # when something unintended became trainable, and there are now three
+            # towers to keep straight.
+            _allowed = _allowed + (
+                "unified_geotex.ss_flow.", "unified_geotex.geo_flow.",
+                "unified_geotex.ss_gates_geo", "unified_geotex.ss_gates_tex",
+                "unified_geotex.ss_reads_gate",
+                "geo_connector.", "ss_connector.")
         if getattr(getattr(model, "unified_geotex", None), "from_scratch", False):
             # From-scratch MMDiT3D: there is no frozen warm start, so EVERY
             # unified param is meant to train (geo_flow, tex_flow, cond_flow,

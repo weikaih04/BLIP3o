@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+import contextlib
+
 import torch
 
 from trellis2_blip3o.loss import TRELLIS2FlowMatchingLoss
@@ -679,6 +681,38 @@ def _t_seq_len_probe():
     return _t_seq(SS_PARAMS["steps"], SS_PARAMS["rescale_t"])
 
 
+def _row_balanced_mse(pred: torch.Tensor, target: torch.Tensor,
+                      keep: torch.Tensor) -> torch.Tensor:
+    """Dense twin of _voxel_balanced_mse, for the SS tower's (B, C, D, H, W).
+
+    CONTAINS A COLLECTIVE — call it UNCONDITIONALLY. A rank whose whole
+    micro-batch drew the clean class has zero kept rows and must STILL enter the
+    all_reduce; guarding it behind `if keep.any():` makes the collective
+    rank-conditional, which is an NCCL hang, not an error.
+
+    Row SELECTION (pred[keep]) rather than multiply-by-zero: the normaliser is
+    the all-reduced count of kept rows, so an empty local selection contributes
+    0 to the numerator AND 0 to the denominator instead of diluting the loss
+    scale, and the empty sum keeps a live grad_fn so DeepSpeed still sees the SS
+    parameters as used. Same reasoning as the sparse helper below, one dimension
+    down.
+    """
+    p_sel, t_sel = pred[keep], target[keep]
+    # 0-dim, NOT torch.tensor([...]): a shape-[1] denominator broadcasts the
+    # scalar numerator up to shape [1], and a 1-D loss silently propagates all
+    # the way into the per-task log reducer, which stacks scalars.
+    n_local = torch.tensor(float(p_sel.shape[0]), device=pred.device)
+    sq = ((p_sel.float() - t_sel.float()) ** 2).flatten(1).mean(1).sum()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        world = torch.distributed.get_world_size()
+        n_glob = n_local.clone()
+        torch.distributed.all_reduce(n_glob)
+        # x world: DDP averages gradients across ranks, so scaling by the global
+        # count alone would divide the loss twice.
+        return sq * world / n_glob.clamp_min(1.0)
+    return sq / n_local.clamp_min(1.0)
+
+
 def _voxel_balanced_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """MSE whose PER-VOXEL weight does not depend on how many voxels this rank drew.
 
@@ -742,6 +776,16 @@ def compute_unified_geotex_loss(
     cond_max_length: int = 8192,
     # unified knobs
     p_corner: float = 0.2, p_corner2: float = 0.2,
+    # ── v10: the third tower ──
+    ss_flow_present: bool = False,   # CONFIG-derived, rank-uniform: gates the
+                                     # collectives and the log-key set
+    target_ss_latent=None,           # (B, 8, 16, 16, 16) RAW — the SS config has
+                                     # no normalization key, by upstream design
+    connector_ss=None,
+    loss_fn_ss=None,                 # logitNormal(1,1), sigma_min 1e-5
+    ss_loss_w: float = 1.0,
+    p_solo: float = 0.20, p_lag: float = 0.20,
+    k0_lo: int = 3, k0_hi: int = 11,
     probe_every: int = 200,   # cond-sensitivity probe cadence; 0 = off
     # ── S2b: geo unfrozen (the "three-pack" of the design doc) ──
     geo_loss_w: float = 0.0,        # >0 turns on geo's OWN velocity loss
@@ -799,7 +843,13 @@ def compute_unified_geotex_loss(
             # connector_geo(0)+zeros-dino is the geo tower's own learned uncond
             # (s3 trained with mask_drop 0.1), so replayed drops are in-distribution.
             _cs_ext = (_sdrops["drop"], _sdrops["ddrop"], _sdrops["qdrop"])
-        with torch.no_grad():
+        # no_grad ONLY while the geo connector is frozen. v10 trains it, and a
+        # no_grad here would starve it forever — silently, since the geo tower
+        # still learns through its own blocks and nothing would look broken.
+        _cs_ctx = (contextlib.nullcontext()
+                   if any(pm.requires_grad for pm in connector_geo.parameters())
+                   else torch.no_grad())
+        with _cs_ctx:
             cond_s, key_s, _, _ = build_unified_cond(
                 connector_geo, cond_hidden, cond_key_mask,
                 mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
@@ -809,8 +859,51 @@ def compute_unified_geotex_loss(
                 ext_drops=_cs_ext)
             cond_s = _masked_list(cond_s, key_s)
 
-    # timestep pair + noising (diffuse/get_v = upstream formulas, never re-derived)
-    t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2)
+    # ── v10: the SS stream's cond, from the SAME realized per-sample masks ──
+    # Unified dropout is not a nicety: at inference CFG nulls all three streams
+    # together, so a row that trains with cond dropped on tex but present on SS
+    # rehearses a combination that never occurs. Replaying via ext_drops also
+    # consumes no RNG, so adding the third connector cannot shift the stream.
+    # The SS lane takes the (B,1,1,T) sdpa mask, NOT the masked list the sparse
+    # lanes use — its cross-attn is dense.
+    cond_ss = sdpa_ss = None
+    if ss_flow_present:
+        assert connector_ss is not None, "ss_flow_present but connector_ss is None"
+        _ss_ext = _cs_ext if (joint_cond_drop and _sdrops.get("drop") is not None) else (
+            (_sdrops["drop"], _sdrops["ddrop"], _sdrops["qdrop"])
+            if _sdrops.get("drop") is not None else None)
+        cond_ss, key_ss, sdpa_ss, _ = build_unified_cond(
+            connector_ss, cond_hidden, cond_key_mask,
+            mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
+            dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
+            qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
+            qwen_view_ids=qwen_view_ids, dino_view_embed=dino_view_embed,
+            cond_max_length=cond_max_length, ext_drops=_ss_ext)
+
+    # timestep pair/triple + noising (diffuse/get_v = upstream, never re-derived)
+    if ss_flow_present:
+        t_ss, t_s, t_x, cls = sample_timestep_triples(
+            B, dev, p_corner=p_corner, p_corner2=p_corner2,
+            p_solo=p_solo, p_lag=p_lag, k0_lo=k0_lo, k0_hi=k0_hi)
+        # Row classes -> masks. Each is used in exactly one place and none of
+        # them gates a collective; see the loss blocks below.
+        m_solo = cls == CLS_SOLO
+        m_lag = cls == CLS_LAG
+        m_clean = cls == CLS_CLEAN
+        # SS is supervised wherever it is actually diffusing. At t_ss=0 the input
+        # IS x_0, so the v-target's noise term never enters the input and the
+        # residual is unlearnable — the same reason geo is unsupervised at its
+        # own t_s=0 corner, and the reason the official logitNormal schedule
+        # never draws 0.
+        m_ss_sup = ~m_clean
+        # slat is supervised everywhere EXCEPT the solo rows, where its input is
+        # pure noise standing in for "not present".
+        m_slat_sup = ~m_solo
+    else:
+        t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2)
+        t_ss = cls = None
+        m_solo = m_lag = m_ss_sup = None
+        m_clean = m_slat_sup = None
     # t_x_sampled survives for the t_x_mean / corner2_frac logs, which must reflect the
     # SCHEDULER rather than data availability (they exist to verify p_corner2 and would
     # otherwise become a mixture with the tex-less fraction).
@@ -834,6 +927,19 @@ def compute_unified_geotex_loss(
               f"geo-supervised {sup.float().mean():.0%}, of which "
               f"inference-aligned (t_s<=t_x) "
               f"{(tri.sum() / sup.sum().clamp_min(1)).item():.0%}", flush=True)
+        if ss_flow_present:
+            # The pair report above describes t_s/t_x only and is SILENT about
+            # the three row classes — which is exactly the shape of the failure
+            # it was written to prevent. Report the triple too, measured.
+            _n = float(B)
+            print(f"[timestep-3] configured solo {p_solo} lag {p_lag} "
+                  f"k0 {k0_lo}..{k0_hi} | measured on this batch (B={B}): "
+                  f"solo {m_solo.float().mean():.2f} lag {m_lag.float().mean():.2f} "
+                  f"clean {m_clean.float().mean():.2f} | "
+                  f"t_ss mean {t_ss.mean():.3f}, ordered "
+                  f"{((t_ss <= t_s + 1e-6) & (t_s <= t_x + 1e-6)).float().mean():.0%} | "
+                  f"NOTE small B makes these noisy — trust the per_stage curves",
+                  flush=True)
     # dtype discipline (audit; loss.py:172-177 verbatim rule): cast t to the
     # TARGET dtype — never float() — or diffuse upcasts x_t to fp32; and cast
     # targets to a common dtype like the cascade path does (:314/:322).
@@ -858,12 +964,33 @@ def compute_unified_geotex_loss(
 
     # autocast wrapper: TimestepEmbedder forces fp32 t_freq into bf16 Linears —
     # loss.py:189-193 documents the exact crash; same convention here.
+    ss_kw, x0_ss, v_ss_target = {}, None, None
+    if ss_flow_present:
+        assert target_ss_latent is not None and loss_fn_ss is not None, \
+            "ss_flow_present but no target_ss_latent / loss_fn_ss — the geotex " \
+            "forward would silently train two towers out of three"
+        x0_ss = target_ss_latent.to(dev).to(common_dt)
+        noise_ss = torch.randn_like(x0_ss)
+        t_ss = t_ss.to(common_dt)
+        x_tss = loss_fn_ss.diffuse(x0_ss, t_ss, noise=noise_ss)
+        v_ss_target = loss_fn_ss.get_v(x0_ss, noise_ss, t_ss)
+        ss_kw = dict(x_ss=x_tss, t_ss=(t_ss * 1000.0).to(x_tss.dtype),
+                     cond_ss=cond_ss, ss_cond_mask=sdpa_ss,
+                     # SS may read the slat lanes ONLY on lag rows: elsewhere the
+                     # slat tokens sit on GT-derived coords, i.e. on the answer.
+                     ss_read_on=m_lag)
+
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                         enabled=x_tx.feats.is_cuda):
-        v_s_pred, v_x_pred = unified_model(
+        _out = unified_model(
             x_ts, x_tx, (t_s * 1000.0).to(x_ts.feats.dtype),
             (t_x * 1000.0).to(x_tx.feats.dtype), cond_s, cond_x,
-            tex_concat_cond=cc)
+            tex_concat_cond=cc, **ss_kw)
+    if ss_flow_present:
+        v_s_pred, v_x_pred, v_ss_pred = _out
+    else:
+        v_s_pred, v_x_pred = _out
+        v_ss_pred = None
 
     # Row-select (feats[rows_x]), never multiply-by-zero: _voxel_balanced_mse
     # normalizes by the all-reduced count of rows PASSED IN, so selection keeps the
@@ -887,6 +1014,25 @@ def compute_unified_geotex_loss(
         rows_x = None
         loss = _voxel_balanced_mse(v_x_pred.feats.float(), v_target.feats.float())
         _tvf = 1.0
+    if ss_flow_present:
+        # Mask the SLAT losses off on solo rows by folding the row mask into the
+        # voxel selection, rather than by skipping the call: the collective must
+        # stay unconditional. rows_x already carries tex-availability; AND them.
+        _slat_rows = torch.cat([
+            m_slat_sup[b].expand(sl.stop - sl.start)
+            for b, sl in enumerate(x0_x.layout)])
+        if rows_x is None:
+            rows_x = _slat_rows
+        else:
+            rows_x = rows_x & _slat_rows
+        loss = _voxel_balanced_mse(v_x_pred.feats[rows_x].float(),
+                                   v_target.feats[rows_x].float())
+    # ── SS flow loss. Unconditional call, masked by ROW SELECTION. ──
+    ss_loss = None
+    if ss_flow_present:
+        ss_loss = _row_balanced_mse(v_ss_pred.float(), v_ss_target.float(), m_ss_sup)
+        loss = loss + ss_loss_w * ss_loss
+
     # Every key below is emitted UNCONDITIONALLY on every step: the per_stage reducer
     # all_reduces a positionally-sorted value vector built from each rank's own key
     # set, so a sometimes-missing key hands every curve some other metric's number.
@@ -905,6 +1051,27 @@ def compute_unified_geotex_loss(
             # with different pbr coverage — this is the number that says why.
             "corner2_frac_effective": (t_x == 1).float().mean().item(),
             "tex_valid_frac": _tvf}
+    # v10 keys. Emitted whenever the third tower exists — the set is decided by
+    # CONFIG (ss_flow_present), never by what this batch happened to draw, so it
+    # is identical on every rank. The *_frac keys report the MEASURED class mix
+    # rather than the configured one: the whole point of the 2026-08-16 lesson is
+    # that a schedule which silently differs from its config costs a whole run.
+    if ss_flow_present:
+        logs.update({
+            "ss_flow_loss": ss_loss.detach().item(),
+            "t_ss_mean": t_ss.mean().item(),
+            "ss_solo_frac": m_solo.float().mean().item(),
+            "lag_frac": m_lag.float().mean().item(),
+            "clean_frac": m_clean.float().mean().item(),
+            "ss_sup_frac": m_ss_sup.float().mean().item(),
+            "slat_sup_frac": m_slat_sup.float().mean().item(),
+            # gate norms: the model's own vote on whether the cross-tower reads
+            # are worth anything. Zero by construction at init; still ~0 late
+            # means the third tower is decorative.
+            "ss_gate_geo": float(unified_model.ss_gates_geo.detach().abs().mean()),
+            "ss_gate_tex": float(unified_model.ss_gates_tex.detach().abs().mean()),
+            "ss_reads_gate": float(unified_model.ss_reads_gate.detach().abs().mean()),
+        })
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex
