@@ -592,8 +592,29 @@ class UnifiedGeoTexFlow(nn.Module):
                 sp.VarLenTensor(v_all[geo_idx], geo_layout))
         return a_s, a_x
 
+    def _add_ss_read(self, a, q_untagged, gate_tab, idx, ss_kv):
+        """slat <- SS: a SEPARATE gated softmax, added before to_out.
+
+        q must be the UNTAGGED query. The +-pi/2 rotation of the 64th (identity
+        pad) rope pair is a stream tag for the SHARED union softmax, which cannot
+        otherwise tell which stream is asking. This read has its own softmax, so
+        it needs no tag — and using the tagged q against untagged SS keys would
+        apply a spurious half-turn to every cross-tower logit, invisible at
+        init because the gate is zero.
+
+        k/v stay DENSE (B, 4096, H, D): the sparse kernel has a native
+        (VarLen q, dense k, dense v) overload that folds them to kv_seqlen
+        [4096]*B itself, so there is no VarLen-ification and no per-sample loop.
+        """
+        if ss_kv is None or gate_tab is None:
+            return a
+        k_ss, v_ss = ss_kv
+        r = sparse_scaled_dot_product_attention(q_untagged, k_ss, v_ss)
+        g = gate_tab[idx].to(a.feats.dtype).reshape(1, -1, 1)
+        return a.replace(a.feats + g * r.feats)
+
     def _run_block_pair_fused(self, idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x,
-                              plan):
+                              plan, ss_kv=None):
         """Standard-MMDiT block on the fused path. Stream tag is ABSOLUTE here
         (tex's q AND k rotated by π/2, geo's not) — a single shared softmax
         cannot know which stream is querying, so the tag must live on the
@@ -611,8 +632,11 @@ class UnifiedGeoTexFlow(nn.Module):
             q_s, k_s, v_s = _attn_qkv(gblk.self_attn, hn_s)
             hn_x = fused_norm_modulate(hx_in, tblk.norm1, tsc, tsh)
             q_x, k_x, v_x = _attn_qkv(tblk.self_attn, hn_x)
+            q_x_raw = q_x                                   # pre-tag, for the SS read
             q_x, k_x = _rotate_pad_pair(q_x), _rotate_pad_pair(k_x)   # stream tag
             a_s, a_x = self._fused_joint_attn(q_s, k_s, v_s, q_x, k_x, v_x, plan)
+            a_s = self._add_ss_read(a_s, q_s, self.ss_gates_geo, idx, ss_kv)
+            a_x = self._add_ss_read(a_x, q_x_raw, self.ss_gates_tex, idx, ss_kv)
 
             a_s = _attn_out(gblk.self_attn, a_s)
             hs = fused_gate_residual(hs_in, a_s, gg)
@@ -635,7 +659,7 @@ class UnifiedGeoTexFlow(nn.Module):
         return inner(h_s, h_x)
 
     def _run_block_pair_bidir(self, idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x,
-                              corner_on, tok_on):
+                              corner_on, tok_on, ss_kv=None):
         """BIDIRECTIONAL stitched block (user topology 2026-08-11): standard
         MMDiT phase order — both streams' QKV from PRE-update hiddens, geo
         attends [self; tex] (corner-masked), tex attends [self; geo], then both
@@ -660,6 +684,7 @@ class UnifiedGeoTexFlow(nn.Module):
             # 1-ULP-class off flash at real scale; G0-bidir caught it).
             # ABSOLUTE stream tag: tex's q/k rotated, geo's untouched (same
             # convention as the fused path and the cached inference path).
+            q_x_raw = q_x                                   # pre-tag, for the SS read
             q_x, k_x = _rotate_pad_pair(q_x), _rotate_pad_pair(k_x)
             k_x_tag = k_x
             if self.coupling == "union":
@@ -677,6 +702,7 @@ class UnifiedGeoTexFlow(nn.Module):
             else:
                 a_s = self._gated_cross_attn(idx, q_s, k_s, v_s, k_x_tag, v_x,
                                              gates=self.b_gates, tok_on=tok_on)
+            a_s = self._add_ss_read(a_s, q_s, self.ss_gates_geo, idx, ss_kv)
             a_s = _attn_out(gblk.self_attn, a_s)
             hs = fused_gate_residual(hs_in, a_s, gg)
             hcs = hs.replace(gblk.norm2(hs.feats))
@@ -689,6 +715,7 @@ class UnifiedGeoTexFlow(nn.Module):
                 a_x = self._union_attn(q_x, k_x, v_x, k_s_tag, v_s)
             else:
                 a_x = self._gated_cross_attn(idx, q_x, k_x, v_x, k_s_tag, v_s)
+            a_x = self._add_ss_read(a_x, q_x_raw, self.ss_gates_tex, idx, ss_kv)
             a_x = _attn_out(tblk.self_attn, a_x)
             hx = fused_gate_residual(hx_in, a_x, tg)
             hcx = hx.replace(tblk.norm2(hx.feats))
@@ -702,7 +729,8 @@ class UnifiedGeoTexFlow(nn.Module):
             return _ckpt.checkpoint(inner, h_s, h_x, use_reentrant=False)
         return inner(h_s, h_x)
 
-    def _tex_block_inner(self, idx, h_x, mod_x, cond_x, k_s, v_s, k_c=None, v_c=None):
+    def _tex_block_inner(self, idx, h_x, mod_x, cond_x, k_s, v_s, k_c=None, v_c=None,
+                         ss_kv=None):
         tblk = self.tex_flow.blocks[idx]
         sh_msa, sc_msa, g_msa, sh_mlp, sc_mlp, g_mlp = _block_mod_params(tblk, mod_x)
         hn = fused_norm_modulate(h_x, tblk.norm1, sc_msa, sh_msa)
@@ -712,12 +740,14 @@ class UnifiedGeoTexFlow(nn.Module):
         # Within-stream logits unchanged, cross-stream get ∓π/2. Keeping the
         # cached tex|mesh inference path on the same convention is mandatory —
         # a relative tag here would silently mismatch the trained model.
+        q_x_raw = q_x                                       # pre-tag, for the SS read
         q_x, k_x = _rotate_pad_pair(q_x), _rotate_pad_pair(k_x)
         if self.coupling == "union":
             a = self._union_attn(q_x, k_x, v_x, k_s, v_s, k_c, v_c)
         else:
             a = self._gated_cross_attn(idx, q_x, k_x, v_x, k_s, v_s, k_c, v_c,
                                        self.cond_gates_tex)
+        a = self._add_ss_read(a, q_x_raw, self.ss_gates_tex, idx, ss_kv)
         a = _attn_out(tblk.self_attn, a)
         h_x = fused_gate_residual(h_x, a, g_msa)
         hc = h_x.replace(tblk.norm2(h_x.feats))
@@ -973,6 +1003,43 @@ class UnifiedGeoTexFlow(nn.Module):
             h, _, _ = self._run_ss_block(i, h, mod_ss, c, ss_cond_mask)
         return self.ss_epilogue(h, x_ss.dtype)
 
+    def _ss_reads_slat(self, idx, h_ss, h_s, h_x, ss_read_on):
+        """SS <- slat, the dormant direction. Returns None unless explicitly on.
+
+        THE ROW MASK IS CORRECTNESS, NOT AN OPTIMISATION. At training time the
+        slat lanes live on GT-derived coords, which ARE the occupancy the SS
+        tower is being asked to predict. A row where SS may read them is a row
+        where SS can copy the answer, and the symptom is a BETTER loss curve, so
+        nothing downstream will complain. ss_read_on is the per-sample gate: it
+        is on only for lag rows (t_ss > 0 with a slat context that is itself
+        noised), off for the t_ss=0 clean rows where SS already holds the answer
+        and off for solo rows where the slat lanes are pure noise.
+
+        ss_reads_enabled is the separate, global inference switch — v10 samples
+        with it False so the SS tower's trajectory is exactly the specialist's.
+        """
+        if (self.ss_reads_gate is None or not self.ss_reads_enabled
+                or ss_read_on is None or not bool(ss_read_on.any())):
+            return None
+        ss, gblk = self.ss_flow, self.geo_flow.blocks[idx]
+        tblk = self.tex_flow.blocks[idx]
+        # q from the SS hidden through the SS block's own q projection; k/v from
+        # the slat lanes' PRE-update hiddens, so the direction is symmetric with
+        # the slat<-SS read that happens in the same block.
+        blk = ss.blocks[idx]
+        B, L, _ = h_ss.shape
+        q = blk.self_attn.to_qkv(h_ss).reshape(B, L, 3, blk.self_attn.num_heads, -1)[:, :, 0]
+        if blk.self_attn.qk_rms_norm:
+            q = blk.self_attn.q_rms_norm(q)
+        out = 0.0
+        for j, (hh, hb) in enumerate(((h_s, gblk), (h_x, tblk))):
+            k, v = _attn_qkv(hb.self_attn, hh)[1:]
+            r = sparse_scaled_dot_product_attention(q, k, v)
+            g = self.ss_reads_gate[idx, j].to(r.dtype).reshape(1, 1, -1, 1)
+            out = out + g * r
+        m = ss_read_on.to(out.dtype).reshape(-1, 1, 1, 1)
+        return out * m
+
     def ss_kv_for_slat(self, k_pre, v):
         """Re-rope a borrowed SS key into the 32^3 slat frame.
 
@@ -1014,7 +1081,9 @@ class UnifiedGeoTexFlow(nn.Module):
         return out
 
     # ── full forward ────────────────────────────────────────────────────────
-    def forward(self, x_s, x_x, t_s, t_x, cond_s, cond_x, tex_concat_cond=None):
+    def forward(self, x_s, x_x, t_s, t_x, cond_s, cond_x, tex_concat_cond=None,
+                x_ss=None, t_ss=None, cond_ss=None, ss_cond_mask=None,
+                ss_read_on=None):
         """Elastic-checkpointing wrapper (TRELLIS contract, elastic_utils.py:
         get_mem_ratio → with_mem_ratio → update_run_states) around _forward_impl.
         Inactive unless a controller is registered, so the static geotex_gc
@@ -1022,15 +1091,19 @@ class UnifiedGeoTexFlow(nn.Module):
         ctrl = getattr(self, "_memory_controller", None)
         if ctrl is None or not torch.is_grad_enabled() or not self.training:
             return self._forward_impl(x_s, x_x, t_s, t_x, cond_s, cond_x,
-                                      tex_concat_cond)
+                                      tex_concat_cond, x_ss, t_ss, cond_ss,
+                                      ss_cond_mask, ss_read_on)
         n = self._get_input_size(x_s)
         with self._with_mem_ratio(ctrl.get_mem_ratio(n)) as exact:
             out = self._forward_impl(x_s, x_x, t_s, t_x, cond_s, cond_x,
-                                     tex_concat_cond)
+                                     tex_concat_cond, x_ss, t_ss, cond_ss,
+                                     ss_cond_mask, ss_read_on)
         ctrl.update_run_states(n, exact)
         return out
 
-    def _forward_impl(self, x_s, x_x, t_s, t_x, cond_s, cond_x, tex_concat_cond=None):
+    def _forward_impl(self, x_s, x_x, t_s, t_x, cond_s, cond_x, tex_concat_cond=None,
+                      x_ss=None, t_ss=None, cond_ss=None, ss_cond_mask=None,
+                      ss_read_on=None):
         """x_s/x_x: noisy SparseTensors (32ch each, shared coords). t_s/t_x: (B,)
         in flow units (already *1000). cond_s/cond_x: per-stream cond tensors
         (SLatFlowModel contract). tex_concat_cond: SparseTensor (32ch, TEX norm
@@ -1102,19 +1175,40 @@ class UnifiedGeoTexFlow(nn.Module):
             # corner mask from t (flow units: 0 iff raw t_s==0) — per-sample
             # bool for hard union exclusion + per-token 0/1 for the gated term
             corner_on = (t_s != 0)
+            # ── v10: the SS lane runs INTERLEAVED with the slat pair ──
+            # Block i of SS produces the (k, v) block i of the slat lanes read,
+            # so only one block's pair is ever live. Running the tower to
+            # completion first would hold all 30 pairs across the whole slat
+            # pass: 30 x 2 x 4096 x 1536 x 2B = 755 MB per sample.
+            ss_on = x_ss is not None and self.ss_flow is not None
+            if ss_on:
+                h_ss, mod_ss, c_ss = self.ss_prologue(x_ss, t_ss, cond_ss)
             if self.fused_attn and self.coupling == "union":
                 # plan computed ONCE per forward (layout + t_s are step-constant)
                 plan = _fusion_plan(x_s.layout, corner_on, x_s.feats.device)
                 for idx in range(len(geo.blocks)):
+                    ss_kv = None
+                    if ss_on:
+                        h_ss, k_pre, v_ss = self._run_ss_block(
+                            idx, h_ss, mod_ss, c_ss, ss_cond_mask, want_kv=True,
+                            ss_read=self._ss_reads_slat(idx, h_ss, h_s, h_x, ss_read_on))
+                        ss_kv = self.ss_kv_for_slat(k_pre, v_ss)
                     h_s, h_x = self._run_block_pair_fused(
-                        idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x, plan)
+                        idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x, plan, ss_kv=ss_kv)
             else:
                 tok_on = torch.cat([
                     corner_on[b].to(x_s.feats.dtype).expand(sl.stop - sl.start)
                     for b, sl in enumerate(x_s.layout)]).view(-1, 1, 1)
                 for idx in range(len(geo.blocks)):
+                    ss_kv = None
+                    if ss_on:
+                        h_ss, k_pre, v_ss = self._run_ss_block(
+                            idx, h_ss, mod_ss, c_ss, ss_cond_mask, want_kv=True,
+                            ss_read=self._ss_reads_slat(idx, h_ss, h_s, h_x, ss_read_on))
+                        ss_kv = self.ss_kv_for_slat(k_pre, v_ss)
                     h_s, h_x = self._run_block_pair_bidir(
-                        idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x, corner_on, tok_on)
+                        idx, h_s, h_x, mod_s, mod_x, cond_s, cond_x, corner_on, tok_on,
+                        ss_kv=ss_kv)
         else:
             for idx in range(len(geo.blocks)):
                 h_s, h_x = self._run_block_pair(idx, h_s, h_x, mod_s, mod_x,
@@ -1127,6 +1221,8 @@ class UnifiedGeoTexFlow(nn.Module):
         h_x = manual_cast(h_x, x_x.dtype)
         h_x = h_x.replace(F.layer_norm(h_x.feats, h_x.feats.shape[-1:]))
         v_x = tex.out_layer(h_x)
+        if x_ss is not None and self.ss_flow is not None:
+            return v_s, v_x, self.ss_epilogue(h_ss, x_ss.dtype)
         return v_s, v_x
 
     # ── inference helpers (3-mode sampler; geotex_sampler.py) ───────────────
