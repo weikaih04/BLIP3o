@@ -45,8 +45,13 @@ from .vlm_collate import boiler_ids, cap_image, px_per_tok
 from .dino_align import DinoV3FeatureExtractor, TRELLIS_DINOV3_NAME
 
 # ── the exact strings the v2.2 cache was built with (build_vlm_cache_v22.py) ──
-V22_CKPT = ("/fsx/home/weikai.huang/3dgen/vlm3d_runs/stage1_v22/"
-            "v0-20260703-051346/checkpoint-1000")
+_V22_DEFAULT = ("/fsx/home/weikai.huang/3dgen/vlm3d_runs/stage1_v22/"
+                "v0-20260703-051346/checkpoint-1000")
+# COND_VLM_CKPT swaps the conditioning VLM for every consumer that defaults to V22_CKPT
+# (TrainCondEncoder, prep_i1/prep_im, LiveCond). It must be a LOCAL dir whose processor
+# uses the same <|vision_start|><|image_pad|><|vision_end|> convention (any Qwen VL).
+# Unset → the v2.2 finetune, bit-identical to every run launched before this knob existed.
+V22_CKPT = os.environ.get("COND_VLM_CKPT", _V22_DEFAULT)
 IMG_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
 PROMPT_I1 = "[3D Gen] " + IMG_TOKEN + "\nReconstruct this object in 3D."
 PROMPT_IM = "[3D Gen] {imgs}\nReconstruct this object in 3D."
@@ -57,7 +62,15 @@ TXT_PROMPTS = ["Generate a 3D asset: {c}",
 # per-modality token budgets, from the cache _meta.json of the roots the 40k run trained on
 DINO_SIZE_I1 = 512          # v22_3dvlm_tok1024_mv1: dino_image_size 512 -> 1029 tok
 DINO_SIZE_IM = 320          # v22_im4r:              dino_image_size 320 ->  405 tok/view
-IM_QWEN_TOK_PER_VIEW = 64   # v22_im4r: im_qwen_tok_per_view 64 -> 256² px/view
+IM_QWEN_TOK_PER_VIEW = 128  # 362² px/view; 4 views -> 512 qwen tokens
+# Raised from 64 (v22_im4r). At 64 a view carried 256x256 pixels and four of them totalled 256
+# tokens — one SIXTEENTH of what the single-image path gets for one view (1024). That is the
+# most likely physical reason the IM arm ignores view CONTENT (four different views scored the
+# same as four copies of one): the information never entered the conditioning.
+#
+# This invalidates the v22_im4r cond cache and any flow trained on it — the cache has to be
+# rebuilt and the flows retrained. That is affordable only because the final run is from
+# scratch anyway; do NOT change this constant against an already-trained flow.
 I1_QWEN_CANVAS = 1024       # the render resolution -> 1024 vision tok
 
 # render geometry (measured over the held-out renders_cond webps)

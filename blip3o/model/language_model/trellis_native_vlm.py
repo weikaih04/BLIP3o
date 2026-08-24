@@ -148,11 +148,10 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         # ── S2b: unfreeze geo (design doc "three-pack"; only with G3 as a red line) ──
         geotex_unfreeze_geo: bool = False,      # geo becomes trainable (joint's value needs this)
         geotex_geo_loss_w: float = 1.0,         # geo's own velocity loss (else geo just serves tex)
-        geotex_distill_w: float = 1.0,          # MF self-distill vs the frozen S1 geo
-        geotex_distill_lo: float = 0.1,         # distill weight at t_x->0 (tex clean)
-        geotex_distill_hi: float = 1.0,         # distill weight at t_x->1 (tex pure noise)
         geotex_p_corner: float = 0.4,           # t_s=0 corner mass (user 2026-08-11: flagship-mode priority; MF-exact 0.2 = A1 arm)
         geotex_p_corner2: float = 0.2,          # t_x=1 corner (mesh-only marginal; MF's second corner, bidir design)
+        geotex_mismatch_w: float = 0.0,         # mismatched-image hinge weight (experiment)
+        geotex_mismatch_margin: float = 0.15,
         geotex_concat_cond: bool = False,       # per-voxel shape concat into tex (cascade legacy)
         logitnorm_mean: float = 1.0,
         logitnorm_std: float = 1.0,
@@ -218,11 +217,10 @@ class TrellisNativeVLMConfig(PretrainedConfig):
         self.geotex_gc = geotex_gc
         self.geotex_unfreeze_geo = geotex_unfreeze_geo
         self.geotex_geo_loss_w = geotex_geo_loss_w
-        self.geotex_distill_w = geotex_distill_w
-        self.geotex_distill_lo = geotex_distill_lo
-        self.geotex_distill_hi = geotex_distill_hi
         self.geotex_p_corner = geotex_p_corner
         self.geotex_p_corner2 = geotex_p_corner2
+        self.geotex_mismatch_w = geotex_mismatch_w
+        self.geotex_mismatch_margin = geotex_mismatch_margin
         self.geotex_concat_cond = geotex_concat_cond
         self.fuse_dino = fuse_dino
         self.dino_drop_prob = dino_drop_prob
@@ -340,7 +338,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
             # diffusion_connector (standard name → EMA/save/inference conventions hold).
             from trellis2_blip3o.unified_geotex import (
                 assemble_unified, load_connectors, assemble_unified_from_run,
-                load_run_connectors, load_geo_teacher_from_run)
+                load_run_connectors)
             assert config.geotex_shape_init and config.geotex_tex_init, \
                 "[geotex] --geotex_shape_init and --geotex_tex_init are required"
             # A geotex RUN checkpoint (S1 -> S2b) stores `unified_geotex.*`; the
@@ -410,34 +408,11 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                     _b.use_checkpoint = (_i < _n_ckpt)
                 rank0_print(f"[geotex] gradient checkpointing on {_n_ckpt}/{_nb} block pairs "
                             f"(geotex_gc={_gc})")
-            # ── S2b: unfreeze geo + build the frozen self-distill teacher ──
+            # ── S2b: unfreeze geo ──
             if getattr(config, "geotex_unfreeze_geo", False):
                 self.unified_geotex.unfreeze_geo()
-                # Self-distillation needs an S1 geo to distil FROM. There is
-                # none from scratch — the flag is a no-op there, not an error,
-                # so a shared launcher config still runs.
-                if float(getattr(config, "geotex_distill_w", 0.0)) > 0 and not _gt_scratch:
-                    # Teacher = a SECOND copy of the S1 geo weights, frozen, run
-                    # ONE-WAY (it never learned to read tex, so its function is
-                    # the pretrained specialist's). Non-child attribute so it
-                    # stays out of the state_dict and ZeRO partitioning — the
-                    # same pattern this file uses for the frozen DINOv3.
-                    if _resume:
-                        _teacher = load_geo_teacher_from_run(_resume)
-                    else:
-                        from trellis2_blip3o.unified_geotex import _load_prefixed_state
-                        from blip3o.model.multimodal_decoder.builder import build_shape_slat_512
-                        class _C2:
-                            trellis_shape_slat_ckpt = None
-                        _teacher = build_shape_slat_512(_C2())
-                        _teacher.load_state_dict(_load_prefixed_state(
-                            config.geotex_shape_init, "shape_slat_512."), strict=True)
-                        _teacher.requires_grad_(False).eval()
-                    object.__setattr__(self, "_geo_teacher", _teacher)
-                    rank0_print("[geotex] S2b self-distill teacher built (frozen S1 geo)")
                 rank0_print(f"[geotex] S2b: geo UNFROZEN "
-                            f"(geo_loss_w={config.geotex_geo_loss_w} "
-                            f"distill_w={config.geotex_distill_w})")
+                            f"(geo_loss_w={config.geotex_geo_loss_w})")
             rank0_print(f"[geotex] unified assembled: shape={config.geotex_shape_init} "
                         f"tex={config.geotex_tex_init} coupling={config.geotex_coupling} "
                         f"(geo frozen, tex GC on)")
@@ -846,6 +821,9 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         target_shape_slat_512: Optional[Any] = None,
         target_tex_slat_512: Optional[Any] = None,
         tex_concat_cond: Optional[Any] = None,
+        # (B,) bool — per-sample texture-supervision validity (option C). None means
+        # "all valid" (legacy all-pbr batches). Consumed only by the geotex loss.
+        tex_valid: Optional[torch.Tensor] = None,
         # DINOv3 alignment renders (collator emits when images present; aligner-gated)
         dino_images: Optional[torch.Tensor] = None,
         # cached-cond fast path (deferred feature; v1 leaves these None → run VLM)
@@ -985,20 +963,18 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         # tex cond runs the trained connector with the production dropout stack.
         if self.unified_geotex is not None:
             if target_shape_slat_512 is None or target_tex_slat_512 is None:
+                _missing = [n for n, v in (("target_shape_slat_512", target_shape_slat_512),
+                                           ("target_tex_slat_512", target_tex_slat_512))
+                            if v is None]
                 raise ValueError(
-                    "[geotex] batch missing target_shape_slat_512/target_tex_slat_512 — "
-                    "the unified loss needs BOTH GT SLATs; train on tex-full data (the "
-                    "same s3 tex mixture) so every batch carries both.")
+                    f"[geotex] batch missing {_missing} — the unified loss needs both GT "
+                    "SLATs. If tex is the missing one on a partial-pbr pool, set "
+                    "tex_placeholder: true in the mixture yaml (per-sample masking, "
+                    "option C) rather than filtering the pool. NOTE: this raise fires "
+                    "per-rank while the other ranks proceed into their next collective — "
+                    "on a multi-rank run the visible symptom is an NCCL timeout HANG, "
+                    "and this message sits in ONE rank's log, not the launcher's.")
             _fuse = getattr(self.config, "fuse_dino", False)
-            # the self-distill teacher is a NON-CHILD attribute (kept off the
-            # state_dict and out of ZeRO partitioning), so model.to(device)
-            # never moves it — lazy-move on first use, same as the frozen
-            # DINOv3 extractor above.
-            _teacher = getattr(self, "_geo_teacher", None)
-            if _teacher is not None:
-                _dev = target_shape_slat_512.feats.device
-                if next(_teacher.parameters()).device != _dev:
-                    _teacher.to(_dev)
             loss, glogs = flow_heads.compute_unified_geotex_loss(
                 unified_model=self.unified_geotex,
                 connector_geo=self.geo_connector,
@@ -1008,6 +984,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 cond_key_mask=cond_key_mask,
                 target_shape_slat_512=target_shape_slat_512,
                 target_tex_slat_512=target_tex_slat_512,
+                tex_valid=tex_valid,
                 dino_hidden=dino_hidden if _fuse else None,
                 dino_key_mask=dino_keep_mask.bool()
                     if (dino_keep_mask is not None and _fuse) else None,
@@ -1021,6 +998,8 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                 cond_max_length=self.config.cond_max_length,
                 p_corner=float(self.config.geotex_p_corner),
                 p_corner2=float(getattr(self.config, "geotex_p_corner2", 0.2)),
+                mismatch_w=float(getattr(self.config, "geotex_mismatch_w", 0.0)),
+                mismatch_margin=float(getattr(self.config, "geotex_mismatch_margin", 0.15)),
                 # "unfreeze" gates the geo loss because in a WARM START geo is
                 # frozen by default. From scratch nothing is frozen and the flag
                 # is meaningless — but leaving the gate as-is would silently
@@ -1032,16 +1011,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                             if (getattr(self.config, "geotex_unfreeze_geo", False)
                                 or getattr(self.config, "geotex_from_scratch", False))
                             else 0.0),
-                geo_teacher=_teacher,
-                # Self-distillation is warm-start-only by nature: there is no S1
-                # geo to distil from. _teacher is None from scratch, so the term
-                # is skipped either way; zero it here so the log says so too.
-                distill_w=(float(getattr(self.config, "geotex_distill_w", 0.0))
-                           if (getattr(self.config, "geotex_unfreeze_geo", False)
-                               and not getattr(self.config, "geotex_from_scratch", False))
-                           else 0.0),
-                distill_lo=float(getattr(self.config, "geotex_distill_lo", 0.1)),
-                distill_hi=float(getattr(self.config, "geotex_distill_hi", 1.0)),
+                joint_cond_drop=bool(getattr(self.config, "geotex_joint_cond_drop", False)),
             )
             loss = loss * float(self.config.flow_weight)
             self._last_diag = {f"per_stage/{k}": float(v) for k, v in glogs.items()}
@@ -1110,6 +1080,16 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                             "(Stage-1 is I1-only; IM belongs to Stage-3 where KD is off)")
                 self._warned_im_kd = True
 
+        # OPTION-C GUARD: the cascade has no per-sample mask API — "the tex target
+        # exists" IS its on-switch (flow_heads:321, blip3o_qwen:217). A tex_placeholder
+        # dataset feeding this path would silently train the texture stage to predict
+        # noise-minus-zeros on every pbr-less sample, with healthy-looking curves. Fail
+        # loudly instead: placeholders are geotex-only by contract (threed.py docstring).
+        if tex_valid is not None and not bool(tex_valid.all()):
+            raise ValueError(
+                "[cascade] batch carries tex_valid with invalid samples, i.e. placeholder "
+                "texture targets — the cascade cannot mask per sample and would train on "
+                "the zeros. tex_placeholder: true is only valid for train_stages=geotex.")
         # 2. cond → connector → 3-stage TRELLIS cascade flow loss (shared helper).
         loss, logs = flow_heads.compute_cascade_flow_loss(
             connector=self.diffusion_connector,

@@ -1102,21 +1102,6 @@ def assemble_unified_from_run(run_ckpt: str, cond_mode: str = "cross_attn",
     return uni
 
 
-def load_geo_teacher_from_run(run_ckpt: str, weights_file: str = "model.safetensors"):
-    """The frozen self-distillation teacher for S2b: the geo stream AS OF S1
-    (which is still bit-exactly the shape specialist, since S1 never trained
-    it), in the training dtype layout, run ONE-WAY."""
-    from blip3o.model.multimodal_decoder.builder import build_shape_slat_512
-
-    class _Cfg:
-        trellis_shape_slat_ckpt = None
-
-    geo = build_shape_slat_512(_Cfg())
-    geo.load_state_dict(_load_prefixed_state(run_ckpt, "unified_geotex.geo_flow.",
-                                             weights_file), strict=True)
-    return geo.requires_grad_(False).eval()
-
-
 def _from_pretrained_pair():
     """The two base flows in TRELLIS's INFERENCE dtype layout: fp32 boundary
     layers + bf16 blocks + self.dtype=bf16 (t2models.from_pretrained — measured

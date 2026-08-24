@@ -377,6 +377,11 @@ def build_unified_cond(
     dino_view_embed: Optional[torch.Tensor] = None,
     cond_max_length: int = 8192,
     detach_cond: bool = False,   # cascade-parity default (audit: was silently True)
+    ext_drops=None,     # (drop, ddrop, qdrop) bool (B,) — REPLAY these instead of drawing.
+                        # KD teacher conds use it to see the student's realized CFG drops;
+                        # None = draw internally (bit-identical to the pre-KD code).
+    drops_out=None,     # dict filled with the realized drop/ddrop/qdrop masks (recording
+                        # only — zero effect on RNG or outputs).
 ):
     """Cond assembly for the UNIFIED path — a deliberate PARALLEL implementation
     of compute_cascade_flow_loss's fusion/plain branches (lines ~145-254), NOT a
@@ -401,7 +406,10 @@ def build_unified_cond(
     drop_mask = None
     if dino_hidden is not None:
         # fusion branch — mirrors compute_cascade_flow_loss exactly
-        drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
+        if ext_drops is not None:
+            drop = ext_drops[0].to(cond_hidden.device).bool()
+        else:
+            drop = (torch.rand(B, device=cond_hidden.device) < mask_drop_prob)
         drop_mask = drop
         keep = (~drop).to(cond_hidden.dtype).view(B, 1, 1)
         cond_q = connector(cond_hidden * keep, key_mask=cond_key_mask)
@@ -420,17 +428,42 @@ def build_unified_cond(
         dmask = dino_key_mask if dino_key_mask is not None else torch.ones(
             dino_hidden.shape[:2], dtype=torch.bool, device=dino_hidden.device)
         ddrop = torch.zeros(B, dtype=torch.bool, device=dino_hidden.device)
-        if dino_drop_prob > 0:
-            ddrop = (torch.rand(B, device=dino_hidden.device) < dino_drop_prob)
+        qdrop = torch.zeros(B, dtype=torch.bool, device=cond_q.device)
+        if ext_drops is not None:
+            ddrop = ext_drops[1].to(dino_hidden.device).bool()
             dmask = dmask & ~ddrop[:, None]
-        if qwen_drop_prob > 0:
-            qdrop = (torch.rand(B, device=cond_q.device) < qwen_drop_prob) & ~ddrop
+            qdrop = ext_drops[2].to(cond_q.device).bool() & ~ddrop
             cond_key_mask = cond_key_mask & ~qdrop[:, None]
+        else:
+            if dino_drop_prob > 0:
+                ddrop = (torch.rand(B, device=dino_hidden.device) < dino_drop_prob)
+                dmask = dmask & ~ddrop[:, None]
+            if qwen_drop_prob > 0:
+                qdrop = (torch.rand(B, device=cond_q.device) < qwen_drop_prob) & ~ddrop
+                cond_key_mask = cond_key_mask & ~qdrop[:, None]
+        if drops_out is not None:
+            drops_out.update(drop=drop, ddrop=ddrop, qdrop=qdrop)
         cond = torch.cat([dino_seg, cond_q], dim=1)
         cond_key_mask = torch.cat([dmask, cond_key_mask], dim=1)
     else:
         # plain branch (text task / no DINO)
-        cond = connector(mask_drop(cond_hidden, mask_drop_prob), key_mask=cond_key_mask)
+        if ext_drops is not None:
+            _keep = (~ext_drops[0].to(cond_hidden.device).bool()).to(cond_hidden.dtype)
+            cond = connector(cond_hidden * _keep.view(B, 1, 1), key_mask=cond_key_mask)
+        elif drops_out is not None and mask_drop_prob > 0:
+            # explicit draw so the mask can be recorded; torch.bernoulli, identical
+            # RNG consumption and semantics to mask_drop (flow_heads.py:23-33).
+            _dm = torch.bernoulli(torch.zeros(
+                B, device=cond_hidden.device, dtype=cond_hidden.dtype) + mask_drop_prob)
+            drop_mask = _dm.bool()
+            cond = connector(cond_hidden * (1.0 - _dm).view(B, 1, 1),
+                             key_mask=cond_key_mask)
+        else:
+            cond = connector(mask_drop(cond_hidden, mask_drop_prob), key_mask=cond_key_mask)
+        if drops_out is not None:
+            _z = torch.zeros(B, dtype=torch.bool, device=cond_hidden.device)
+            drops_out.update(drop=drop_mask if drop_mask is not None else _z,
+                             ddrop=_z, qdrop=_z)
         if getattr(connector, "pos_stamp", None) is not None:
             from .pos_stamp import IMG_SPAN_FULL
             cond = connector.pos_stamp(cond, IMG_SPAN_FULL)
@@ -554,6 +587,16 @@ def compute_unified_geotex_loss(
     cond_key_mask: torch.Tensor,
     target_shape_slat_512,            # sp.SparseTensor, SHAPE-norm space (geo stream space)
     target_tex_slat_512,              # sp.SparseTensor, tex_pbr-norm space
+    tex_valid=None,                   # (B,) bool | None — per-sample tex supervision
+                                      # validity (option C). None = all valid. Invalid
+                                      # samples carry a zeros placeholder target: their
+                                      # t_x is forced to the trained t_x=1 noise corner
+                                      # (so the placeholder never enters the model
+                                      # INPUT) and their voxels are row-masked out of
+                                      # the tex loss (get_v is (1-s)*noise - x_0 with
+                                      # NO t in it, so t_x=1 does NOT neutralize the
+                                      # TARGET — the mask is the correctness, not an
+                                      # optimization).
     # cond extras (same contract as the cascade path)
     dino_hidden=None, dino_key_mask=None, dino_view_ids=None, qwen_view_ids=None,
     dino_view_embed=None,
@@ -566,10 +609,14 @@ def compute_unified_geotex_loss(
     probe_every: int = 200,   # cond-sensitivity probe cadence; 0 = off
     # ── S2b: geo unfrozen (the "three-pack" of the design doc) ──
     geo_loss_w: float = 0.0,        # >0 turns on geo's OWN velocity loss
-    geo_teacher=None,               # frozen S1-geo (a plain SLatFlowModel) for self-distill
-    distill_w: float = 0.0,         # >0 turns on MF-style anti-drift distillation
-    distill_lo: float = 0.1,        # weight when tex is CLEAN  (t_x->0): student may deviate
-    distill_hi: float = 1.0,        # weight when tex is NOISE  (t_x->1): must match teacher
+    mismatch_w: float = 0.0,        # >0 turns on the mismatched-image hinge (see below)
+    mismatch_margin: float = 0.15,  # how much worse the WRONG image must be
+    joint_cond_drop: bool = False,  # WARM path: replay cond_x's realized CFG/modality
+                                    # drops onto cond_s (same per-sample masks, both
+                                    # towers drop together — matches inference's joint
+                                    # uncond, where BOTH streams' cond is nulled).
+                                    # False = legacy S1/S2b convention (cond_s never
+                                    # dropped). No effect from scratch (cond_s=None).
 ) -> Tuple[torch.Tensor, Dict]:
     """Stage-1 unified loss: sample (t_s,t_x), noise geo GT at t_s, feed its
     RENORMALIZED state as tex concat_cond (exactly what joint inference feeds —
@@ -590,32 +637,51 @@ def compute_unified_geotex_loss(
         m = key_mask.bool()
         return [cond[b, m[b]] for b in range(cond.shape[0])]
 
-    # A three-stream MMDiT has ONE cond stream, so it ignores cond_s entirely
-    # (mmdit3d._prepare). Building it anyway costs a connector forward plus a
-    # per-sample python mask loop every step, for a tensor nothing reads. The
-    # distill teacher below is warm-start-only and unreachable in that mode.
-    if getattr(unified_model, "from_scratch", False):
-        cond_s = None
-    else:
-        with torch.no_grad():
-            cond_s, key_s, _, _ = build_unified_cond(
-                connector_geo, cond_hidden, cond_key_mask,
-                mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
-                dino_drop_prob=0.0, qwen_drop_prob=0.0,
-                dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
-                dino_view_embed=dino_view_embed, cond_max_length=cond_max_length)
-            cond_s = _masked_list(cond_s, key_s)
+    _sdrops = {}   # realized CFG drops, recorded for cond_s joint-drop replay
+                   # (recording has no RNG effect)
     cond_x, key_x, _, _ = build_unified_cond(
         connector_tex, cond_hidden, cond_key_mask,
         mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
         dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
         qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
         qwen_view_ids=qwen_view_ids, dino_view_embed=dino_view_embed,
-        cond_max_length=cond_max_length)
+        cond_max_length=cond_max_length, drops_out=_sdrops)
     cond_x = _masked_list(cond_x, key_x)
+    # A three-stream MMDiT has ONE cond stream, so it ignores cond_s entirely
+    # (mmdit3d._prepare). Building it anyway costs a connector forward plus a
+    # per-sample python mask loop every step, for a tensor nothing reads.
+    # (Moved AFTER the cond_x build so joint_cond_drop can replay its realized
+    # masks; on the scratch path nothing between the two sites consumes RNG, so
+    # the draw order is unchanged — guarded by the golden test.)
+    if getattr(unified_model, "from_scratch", False):
+        cond_s = None
+    else:
+        _cs_ext = None
+        if joint_cond_drop and _sdrops.get("drop") is not None:
+            # both towers drop TOGETHER on the same samples — the training-time
+            # mirror of CFG inference, whose uncond branch nulls both conds.
+            # connector_geo(0)+zeros-dino is the geo tower's own learned uncond
+            # (s3 trained with mask_drop 0.1), so replayed drops are in-distribution.
+            _cs_ext = (_sdrops["drop"], _sdrops["ddrop"], _sdrops["qdrop"])
+        with torch.no_grad():
+            cond_s, key_s, _, _ = build_unified_cond(
+                connector_geo, cond_hidden, cond_key_mask,
+                mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
+                dino_drop_prob=0.0, qwen_drop_prob=0.0,
+                dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
+                dino_view_embed=dino_view_embed, cond_max_length=cond_max_length,
+                ext_drops=_cs_ext)
+            cond_s = _masked_list(cond_s, key_s)
 
     # timestep pair + noising (diffuse/get_v = upstream formulas, never re-derived)
     t_s, t_x = sample_timestep_pairs(B, dev, p_corner=p_corner, p_corner2=p_corner2)
+    # t_x_sampled survives for the t_x_mean / corner2_frac logs, which must reflect the
+    # SCHEDULER rather than data availability (they exist to verify p_corner2 and would
+    # otherwise become a mixture with the tex-less fraction).
+    t_x_sampled = t_x.clone()
+    if tex_valid is not None:
+        tex_valid = tex_valid.to(dev).bool()
+        t_x = torch.where(tex_valid, t_x, torch.ones_like(t_x))
     # ONE-TIME REPORT of what was actually sampled, not what was configured.
     # The 2026-08-16 run trained on the independent square (33% of every
     # geometry-supervised sample at t_s > t_x) and nothing said so,
@@ -626,7 +692,7 @@ def compute_unified_geotex_loss(
     if not getattr(compute_unified_geotex_loss, "_reported", False):
         compute_unified_geotex_loss._reported = True
         sup = (t_s != 0)
-        tri = sup & (t_s <= t_x)
+        tri = sup & (t_s <= t_x_sampled)   # sampled, not forced — the report describes the scheduler
         print(f"[timestep] corner {p_corner} corner2 {p_corner2} | "
               f"measured on this batch: "
               f"geo-supervised {sup.float().mean():.0%}, of which "
@@ -663,11 +729,46 @@ def compute_unified_geotex_loss(
             (t_x * 1000.0).to(x_tx.feats.dtype), cond_s, cond_x,
             tex_concat_cond=cc)
 
-    loss = _voxel_balanced_mse(v_x_pred.feats.float(), v_target.feats.float())
+    # Row-select (feats[rows_x]), never multiply-by-zero: _voxel_balanced_mse
+    # normalizes by the all-reduced count of rows PASSED IN, so selection keeps the
+    # per-voxel weight at 1/N_global_valid (constant loss scale regardless of the
+    # tex-less fraction) and a rank with zero valid voxels contributes n_local=0 —
+    # correctly excluded from the global denominator instead of diluting it, which is
+    # also what cancels the ZeRO cross-rank gradient dilution. No `.any()` guard: the
+    # helper contains an all_reduce and a guarded call would make the collective
+    # rank-conditional (NCCL hang). Empty selection is legal — sum() is 0.0 with a
+    # live grad_fn, so DeepSpeed still sees the tex parameters as used.
+    if tex_valid is not None:
+        _tv = tex_valid.tolist()          # one host sync, not B (tex_valid[b] syncs per item)
+        rows_x = torch.cat([
+            torch.ones(sl.stop - sl.start, dtype=torch.bool, device=dev) if _tv[b]
+            else torch.zeros(sl.stop - sl.start, dtype=torch.bool, device=dev)
+            for b, sl in enumerate(x0_x.layout)])
+        loss = _voxel_balanced_mse(v_x_pred.feats[rows_x].float(),
+                                   v_target.feats[rows_x].float())
+        _tvf = tex_valid.float().mean().item()
+    else:
+        rows_x = None
+        loss = _voxel_balanced_mse(v_x_pred.feats.float(), v_target.feats.float())
+        _tvf = 1.0
+    # Every key below is emitted UNCONDITIONALLY on every step: the per_stage reducer
+    # all_reduces a positionally-sorted value vector built from each rank's own key
+    # set, so a sometimes-missing key hands every curve some other metric's number.
+    # t_x_mean/corner2_frac use t_x_sampled — the scheduler's draw — so the schedule
+    # stays verifiable; tex_valid_frac carries the data-availability signal separately.
     logs = {"tex_flow_loss": loss.detach().item(),
-            "t_s_mean": t_s.mean().item(), "t_x_mean": t_x.mean().item(),
+            "t_s_mean": t_s.mean().item(), "t_x_mean": t_x_sampled.mean().item(),
             "corner_frac": (t_s == 0).float().mean().item(),
-            "corner2_frac": (t_x == 1).float().mean().item()}
+            "corner2_frac": (t_x_sampled == 1).float().mean().item(),
+            # What the MODEL actually trains on, forced corners included. On pool1800k
+            # (24.9% tex-less) this reads ~0.44 against a configured 0.25 — the tex
+            # stream sits at its t_x=1 corner nearly twice as often as P_CORNER2 says,
+            # and geometry correspondingly trains in the "texture is pure noise" regime
+            # twice as often. corner2_frac (sampled) verifies the SCHEDULER; this key
+            # verifies the DISTRIBUTION. geo metrics are not comparable across pools
+            # with different pbr coverage — this is the number that says why.
+            "corner2_frac_effective": (t_x == 1).float().mean().item(),
+            "tex_valid_frac": _tvf}
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex
@@ -722,37 +823,76 @@ def compute_unified_geotex_loss(
     if geo_loss_w > 0:
         v_s_target = loss_fn_slat.get_v(x0_s, noise_s, t_s)
         keep = (t_s != 0)
-        if bool(keep.any()):
-            rows = torch.cat([
-                torch.ones(sl.stop - sl.start, dtype=torch.bool, device=dev) if keep[b]
-                else torch.zeros(sl.stop - sl.start, dtype=torch.bool, device=dev)
-                for b, sl in enumerate(x0_s.layout)])
-            geo_loss = _voxel_balanced_mse(v_s_pred.feats[rows].float(),
-                                           v_s_target.feats[rows].float())
-            loss = loss + geo_loss_w * geo_loss
-            logs["geo_flow_loss"] = geo_loss.detach().item()
+        # NO `if keep.any():` GUARD HERE, deliberately. _voxel_balanced_mse contains
+        # a torch.distributed.all_reduce; guarding the call makes that collective
+        # RANK-CONDITIONAL, and a rank whose whole micro-batch happened to draw
+        # t_s=0 would skip it while every other rank blocks — an NCCL desync/hang,
+        # not an error. At p_corner=0.1 and B=8 that is p=1e-8 per rank-step, i.e.
+        # ~0.02 expected occurrences over a 60k-step 32-rank run: rare enough to
+        # have never fired, common enough to be a real way to lose four nodes.
+        # An all-False mask is a legal input: feats[rows] is empty, n_local=0, the
+        # rank contributes 0 to the global voxel count (so it is correctly excluded
+        # from the denominator rather than diluting it), and the empty sum still
+        # carries a grad_fn so DeepSpeed sees the parameters as used.
+        rows = torch.cat([
+            torch.ones(sl.stop - sl.start, dtype=torch.bool, device=dev) if keep[b]
+            else torch.zeros(sl.stop - sl.start, dtype=torch.bool, device=dev)
+            for b, sl in enumerate(x0_s.layout)])
+        geo_loss = _voxel_balanced_mse(v_s_pred.feats[rows].float(),
+                                       v_s_target.feats[rows].float())
+        loss = loss + geo_loss_w * geo_loss
+        # Emitted UNCONDITIONALLY for the same class of reason: train_native.py's
+        # per_stage reducer builds `keys = sorted(self._stage_sum)` per rank and
+        # all_reduces the value vector positionally. Two ranks with the same NUMBER
+        # of keys but different key SETS reduce cleanly and hand every curve some
+        # other metric's number.
+        logs["geo_flow_loss"] = geo_loss.detach().item()
 
-    # ── S2b term 2: MF-style self-distillation (anti-drift) ─────────────────
-    # Teacher = the FROZEN S1 geo, run ONE-WAY (it never learned to read tex, so
-    # its function is the pretrained specialist's). Weight rises with t_x: when
-    # the tex stream is pure noise it carries no information, so the student has
-    # no excuse to deviate from the teacher; when tex is clean, deviation is the
-    # whole point and the pull is relaxed.
-    if distill_w > 0 and geo_teacher is not None:
-        # There is no S1 geo to distil from in a from-scratch run, and cond_s is
-        # None there — fail loudly instead of feeding the teacher a None cond.
-        assert cond_s is not None, \
-            "self-distillation needs the warm-start geo connector; not available from scratch"
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                             enabled=x_tx.feats.is_cuda):
-            v_s_teacher = geo_teacher(x_ts, (t_s * 1000.0).to(x_ts.feats.dtype), cond_s)
-        w_per_sample = distill_lo + (distill_hi - distill_lo) * t_x.float()
-        w_rows = torch.cat([w_per_sample[b].expand(sl.stop - sl.start)
-                            for b, sl in enumerate(x0_s.layout)]).unsqueeze(-1)
-        d = (v_s_pred.feats.float() - v_s_teacher.feats.float()) ** 2
-        distill = (d * w_rows).mean()
-        loss = loss + distill_w * distill
-        logs["geo_distill"] = distill.detach().item()
+            # ── mismatched-image hinge ──────────────────────────────────────
+            # Measured 2026-08-20 across v8 checkpoints 2k..10k: handing geometry
+            # a DIFFERENT asset's image costs it 2.6 / 4.1 / 4.3 / 4.7 / 4.3% —
+            # it climbed until step 4000 and has been flat for the 6000 since,
+            # while the released model pays 13.3%. So "conditioning will become
+            # load-bearing with more steps" is not supported; the model reaches a
+            # plateau where the image is worth little because GT coords already
+            # determine most of the shape and nothing in the objective rewards
+            # using the picture beyond that.
+            #
+            # This adds the reward directly: run the SAME noised inputs at the
+            # SAME timesteps with the conditioning rolled by one sample, and
+            # require the wrong image to cost at least `mismatch_margin`. A
+            # hinge, not a plain gap-maximiser, so it stops pushing once the
+            # margin is met and cannot trade real accuracy for separation.
+            #
+            # Costs one extra forward+backward, i.e. roughly 1.8x the step. Off
+            # by default; this is an experiment, not a shipped default.
+        # Guarded ONLY by mismatch_w and B — both identical on every rank, so the
+        # all_reduce inside _voxel_balanced_mse below stays collective. Nesting
+        # this under `keep.any()` (as it was) would have made it rank-conditional
+        # the moment the hinge was enabled.
+        if mismatch_w > 0 and B > 1:
+            roll = lambda c: None if c is None else c[1:] + c[:1]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                                enabled=x_tx.feats.is_cuda):
+                v_s_bad, _ = unified_model(
+                    x_ts, x_tx, (t_s * 1000.0).to(x_ts.feats.dtype),
+                    (t_x * 1000.0).to(x_tx.feats.dtype),
+                    roll(cond_s), roll(cond_x), tex_concat_cond=cc)
+            bad = _voxel_balanced_mse(v_s_bad.feats[rows].float(),
+                                      v_s_target.feats[rows].float())
+            hinge = torch.relu(geo_loss * (1.0 + mismatch_margin) - bad)
+            loss = loss + mismatch_w * hinge
+            logs["geo_mismatch_ratio"] = (bad / geo_loss.clamp_min(1e-8)).detach().item()
+            logs["geo_mismatch_hinge"] = hinge.detach().item()
+
+    if mismatch_w > 0 and geo_loss_w <= 0 and not getattr(
+            compute_unified_geotex_loss, "_warned_dead_hinge", False):
+        compute_unified_geotex_loss._warned_dead_hinge = True
+        print("[geotex] WARNING: mismatch_w > 0 but geo_loss_w == 0 — the hinge block "
+              "is nested inside the geo loss and is a SILENT NO-OP in this config "
+              "(no gradient, no geo_mismatch_* keys). On warm starts geo_loss_w is "
+              "forced to 0 unless geotex_unfreeze_geo; the experiment you think is "
+              "running is not.", flush=True)
 
     # ── CONDITIONING SENSITIVITY PROBE ──────────────────────────────────────
     # THE diagnostic this project lacked. After 60,000 steps we still could not
@@ -794,12 +934,27 @@ def compute_unified_geotex_loss(
                         ps, px = unified_model(ns, nx, (one * 1000.0), (one * 1000.0),
                                                cs, cx, tex_concat_cond=ns)
                     # x0 = x_t - t*v with t = 1
+                    # Tex arm MASKED to valid rows. Placeholder samples reconstruct
+                    # the same meaningless zeros under "ok" and "bad" alike, adding a
+                    # large near-identical term to numerator and denominator — which
+                    # drags cond_sens_tex toward 1.0, the exact "the stream ignores
+                    # its conditioning" signature this probe exists to detect.
+                    _e_x = ((nx.feats.float() - px.feats.float()) - x0_x.feats.float()).pow(2)
+                    if rows_x is not None:
+                        _e_x = _e_x[rows_x]
                     out[tag] = (
                         float(((ns.feats.float() - ps.feats.float()) - x0_s.feats.float()).pow(2).mean()),
-                        float(((nx.feats.float() - px.feats.float()) - x0_x.feats.float()).pow(2).mean()))
+                        float(_e_x.mean()) if _e_x.numel() else None)
+                _prev = getattr(compute_unified_geotex_loss, "_probe_last", (1.0, 1.0))
                 compute_unified_geotex_loss._probe_last = (
                     out["bad"][0] / max(out["ok"][0], 1e-8),
-                    out["bad"][1] / max(out["ok"][1], 1e-8))
+                    # All-invalid batch on a probe step (p≈0.25^8 per batch at 75%
+                    # coverage): no valid tex voxels to measure. Carry the previous
+                    # tex reading — a NaN here would be summed into the 500-step
+                    # per_stage window and blank the whole cond_sens_tex curve.
+                    out["bad"][1] / max(out["ok"][1], 1e-8)
+                    if out["ok"][1] is not None and out["bad"][1] is not None
+                    else _prev[1])
         # CARRY THE LAST VALUE ON EVERY STEP. HF Trainer averages logged
         # scalars over `logging_steps` and treats a missing key as absent from
         # only some steps — a probe that fires once per 200 steps came out as

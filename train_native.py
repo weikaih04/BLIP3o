@@ -261,17 +261,199 @@ def _apply_flow_freeze(model, mode: str):
             p.requires_grad_(True)
 
 
+
+
+def _pack_live_conds(conds, dev):
+    """Per-sample encoder output -> the padded batch tensors the model expects.
+
+    Mirrors vlm_collate's cached branch, including the two things that are NOT uniform
+    across tasks and cost a 32-GPU crash to learn:
+      * T carries NO DINO at all (no image), so the dino pack must be conditional —
+        flow_heads takes its non-fusion branch for text and a dino segment there would be
+        a condition the cached run never had.
+      * IM carries qwen_view_ids, padded with -1 (never 0, which is a real view ordinal).
+
+    collate_cached builds its mask with a bare torch.zeros, i.e. ALWAYS on CPU; on the
+    cached path _prepare_inputs moves it afterwards, and here nothing would.
+    """
+    from trellis2_blip3o.vlm_cache import collate_cached
+    q = collate_cached(conds)
+    out = {"cond_hidden": q["cond_hidden"].to(dev),
+           "cond_keep_mask": q["cond_keep_mask"].to(dev)}
+    if "dino_hidden" in conds[0]:
+        d = collate_cached([{"cond_hidden": c["dino_hidden"],
+                             "cond_keep_mask": c["dino_keep_mask"]} for c in conds])
+        out["dino_hidden"] = d["cond_hidden"].to(dev)
+        out["dino_keep_mask"] = d["cond_keep_mask"].to(dev)
+        T = d["cond_keep_mask"].shape[1]
+        vid = torch.zeros(len(conds), T, dtype=torch.long)
+        for i, c in enumerate(conds):
+            v = c.get("dino_view_ids")
+            if v is not None:
+                vid[i, :v.shape[0]] = v.cpu()
+        out["dino_view_ids"] = vid.to(dev)
+    if "qwen_view_ids" in conds[0]:
+        Tq = out["cond_hidden"].shape[1]
+        qv = torch.full((len(conds), Tq), -1, dtype=torch.long)
+        for i, c in enumerate(conds):
+            v = c["qwen_view_ids"]
+            qv[i, :v.shape[0]] = v.cpu()
+        out["qwen_view_ids"] = qv.to(dev)
+    return out
+
+
+def _mixture_uses_live_cond(trainer) -> bool:
+    """True when any task in the mixture was built with live_cond=True.
+
+    Read off the DATASETS, not the CLI: live_cond is a per-task yaml arg (mixture.py passes
+    only `s.args` to the task constructor), so there is no flag on the command line to
+    check and a --live_cond would be silently dropped like --max_slat_tokens is.
+    """
+    ds = getattr(trainer, "train_dataset", None)
+    return any(getattr(t, "live_cond", False) for t in getattr(ds, "tasks", []) or [])
+
+
+class _LiveCondPrefetch:
+    """One-batch-deep prefetch that makes the live-cond encode overlap the training step.
+
+    The encode is ~382 ms of GPU work per batch (bs8) against a ~6.5 s step. Run inline in
+    _prepare_inputs it is 5.9% of wall clock, serialized in front of the forward. Run here
+    it is enqueued on a side stream for batch N+1 BEFORE batch N is yielded, so it executes
+    while the main stream is busy with step N.
+
+    ORDER MATTERS AND IS EASY TO GET WRONG. Creating a side stream inside _prepare_inputs
+    and joining it two lines later overlaps NOTHING — the main stream has no work queued at
+    that moment, so it just adds two syncs. The encode has to be launched a full iteration
+    ahead of the step it hides behind, which is why this is a dataloader wrapper and not a
+    trainer hook.
+
+    This does NOT reduce GPU work; the encode and the step contend for SMs. What it
+    recovers is the step's idle SM time (ZeRO allreduce, low-occupancy sparse kernels), so
+    the win is real but bounded — measure it, do not assume it is free.
+    """
+
+    def __init__(self, dl, enc, device):
+        self.dl, self.enc, self.device = dl, enc, device
+        self.stream = torch.cuda.Stream(device=device)
+
+    def __len__(self):
+        return len(self.dl)
+
+    def __getattr__(self, k):                       # dataset / sampler / set_epoch / ...
+        return getattr(self.__dict__["dl"], k)
+
+    def _launch(self, batch):
+        """Enqueue this batch's encode on the side stream. Returns (batch, event)."""
+        if batch is None:
+            return None
+        preps = batch.pop("_live_prep", None) if isinstance(batch, dict) else None
+        if preps is None:
+            return (batch, None)
+        cur = torch.cuda.current_stream(self.device)
+        self.stream.wait_stream(cur)                # side stream must see prior main work
+        with torch.cuda.stream(self.stream):
+            conds = self.enc.encode(preps)
+            packed = _pack_live_conds(conds, self.device)
+        # The allocator frees a tensor when ITS stream is done with it; these are consumed
+        # on the main stream, so tell it that too or the blocks can be recycled early.
+        for v in packed.values():
+            v.record_stream(cur)
+        batch.update(packed)
+        ev = torch.cuda.Event()
+        ev.record(self.stream)
+        return (batch, ev)
+
+    def __iter__(self):
+        it = iter(self.dl)
+        cur = self._launch(next(it, None))
+        while cur is not None:
+            batch, ev = cur
+            if ev is not None:
+                torch.cuda.current_stream(self.device).wait_event(ev)   # GPU-side, no host stall
+            nxt_raw = next(it, None)
+            nxt = self._launch(nxt_raw)             # <- N+1 goes on the wire BEFORE N is yielded
+            yield batch
+            cur = nxt
+
+
 class NativeTrainer(Trainer):
     """Trainer that (1) moves trellis2 SparseTensor SLAT targets to the device — vanilla
     Trainer._prepare_inputs only moves torch.Tensors, leaving SparseTensors on CPU and
     crashing the cascade — and (2) emits per-stage / cond / voxel-count diagnostics from
     model.forward into Trainer.log → wandb."""
 
+    # LIVE conditioning (live_cond: true in the mixture yaml): the dataloader workers ship
+    # the CPU half of the Qwen/DINO preprocessing and the two towers run HERE, once per
+    # batch, SERIALLY in front of the step's forward. Measured 8 x 54.8 ms = 0.44 s against
+    # a 6.5 s step, i.e. a ~6.7% tax.
+    #
+    # It is serial ON PURPOSE for now. Hiding it needs a one-batch-deep prefetch that
+    # enqueues batch N+1's encode on a side stream BEFORE yielding batch N (so the encode
+    # overlaps step N's own kernels) — a side stream created and joined inside this method
+    # overlaps nothing, it just adds two syncs. That wrapper belongs on get_train_dataloader
+    # and has to hand tensors across streams with record_stream; not worth the allocator
+    # risk until 6.7% is the thing standing in the way.
+    _live_enc = None
+
+    def _live_encoder(self):
+        if self._live_enc is None:
+            from trellis2_blip3o.live_cond_batch import TrainCondEncoder
+            self._live_enc = TrainCondEncoder(device=str(self.args.device))
+            self._live_enc.warmup(int(self.args.per_device_train_batch_size))
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(f"[live_cond] cond VLM = {self._live_enc.vlm_path}", flush=True)
+                print(f"[live_cond] encoder resident on {self.args.device} "
+                      f"({torch.cuda.memory_allocated(self.args.device)/2**30:.1f} GB)",
+                      flush=True)
+        return self._live_enc
+
+    def get_train_dataloader(self):
+        """Wrap the prepared dataloader so the live-cond encode runs a batch ahead.
+
+        LIVE_COND_PREFETCH=0 falls back to encoding inline in _prepare_inputs — same
+        numbers, ~5.9% slower, and the one to use if a stream/allocator problem is ever
+        suspected. Non-live runs get the dataloader untouched.
+        """
+        dl = super().get_train_dataloader()
+        if not _mixture_uses_live_cond(self):
+            return dl
+        if os.environ.get("LIVE_COND_PREFETCH") == "0":
+            print("[live_cond] prefetch DISABLED — encoding inline in _prepare_inputs",
+                  flush=True)
+            return dl
+        print("[live_cond] prefetch ON — batch N+1 encodes on a side stream during step N",
+              flush=True)
+        return _LiveCondPrefetch(dl, self._live_encoder(), self.args.device)
+
+    def _encode_live(self, prepared):
+        """Inline fallback — only reached when the prefetch wrapper is disabled."""
+        preps = prepared.pop("_live_prep", None)
+        if preps is None:
+            return prepared
+        _prof = os.environ.get("LIVE_COND_PROF") == "1"
+        if _prof:
+            torch.cuda.synchronize(); _t0 = __import__("time").perf_counter()
+            _gap = _t0 - getattr(self, "_live_tprev", _t0)
+        prepared.update(_pack_live_conds(self._live_encoder().encode(preps),
+                                         self.args.device))
+        if _prof:
+            torch.cuda.synchronize(); _t1 = __import__("time").perf_counter()
+            self._live_n = getattr(self, "_live_n", 0) + 1
+            print(f"[live_cond_prof] step {self._live_n:3d}  gap(fetch+step) {_gap*1e3:7.1f} ms"
+                  f"  encode {(_t1-_t0)*1e3:7.1f} ms ({(_t1-_t0)*1e3/len(preps):5.1f}/img)",
+                  flush=True)
+            self._live_tprev = __import__("time").perf_counter()
+        return prepared
+
     def _prepare_inputs(self, inputs):
+        live = inputs.pop("_live_prep", None)   # a list of dicts — Trainer would choke
         prepared = super()._prepare_inputs(inputs)
         for k, v in list(prepared.items()):
             if hasattr(v, "feats") and hasattr(v, "to"):  # SparseTensor
                 prepared[k] = v.to(self.args.device)
+        if live is not None:
+            prepared["_live_prep"] = live
+            prepared = self._encode_live(prepared)
         return prepared
 
     @staticmethod
@@ -518,14 +700,17 @@ class NativeArgs:
     # S2b — unfreeze geo (three-pack: geo loss + self-distill + G3 red line)
     geotex_unfreeze_geo: bool = field(default=False)
     geotex_geo_loss_w: float = field(default=1.0)
-    geotex_distill_w: float = field(default=1.0)
-    geotex_distill_lo: float = field(default=0.1)
-    geotex_distill_hi: float = field(default=1.0)
     geotex_p_corner: float = field(default=0.4)  # user 2026-08-11: flagship tex|mesh mass; 0.2 = A1
     geotex_p_corner2: float = field(default=0.2)  # t_x=1 corner (mesh-only marginal, bidir design)
     # A6 sampler arms (default OFF = the S1/S2b recipe, bit-exact):
     geotex_concat_cond: bool = field(default=False)  # cascade-legacy shape concat into tex
     geotex_pooled_cond: bool = field(default=True)   # SD3/FLUX pooled cond -> adaLN modulation
+    geotex_mismatch_w: float = field(default=0.0)    # mismatched-image hinge (experiment)
+    geotex_mismatch_margin: float = field(default=0.15)
+    # ── dual-teacher output KD (s3_t50b specialists; all default OFF) ──
+    # WARM path: replay cond_x's realized drops onto cond_s (both towers drop
+    # together = inference's joint uncond). Legacy S1/S2b behavior = False.
+    geotex_joint_cond_drop: bool = field(default=False)
     adaptive_grad_clip: bool = field(default=True)   # TRELLIS.2's p95 rolling clip
     # fusion: cond = [raw DINOv3 tokens (cached d-keys); connector(Qwen)] — single cross-attn.
     fuse_dino: bool = field(default=False)
@@ -701,13 +886,13 @@ def main():
         geotex_gc=native_args.geotex_gc,
         geotex_unfreeze_geo=native_args.geotex_unfreeze_geo,
         geotex_geo_loss_w=native_args.geotex_geo_loss_w,
-        geotex_distill_w=native_args.geotex_distill_w,
-        geotex_distill_lo=native_args.geotex_distill_lo,
-        geotex_distill_hi=native_args.geotex_distill_hi,
         geotex_p_corner=native_args.geotex_p_corner,
         geotex_p_corner2=native_args.geotex_p_corner2,
         geotex_concat_cond=native_args.geotex_concat_cond,
         geotex_pooled_cond=native_args.geotex_pooled_cond,
+        geotex_mismatch_w=native_args.geotex_mismatch_w,
+        geotex_joint_cond_drop=native_args.geotex_joint_cond_drop,
+        geotex_mismatch_margin=native_args.geotex_mismatch_margin,
         fuse_dino=native_args.fuse_dino,
         dino_drop_prob=native_args.dino_drop_prob,
         qwen_drop_prob=native_args.qwen_drop_prob,
@@ -742,6 +927,18 @@ def main():
                 max_mem_ratio_start=0.5))
             print(f"[geotex] elastic GC ON (TRELLIS LinearMemoryController, "
                   f"target_ratio={native_args.elastic_target_ratio})")
+        else:
+            # Say it out loud. `elastic_slat` DEFAULTS TO TRUE (:842, and
+            # scripts/train_native_geotex.sh's ELASTIC:-True), so a relaunch that
+            # forgets ELASTIC=False silently changes the memory policy of a run
+            # that was tuned without it — and the failure mode is not a slowdown:
+            # mmdit3d.py:585-590 pins _ckpt_upto=0 in its finally, so once the
+            # elastic context has run, static --geotex_gc is permanently overridden
+            # OFF. A bad memory fit therefore degrades to NO checkpointing, i.e. OOM,
+            # not to safe-and-slow. Printing both states makes the policy visible in
+            # the log instead of inferable from the absence of a line.
+            print(f"[geotex] elastic GC OFF — static checkpointing at "
+                  f"geotex_gc={native_args.geotex_gc}")
         # freeze audit: trainables must be EXACTLY {tex flow, t-mixer, cross_alpha,
         # c_gates, tex connector} — a stray geo/VLM param here would silently train.
         _allowed = ("unified_geotex.tex_flow.", "unified_geotex.t_mixer.",

@@ -107,15 +107,16 @@ ELASTIC="${ELASTIC:-True}"
 ELASTIC_RATIO="${ELASTIC_RATIO:-0.75}"
 UNFREEZE_GEO="${UNFREEZE_GEO:-False}"
 GEO_LOSS_W="${GEO_LOSS_W:-1.0}"
-DISTILL_W="${DISTILL_W:-1.0}"
 BIDIR="${BIDIR:-True}"        # corner-masked bidirectional geo<->tex (user topology 2026-08-11)
 FUSED="${FUSED:-True}"        # fused MMDiT attention: 1 native varlen call/lane; MFU 18.7%->30.0%
-MIX="${MIX:-configs/mix_s3_splits.yaml}"
+# mix_s3_splits.yaml was retired with the cond cache (2026-08-21); the live
+# config is the drop-in successor (same tasks/weights, conds encoded at train time).
+MIX="${MIX:-configs/mix_s3_splits_live.yaml}"
 SHAPE_INIT="${SHAPE_INIT:-runs/s3_shape_t50b/checkpoint-8000}"
 TEX_INIT="${TEX_INIT:-runs/s3_tex_t50b/checkpoint-8000}"
 # ── FROM SCRATCH: three-stream sparse MMDiT (trellis2_blip3o/mmdit3d.py) ──
 # No TRELLIS.2 DiT weights (the VAEs are unchanged); SHAPE_INIT/TEX_INIT are
-# ignored, and so are the warm-start-only knobs (DISTILL_W, COND_MODE,
+# ignored, and so are the warm-start-only knobs (COND_MODE,
 # COND_STREAM_BLOCKS, XATTN_ANNEAL_*, COUPLING, BIDIR). Sizing is these four:
 FROM_SCRATCH="${FROM_SCRATCH:-False}"
 DIM="${DIM:-768}"; HEADS="${HEADS:-6}"          # head_dim must leave a spare rope pair
@@ -202,9 +203,10 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_xattn_anneal_start "$XATTN_ANNEAL_START" --geotex_xattn_anneal_end "$XATTN_ANNEAL_END" \
   --geotex_bidir "$BIDIR" --geotex_fused "$FUSED" --geotex_gc "$GC" \
   --geotex_unfreeze_geo "$UNFREEZE_GEO" --geotex_geo_loss_w "$GEO_LOSS_W" \
-  --geotex_distill_w "$DISTILL_W" \
   --geotex_p_corner "$P_CORNER" --geotex_p_corner2 "$P_CORNER2" \
   --adaptive_grad_clip "${ADAPTIVE_CLIP:-True}" \
+  --geotex_mismatch_w "${MISMATCH_W:-0.0}" --geotex_mismatch_margin "${MISMATCH_MARGIN:-0.15}" \
+  --geotex_joint_cond_drop "${JOINT_COND_DROP:-False}" \
   --build_slat False --ss_only False --compile_ss_flow False \
   --elastic_slat "$ELASTIC" --elastic_target_ratio "$ELASTIC_RATIO" \
   --freeze_vlm True --flow_tune full \
