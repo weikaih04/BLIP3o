@@ -977,7 +977,14 @@ class UnifiedGeoTexFlow(nn.Module):
         a = _dense_attn_out(blk.self_attn, a)
         h = h + a * g1.unsqueeze(1)
 
-        h = h + blk.cross_attn(blk.norm2(h), cond_ss, attn_mask=ss_cond_mask)
+        # * xattn_scale for the same reason the two slat lanes do: it is the
+        # knob that anneals the read-once cross-attn away when a cond STREAM
+        # takes over. Inert at 1.0 (the cross_attn cond_mode v10 runs), but
+        # leaving it off would mean an anneal silently starved two towers of
+        # conditioning while the third kept its own — an asymmetry nothing in
+        # the logs would show.
+        h = h + blk.cross_attn(blk.norm2(h), cond_ss,
+                               attn_mask=ss_cond_mask) * self.xattn_scale
 
         hm = blk.norm3(h)
         hm = hm * (1 + sc2.unsqueeze(1)) + sh2.unsqueeze(1)
