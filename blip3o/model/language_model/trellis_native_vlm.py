@@ -372,6 +372,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                     config.geotex_shape_init, config.geotex_tex_init, _ss_init,
                     all_trainable=True,
                     cond_seg_embed=bool(getattr(config, "geotex_cond_seg_embed", False)),
+                    cond_patch_pos=str(getattr(config, "geotex_cond_patch_pos", "off")),
                     **_kw)
                 rank0_print(f"[geotex] v10 THREE-TOWER assembly: ss={_ss_init}")
             else:

@@ -369,6 +369,8 @@ def build_unified_cond(
     cond_hidden: torch.Tensor,
     cond_key_mask: torch.Tensor,
     cond_seg_embed=None,          # (2, C): [image-segment code, text-segment code]
+    cond_patch_pos=None,          # (span, C): per-patch code for the qwen image span
+    cond_patch_span=None,         # (start, stop) of that span in the FULL qwen seq
     *,
     mask_drop_prob: float = 0.0,
     dino_hidden: Optional[torch.Tensor] = None,
@@ -427,6 +429,16 @@ def build_unified_cond(
         dino_seg = dino_hidden.to(cond_q.dtype)
         if dino_view_embed is not None and dino_view_ids is not None:
             dino_seg = dino_seg + dino_view_embed[dino_view_ids].to(cond_q.dtype)
+        if cond_patch_pos is not None and cond_patch_span is not None:
+            # PER-PATCH POSITION for the qwen image tokens. Applied on the FULL
+            # sequence, before any keep-compaction, because the span indices
+            # (pos_stamp.IMG_SPAN_FULL) are defined against the full layout —
+            # the same reason DinoPosStamp carries two spans. A short sequence
+            # (multi-image, odd batches) is left alone rather than mis-indexed.
+            _a, _b = cond_patch_span
+            if cond_q.shape[1] >= _b:
+                cond_q = cond_q.clone()
+                cond_q[:, _a:_b] = cond_q[:, _a:_b] + cond_patch_pos.to(cond_q.dtype)
         if cond_seg_embed is not None:
             # SEGMENT CODE: "you are an image token" vs "you are a text token".
             # cond is cat([dino ; qwen]) fed to a cross-attn that ropes NOTHING,
@@ -838,9 +850,12 @@ def compute_unified_geotex_loss(
     _sdrops = {}   # realized CFG drops, recorded for cond_s joint-drop replay
                    # (recording has no RNG effect)
     _seg = getattr(unified_model, "cond_seg_embed", None)
+    _pp = getattr(unified_model, "cond_patch_pos", None)
+    _ps = getattr(unified_model, "cond_patch_span", None)
     cond_x, key_x, _, _ = build_unified_cond(
         connector_tex, cond_hidden, cond_key_mask,
         cond_seg_embed=None if _seg is None else _seg[1],
+        cond_patch_pos=None if _pp is None else _pp[1], cond_patch_span=_ps,
         mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
         dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
         qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -873,6 +888,7 @@ def compute_unified_geotex_loss(
             cond_s, key_s, _, _ = build_unified_cond(
                 connector_geo, cond_hidden, cond_key_mask,
                 cond_seg_embed=None if _seg is None else _seg[0],
+                cond_patch_pos=None if _pp is None else _pp[0], cond_patch_span=_ps,
                 mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
                 dino_drop_prob=0.0, qwen_drop_prob=0.0,
                 dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
@@ -896,6 +912,7 @@ def compute_unified_geotex_loss(
         cond_ss, key_ss, sdpa_ss, _ = build_unified_cond(
             connector_ss, cond_hidden, cond_key_mask,
             cond_seg_embed=None if _seg is None else _seg[2],
+            cond_patch_pos=None if _pp is None else _pp[2], cond_patch_span=_ps,
             mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
             dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
             qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -1104,6 +1121,11 @@ def compute_unified_geotex_loss(
         for _i, _nm in enumerate(("geo", "tex", "ss")):
             logs[f"seg_img_{_nm}"] = float(_se[_i, 0].norm()) / max(_dn, 1e-6)
             logs[f"seg_txt_{_nm}"] = float(_se[_i, 1].norm()) / max(_dn, 1e-6)
+    if _pp is not None:
+        _dn2 = float(dino_hidden.float().norm(dim=-1).mean()) if dino_hidden is not None else 1.0
+        _pd = _pp.detach().float()
+        for _i, _nm in enumerate(("geo", "tex", "ss")):
+            logs[f"patchpos_{_nm}"] = float(_pd[_i].norm(dim=-1).mean()) / max(_dn2, 1e-6)
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex

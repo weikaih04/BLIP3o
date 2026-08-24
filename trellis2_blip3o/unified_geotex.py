@@ -215,7 +215,8 @@ class UnifiedGeoTexFlow(nn.Module):
                  bidirectional: bool = False,
                  ss_flow: nn.Module = None,
                  all_trainable: bool = False,
-                 cond_seg_embed: bool = False):
+                 cond_seg_embed: bool = False,
+                 cond_patch_pos: str = "off"):     # off | zero | dino_sig
         """coupling: "union" (DEFAULT — MF-faithful bare single-softmax union,
         dit.py:137-148; user decision 2026-08-11: try MF first, measure) or
         "gated" (in-house mmdit_slat.py:190-196 two-softmax + per-head zero-init
@@ -476,6 +477,42 @@ class UnifiedGeoTexFlow(nn.Module):
             self.cond_seg_embed = nn.Parameter(torch.zeros(3, 2, _C))
         else:
             self.cond_seg_embed = None
+
+        # ── per-patch position code for the QWEN image span ──
+        # The DINO half already carries per-patch position implicitly: it is a
+        # ViT's own output and the pretrained flow was trained to read exactly
+        # that. The qwen visual tokens are the ones the flow cannot place — its
+        # cross-attn ropes nothing, and whatever M-RoPE put into them is not the
+        # signature the flow parses.
+        #
+        # LEARNABLE, INITIALISED FROM THAT SIGNATURE — not zero, and not fixed.
+        #   zero-init makes the model learn three things (that position matters,
+        #     a code for it, and readers for that code) when its readers already
+        #     know one;
+        #   fixed direction (what DinoPosStamp does, with only a learnable
+        #     scalar) cannot correct the assumption underneath it: that qwen
+        #     token i and dino patch i are the same place, when the two come
+        #     from different pipelines (DINO 512px/patch16 vs a 1024px qwen
+        #     canvas) and only happen to land on 32x32 grids.
+        # Starting at the signature buys the head start; being learnable lets
+        # training walk away from the borrowed correspondence if it is wrong.
+        self.cond_patch_pos = None
+        self.cond_patch_span = None
+        if cond_patch_pos != "off":
+            _C = tex_flow.cond_channels
+            from .pos_stamp import DPOS_NPZ, IMG_SPAN_FULL
+            if cond_patch_pos == "dino_sig":
+                import numpy as _np
+                _p = torch.from_numpy(_np.load(DPOS_NPZ)["pos"].astype("float32"))
+                assert _p.shape == (IMG_SPAN_FULL.stop - IMG_SPAN_FULL.start, _C), \
+                    f"dino signature {tuple(_p.shape)} != span x C"
+            elif cond_patch_pos == "zero":
+                _p = torch.zeros(IMG_SPAN_FULL.stop - IMG_SPAN_FULL.start, _C)
+            else:
+                raise ValueError(f"cond_patch_pos={cond_patch_pos!r}")
+            # one per stream, same reasoning as the segment code
+            self.cond_patch_pos = nn.Parameter(_p[None].repeat(3, 1, 1).clone())
+            self.cond_patch_span = (IMG_SPAN_FULL.start, IMG_SPAN_FULL.stop)
 
     # ── coupling A (DEFAULT): MF-faithful bare union softmax ────────────────
     def _union_attn(self, q_x, k_x, v_x, k_s, v_s, k_c=None, v_c=None,
@@ -1387,6 +1424,7 @@ def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: st
                          cond_mode: str = "cross_attn", coupling: str = "union",
                          bidirectional: bool = True, all_trainable: bool = True,
                          cond_seg_embed: bool = False,
+                         cond_patch_pos: str = "off",
                          weights_file: str = "model.safetensors") -> UnifiedGeoTexFlow:
     """v10: the THREE-tower assembly, warm from the s3_t50 specialists.
 
@@ -1426,7 +1464,8 @@ def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: st
     return UnifiedGeoTexFlow(geo, tex, cond_mode=cond_mode, coupling=coupling,
                              bidirectional=bidirectional, ss_flow=ss,
                              all_trainable=all_trainable,
-                             cond_seg_embed=cond_seg_embed)
+                             cond_seg_embed=cond_seg_embed,
+                             cond_patch_pos=cond_patch_pos)
 
 
 def load_tri_connectors(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,
