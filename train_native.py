@@ -702,6 +702,7 @@ class NativeArgs:
     # ── v10: the third tower. Setting geotex_ss_init is what turns v10 on. ──
     geotex_ss_init: str = field(default="")            # s3_ss run ckpt; "" = two-tower
     geotex_ss_loss_w: float = field(default=1.0)
+    geotex_cond_seg_embed: bool = field(default=False)  # image/text segment code on cond
     geotex_p_solo: float = field(default=0.20)         # SS-solo rows
     geotex_p_lag: float = field(default=0.20)          # lag-band rows
     geotex_k0_lo: int = field(default=3)               # t_ss<=t_s fails below 2
@@ -894,6 +895,7 @@ def main():
         geotex_unfreeze_geo=native_args.geotex_unfreeze_geo,
         geotex_ss_init=native_args.geotex_ss_init,
         geotex_ss_loss_w=native_args.geotex_ss_loss_w,
+        geotex_cond_seg_embed=native_args.geotex_cond_seg_embed,
         geotex_p_solo=native_args.geotex_p_solo,
         geotex_p_lag=native_args.geotex_p_lag,
         geotex_k0_lo=native_args.geotex_k0_lo,
@@ -972,7 +974,7 @@ def main():
             _allowed = _allowed + (
                 "unified_geotex.ss_flow.", "unified_geotex.geo_flow.",
                 "unified_geotex.ss_gates_geo", "unified_geotex.ss_gates_tex",
-                "unified_geotex.ss_reads_gate",
+                "unified_geotex.ss_reads_gate", "unified_geotex.cond_seg_embed",
                 "geo_connector.", "ss_connector.")
         if getattr(getattr(model, "unified_geotex", None), "from_scratch", False):
             # From-scratch MMDiT3D: there is no frozen warm start, so EVERY

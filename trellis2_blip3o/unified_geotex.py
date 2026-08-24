@@ -214,7 +214,8 @@ class UnifiedGeoTexFlow(nn.Module):
                  coupling: str = "union",
                  bidirectional: bool = False,
                  ss_flow: nn.Module = None,
-                 all_trainable: bool = False):
+                 all_trainable: bool = False,
+                 cond_seg_embed: bool = False):
         """coupling: "union" (DEFAULT — MF-faithful bare single-softmax union,
         dit.py:137-148; user decision 2026-08-11: try MF first, measure) or
         "gated" (in-house mmdit_slat.py:190-196 two-softmax + per-head zero-init
@@ -465,6 +466,16 @@ class UnifiedGeoTexFlow(nn.Module):
             self.ss_gates_tex = None
             self.ss_reads_gate = None
             self.ss_reads_enabled = False
+
+        # ── cond segment code: (stream, segment, C), segment 0 = image, 1 = text ──
+        # One per stream because each tower reads the cond through its own
+        # connector and may want a different emphasis. 3 x 2 x 1024 = 6144 params,
+        # zero-init, so enabling it does not move step 0.
+        if cond_seg_embed:
+            _C = tex_flow.cond_channels
+            self.cond_seg_embed = nn.Parameter(torch.zeros(3, 2, _C))
+        else:
+            self.cond_seg_embed = None
 
     # ── coupling A (DEFAULT): MF-faithful bare union softmax ────────────────
     def _union_attn(self, q_x, k_x, v_x, k_s, v_s, k_c=None, v_c=None,
@@ -1375,6 +1386,7 @@ def assemble_unified(shape_run_ckpt: str, tex_run_ckpt: str,
 def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,
                          cond_mode: str = "cross_attn", coupling: str = "union",
                          bidirectional: bool = True, all_trainable: bool = True,
+                         cond_seg_embed: bool = False,
                          weights_file: str = "model.safetensors") -> UnifiedGeoTexFlow:
     """v10: the THREE-tower assembly, warm from the s3_t50 specialists.
 
@@ -1413,7 +1425,8 @@ def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: st
     ss.load_state_dict(ss_sd, strict=True)
     return UnifiedGeoTexFlow(geo, tex, cond_mode=cond_mode, coupling=coupling,
                              bidirectional=bidirectional, ss_flow=ss,
-                             all_trainable=all_trainable)
+                             all_trainable=all_trainable,
+                             cond_seg_embed=cond_seg_embed)
 
 
 def load_tri_connectors(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,

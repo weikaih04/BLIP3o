@@ -76,7 +76,8 @@ def cond_uncond(connector, rec: Dict[str, torch.Tensor],
                 dino_view_embed: Optional[torch.Tensor] = None,
                 cond_max_length: int = 10240,
                 device: str = "cuda",
-                drop_dino: bool = False, drop_qwen: bool = False):
+                drop_dino: bool = False, drop_qwen: bool = False,
+                cond_seg_embed=None):
     """(cond, uncond), each (1, T, C), keep-masked — ready for a sampler.
 
     cond    no drops at all.
@@ -107,8 +108,9 @@ def cond_uncond(connector, rec: Dict[str, torch.Tensor],
 
     def build(drop, ddrop, qdrop):
         c, k, _, _ = build_unified_cond(
-            connector, h, km, mask_drop_prob=0.0, dino_drop_prob=0.0,
-            qwen_drop_prob=0.0, ext_drops=(drop, ddrop, qdrop), **kw)
+            connector, h, km, cond_seg_embed=cond_seg_embed, mask_drop_prob=0.0,
+            dino_drop_prob=0.0, qwen_drop_prob=0.0,
+            ext_drops=(drop, ddrop, qdrop), **kw)
         return c[0][k[0]][None]
 
     dd = o if drop_dino else z

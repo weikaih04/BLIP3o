@@ -111,6 +111,31 @@ check("T modality regimes: drop_dino->qwen only, drop_qwen->dino only, "
       "both == drop_dino (qdrop suppressed by ddrop, as in training)", ok,
       f"{tuple(cd.shape)} {tuple(cq.shape)} {tuple(cb.shape)}")
 
+# ── U: the cond SEGMENT code ──
+# cond is cat([dino ; qwen]) into a cross-attn that ropes nothing, so without a
+# code the tower cannot tell which half is which. Zero-init must be a no-op;
+# nonzero must move exactly the segment it belongs to.
+seg = torch.zeros(2, C, device=DEV)
+c_zero, u_zero = cond_uncond(conn, rec, dino_view_embed=dve, device=DEV,
+                             cond_seg_embed=seg)
+ok = torch.equal(c_zero, c) and torch.equal(u_zero, u)
+seg[0] = 0.37                       # image-segment code only
+c_img, u_img = cond_uncond(conn, rec, dino_view_embed=dve, device=DEV,
+                           cond_seg_embed=seg)
+ok &= not torch.equal(c_img[:, :Td], c[:, :Td])      # dino half moved
+ok &= torch.equal(c_img[:, Td:], c[:, Td:])          # qwen half untouched
+seg[0] = 0.0; seg[1] = 0.37         # text-segment code only
+c_txt, _ = cond_uncond(conn, rec, dino_view_embed=dve, device=DEV,
+                       cond_seg_embed=seg)
+ok &= torch.equal(c_txt[:, :Td], c[:, :Td])          # dino half untouched
+ok &= not torch.equal(c_txt[:, Td:], c[:, Td:])      # qwen half moved
+# the CFG uncond must stay all-zero-valued: a dropped row carries no
+# information, structural included
+ok &= float(u_img[0, :Td].abs().max()) == 0.0
+check("U segment code: zero-init is a no-op, each code moves only its own "
+      "segment, and the CFG uncond stays information-free", ok)
+
+
 print(f"\n{len(done)} passed, {len(fails)} failed")
 if fails:
     print("FAILED:", ", ".join(fails))

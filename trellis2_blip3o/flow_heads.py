@@ -368,6 +368,7 @@ def build_unified_cond(
     connector,
     cond_hidden: torch.Tensor,
     cond_key_mask: torch.Tensor,
+    cond_seg_embed=None,          # (2, C): [image-segment code, text-segment code]
     *,
     mask_drop_prob: float = 0.0,
     dino_hidden: Optional[torch.Tensor] = None,
@@ -426,6 +427,23 @@ def build_unified_cond(
         dino_seg = dino_hidden.to(cond_q.dtype)
         if dino_view_embed is not None and dino_view_ids is not None:
             dino_seg = dino_seg + dino_view_embed[dino_view_ids].to(cond_q.dtype)
+        if cond_seg_embed is not None:
+            # SEGMENT CODE: "you are an image token" vs "you are a text token".
+            # cond is cat([dino ; qwen]) fed to a cross-attn that ropes NOTHING,
+            # so the tower receives one unordered bag of ~2053 keys with no marker
+            # saying which half is which. The from-scratch tower gave them
+            # distinct segment ids for exactly this reason (mmdit3d SEGMENTS
+            # cond_dino=2, cond_qwen=3); the warm path lost it because cond moved
+            # out of the joint softmax and into cross-attn.
+            # Zero-init, so step 0 is bit-exact with the warm start. Added HERE,
+            # before the `* keep` below, so a CFG-dropped row stays all-zero: the
+            # uncond must carry no information, structural included.
+            # MAGNITUDE IS NOT FREE — the view embed had to be scaled to ~15% of
+            # the DINO token norm because at 0.7x it drowned the content and the
+            # flow fled to the qwen segment (DINO attention share 0.72 -> 0.22).
+            # Zero-init lets training find the scale instead of us guessing it.
+            dino_seg = dino_seg + cond_seg_embed[0].to(cond_q.dtype)
+            cond_q = cond_q + cond_seg_embed[1].to(cond_q.dtype)
         dino_seg = dino_seg * keep
         dmask = dino_key_mask if dino_key_mask is not None else torch.ones(
             dino_hidden.shape[:2], dtype=torch.bool, device=dino_hidden.device)
@@ -819,8 +837,10 @@ def compute_unified_geotex_loss(
 
     _sdrops = {}   # realized CFG drops, recorded for cond_s joint-drop replay
                    # (recording has no RNG effect)
+    _seg = getattr(unified_model, "cond_seg_embed", None)
     cond_x, key_x, _, _ = build_unified_cond(
         connector_tex, cond_hidden, cond_key_mask,
+        cond_seg_embed=None if _seg is None else _seg[1],
         mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
         dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
         qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -852,6 +872,7 @@ def compute_unified_geotex_loss(
         with _cs_ctx:
             cond_s, key_s, _, _ = build_unified_cond(
                 connector_geo, cond_hidden, cond_key_mask,
+                cond_seg_embed=None if _seg is None else _seg[0],
                 mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
                 dino_drop_prob=0.0, qwen_drop_prob=0.0,
                 dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
@@ -874,6 +895,7 @@ def compute_unified_geotex_loss(
             if _sdrops.get("drop") is not None else None)
         cond_ss, key_ss, sdpa_ss, _ = build_unified_cond(
             connector_ss, cond_hidden, cond_key_mask,
+            cond_seg_embed=None if _seg is None else _seg[2],
             mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
             dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
             qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -1072,6 +1094,16 @@ def compute_unified_geotex_loss(
             "ss_gate_tex": float(unified_model.ss_gates_tex.detach().abs().mean()),
             "ss_reads_gate": float(unified_model.ss_reads_gate.detach().abs().mean()),
         })
+    if getattr(unified_model, "cond_seg_embed", None) is not None:
+        # Norm relative to the DINO token norm, because that ratio is the thing
+        # that went wrong before: a cond-side code at 0.7x the token norm drove
+        # the DINO attention share from 0.72 to 0.22. Zero at init; watch that it
+        # settles well under 1.
+        _dn = float(dino_hidden.float().norm(dim=-1).mean()) if dino_hidden is not None else 1.0
+        _se = unified_model.cond_seg_embed.detach().float()
+        for _i, _nm in enumerate(("geo", "tex", "ss")):
+            logs[f"seg_img_{_nm}"] = float(_se[_i, 0].norm()) / max(_dn, 1e-6)
+            logs[f"seg_txt_{_nm}"] = float(_se[_i, 1].norm()) / max(_dn, 1e-6)
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex
