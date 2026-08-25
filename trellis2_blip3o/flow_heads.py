@@ -365,41 +365,28 @@ def compute_cascade_flow_loss(
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _add_patch_pos(cond_q, cond_patch_pos, qwen_img_pos):
-    """Per-patch position code for the qwen image tokens, indexed by the token's
-    REAL position in its own view rather than a hardcoded span.
+    """Per-patch position code for the qwen image tokens. A pure gather.
 
-    The first version used pos_stamp's [10, 1034) with a length guard, which
-    silently gave i1 rows a code and multi-image rows none — no crash, no log
-    line, two tasks trained on structurally different conditioning. Same reason
-    _qwen_view_ids refuses the cached 292-token layout: any fixed span is valid
-    at exactly one GEOTEX_IM_TOK_PER_VIEW.
+    qwen_img_pos already carries the CANONICAL lattice index, computed in the
+    encoder where the true per-view (h, w) is known — so there is no grid
+    inference here, no square assumption, and nothing that changes meaning when
+    GEOTEX_IM_TOK_PER_VIEW moves. -1 marks a non-image token.
 
-    Lives here rather than inside one branch of build_unified_cond because both
-    branches can carry image tokens — fuse_dino=False takes the plain branch and
-    would otherwise be the same silent skip in a different costume.
-
-    The table is a canonical PxP lattice. A view with n tokens is a
-    sqrt(n) x sqrt(n) grid mapped onto it by scaling, so i1 (32x32) lands 1:1 and
-    IM at 64 tok/view samples every 4th cell — the same physical positions at the
-    resolution that view has.
+    Called from BOTH branches of build_unified_cond: fuse_dino=False takes the
+    plain branch and can still carry image tokens, and leaving it out there would
+    be the same silent skip that made the first version give i1 rows a code and
+    multi-image rows none.
     """
     if cond_patch_pos is None or qwen_img_pos is None:
         return cond_q
-    P = int(round(float(cond_patch_pos.shape[0]) ** 0.5))
-    assert P * P == cond_patch_pos.shape[0], \
-        f"patch table {cond_patch_pos.shape[0]} is not a square lattice"
     qp = qwen_img_pos.to(cond_q.device)
     m = qp >= 0
     if not bool(m.any()):
         return cond_q
-    # tokens per view = max ordinal + 1 (every view carries the same count)
-    side = (qp.max(1, keepdim=True).values + 1).clamp_min(1).float().sqrt().round().long().clamp_min(1)
-    o = qp.clamp_min(0)
-    r, c = o // side, o % side
-    sc = P / side.float()
-    idx = ((r.float() * sc).long().clamp(0, P - 1) * P
-           + (c.float() * sc).long().clamp(0, P - 1))
-    add = cond_patch_pos.to(cond_q.dtype)[idx.clamp(0, P * P - 1)]
+    n = cond_patch_pos.shape[0]
+    assert int(qp.max()) < n, \
+        f"lattice index {int(qp.max())} out of range for a {n}-entry table"
+    add = cond_patch_pos.to(cond_q.dtype)[qp.clamp_min(0)]
     return cond_q + add * m.unsqueeze(-1).to(cond_q.dtype)
 
 
