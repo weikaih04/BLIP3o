@@ -364,29 +364,47 @@ def compute_cascade_flow_loss(
 # Unified Geo-Tex DiT training path (docs/UNIFIED_GEOTEX_DIT_DESIGN.md, P3)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _add_patch_pos(cond_q, cond_patch_pos, qwen_img_pos):
-    """Per-patch position code for the qwen image tokens. A pure gather.
+def _add_patch_pos(cond_q, cond_patch_pos, qwen_img_rc):
+    """Per-patch position code, BILINEARLY sampled from a PxP table at the
+    token's normalised position in its own view.
 
-    qwen_img_pos already carries the CANONICAL lattice index, computed in the
-    encoder where the true per-view (h, w) is known — so there is no grid
-    inference here, no square assumption, and nothing that changes meaning when
-    GEOTEX_IM_TOK_PER_VIEW moves. -1 marks a non-image token.
+    Interpolating rather than snapping to a cell is what makes this survive a
+    change in tokens-per-view — which has already happened once (64 -> 256) and
+    will happen again. Nearest-cell breaks in both directions: a view FINER than
+    the table collides two patches onto one cell, silently losing resolution; a
+    view coarser than it picks one corner of the region it covers instead of the
+    region. Bilinear is the same trick a ViT uses to reuse a position embedding
+    at a new input resolution.
+
+    Two properties worth knowing, both consequences of using cell CENTRES:
+      * a view at exactly PxP samples the integer grid, so the interpolation is
+        an identity and the table is used verbatim — a warm start from the DINO
+        signature is bit-exact at i1;
+      * a view at P/2 x P/2 samples half-way, so each token gets the MEAN of the
+        2x2 cells it covers, which is the correct downsample rather than a corner.
 
     Called from BOTH branches of build_unified_cond: fuse_dino=False takes the
-    plain branch and can still carry image tokens, and leaving it out there would
-    be the same silent skip that made the first version give i1 rows a code and
-    multi-image rows none.
+    plain branch and can still carry image tokens.
     """
-    if cond_patch_pos is None or qwen_img_pos is None:
+    if cond_patch_pos is None or qwen_img_rc is None:
         return cond_q
-    qp = qwen_img_pos.to(cond_q.device)
-    m = qp >= 0
+    rc = qwen_img_rc.to(cond_q.device).float()
+    m = rc[..., 0] >= 0
     if not bool(m.any()):
         return cond_q
     n = cond_patch_pos.shape[0]
-    assert int(qp.max()) < n, \
-        f"lattice index {int(qp.max())} out of range for a {n}-entry table"
-    add = cond_patch_pos.to(cond_q.dtype)[qp.clamp_min(0)]
+    P = int(round(n ** 0.5))
+    assert P * P == n, f"position table {n} is not a square lattice"
+    tab = cond_patch_pos.to(cond_q.dtype).view(P, P, -1)
+    # normalised centre -> continuous table coordinate (align_corners=False)
+    y = (rc[..., 0] * P - 0.5).clamp(0, P - 1)
+    x = (rc[..., 1] * P - 0.5).clamp(0, P - 1)
+    y0, x0 = y.floor().long(), x.floor().long()
+    y1, x1 = (y0 + 1).clamp(max=P - 1), (x0 + 1).clamp(max=P - 1)
+    wy, wx = (y - y0.float()).unsqueeze(-1), (x - x0.float()).unsqueeze(-1)
+    wy, wx = wy.to(cond_q.dtype), wx.to(cond_q.dtype)
+    add = (tab[y0, x0] * (1 - wy) * (1 - wx) + tab[y1, x0] * wy * (1 - wx)
+           + tab[y0, x1] * (1 - wy) * wx + tab[y1, x1] * wy * wx)
     return cond_q + add * m.unsqueeze(-1).to(cond_q.dtype)
 
 
@@ -396,7 +414,7 @@ def build_unified_cond(
     cond_key_mask: torch.Tensor,
     cond_seg_embed=None,          # (2, C): [image-segment code, text-segment code]
     cond_patch_pos=None,          # (P*P, C): per-patch code on a canonical PxP lattice
-    qwen_img_pos=None,            # (B, T) patch ordinal within each view, -1 = not an image token
+    qwen_img_rc=None,             # (B, T, 2) normalised (row, col) in its own view, -1 = not an image
     *,
     mask_drop_prob: float = 0.0,
     dino_hidden: Optional[torch.Tensor] = None,
@@ -455,7 +473,7 @@ def build_unified_cond(
         dino_seg = dino_hidden.to(cond_q.dtype)
         if dino_view_embed is not None and dino_view_ids is not None:
             dino_seg = dino_seg + dino_view_embed[dino_view_ids].to(cond_q.dtype)
-        cond_q = _add_patch_pos(cond_q, cond_patch_pos, qwen_img_pos)
+        cond_q = _add_patch_pos(cond_q, cond_patch_pos, qwen_img_rc)
         if cond_seg_embed is not None:
             # SEGMENT CODE: "you are an image token" vs "you are a text token".
             # cond is cat([dino ; qwen]) fed to a cross-attn that ropes NOTHING,
@@ -509,7 +527,7 @@ def build_unified_cond(
                              key_mask=cond_key_mask)
         else:
             cond = connector(mask_drop(cond_hidden, mask_drop_prob), key_mask=cond_key_mask)
-        cond = _add_patch_pos(cond, cond_patch_pos, qwen_img_pos)
+        cond = _add_patch_pos(cond, cond_patch_pos, qwen_img_rc)
         if cond_seg_embed is not None:
             cond = cond + cond_seg_embed[1].to(cond.dtype)   # text-segment code
         if drops_out is not None:
@@ -819,7 +837,7 @@ def compute_unified_geotex_loss(
                                       # optimization).
     # cond extras (same contract as the cascade path)
     dino_hidden=None, dino_key_mask=None, dino_view_ids=None, qwen_view_ids=None,
-    qwen_img_pos=None,
+    qwen_img_rc=None,
     dino_view_embed=None,
     mask_drop_prob: float = 0.1,
     dino_drop_prob: float = 0.0,
@@ -875,7 +893,7 @@ def compute_unified_geotex_loss(
     cond_x, key_x, _, _ = build_unified_cond(
         connector_tex, cond_hidden, cond_key_mask,
         cond_seg_embed=None if _seg is None else _seg[1],
-        cond_patch_pos=None if _pp is None else _pp[1], qwen_img_pos=qwen_img_pos,
+        cond_patch_pos=None if _pp is None else _pp[1], qwen_img_rc=qwen_img_rc,
         mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
         dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
         qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -908,7 +926,7 @@ def compute_unified_geotex_loss(
             cond_s, key_s, _, _ = build_unified_cond(
                 connector_geo, cond_hidden, cond_key_mask,
                 cond_seg_embed=None if _seg is None else _seg[0],
-                cond_patch_pos=None if _pp is None else _pp[0], qwen_img_pos=qwen_img_pos,
+                cond_patch_pos=None if _pp is None else _pp[0], qwen_img_rc=qwen_img_rc,
                 mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
                 dino_drop_prob=0.0, qwen_drop_prob=0.0,
                 dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
@@ -932,7 +950,7 @@ def compute_unified_geotex_loss(
         cond_ss, key_ss, sdpa_ss, _ = build_unified_cond(
             connector_ss, cond_hidden, cond_key_mask,
             cond_seg_embed=None if _seg is None else _seg[2],
-            cond_patch_pos=None if _pp is None else _pp[2], qwen_img_pos=qwen_img_pos,
+            cond_patch_pos=None if _pp is None else _pp[2], qwen_img_rc=qwen_img_rc,
             mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
             dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
             qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -1149,8 +1167,8 @@ def compute_unified_geotex_loss(
         # COVERAGE, because the first version skipped multi-image rows in silence.
         # This is the number that would have shown it: the fraction of rows whose
         # qwen segment actually received a patch code.
-        logs["patchpos_cov"] = (0.0 if qwen_img_pos is None
-                                else float((qwen_img_pos >= 0).any(1).float().mean()))
+        logs["patchpos_cov"] = (0.0 if qwen_img_rc is None
+                                else float((qwen_img_rc[..., 0] >= 0).any(1).float().mean()))
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex

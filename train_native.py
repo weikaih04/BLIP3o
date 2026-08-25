@@ -299,15 +299,16 @@ def _pack_live_conds(conds, dev):
             v = c["qwen_view_ids"]
             qv[i, :v.shape[0]] = v.cpu()
         out["qwen_view_ids"] = qv.to(dev)
-    if "qwen_img_pos" in conds[0]:
-        # Same -1 padding as qwen_view_ids: 0 is a REAL patch ordinal, so padding
-        # with it would tell the model every pad token is the top-left patch.
+    if "qwen_img_rc" in conds[0]:
+        # -1 padding, same reason qwen_view_ids uses it: 0.0 is a REAL normalised
+        # coordinate, so padding with zeros would place every pad token at the
+        # top-left corner of the image.
         Tq = out["cond_hidden"].shape[1]
-        qp = torch.full((len(conds), Tq), -1, dtype=torch.long)
+        qp = torch.full((len(conds), Tq, 2), -1.0)
         for i, c in enumerate(conds):
-            v = c["qwen_img_pos"]
+            v = c["qwen_img_rc"]
             qp[i, :v.shape[0]] = v.cpu()
-        out["qwen_img_pos"] = qp.to(dev)
+        out["qwen_img_rc"] = qp.to(dev)
     return out
 
 
@@ -713,6 +714,7 @@ class NativeArgs:
     geotex_ss_loss_w: float = field(default=1.0)
     geotex_cond_seg_embed: bool = field(default=False)  # image/text segment code on cond
     geotex_cond_patch_pos: str = field(default="off")   # off | zero | dino_sig
+    geotex_cond_patch_lattice: int = field(default=32)  # position-table resolution
     geotex_p_solo: float = field(default=0.20)         # SS-solo rows
     geotex_p_lag: float = field(default=0.20)          # lag-band rows
     geotex_k0_lo: int = field(default=3)               # t_ss<=t_s fails below 2
@@ -907,6 +909,7 @@ def main():
         geotex_ss_loss_w=native_args.geotex_ss_loss_w,
         geotex_cond_seg_embed=native_args.geotex_cond_seg_embed,
         geotex_cond_patch_pos=native_args.geotex_cond_patch_pos,
+        geotex_cond_patch_lattice=native_args.geotex_cond_patch_lattice,
         geotex_p_solo=native_args.geotex_p_solo,
         geotex_p_lag=native_args.geotex_p_lag,
         geotex_k0_lo=native_args.geotex_k0_lo,

@@ -373,6 +373,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                     all_trainable=True,
                     cond_seg_embed=bool(getattr(config, "geotex_cond_seg_embed", False)),
                     cond_patch_pos=str(getattr(config, "geotex_cond_patch_pos", "off")),
+                    cond_patch_lattice=int(getattr(config, "geotex_cond_patch_lattice", 32)),
                     **_kw)
                 rank0_print(f"[geotex] v10 THREE-TOWER assembly: ss={_ss_init}")
             else:
@@ -872,7 +873,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
         dino_keep_mask: Optional[torch.Tensor] = None,
         dino_view_ids: Optional[torch.Tensor] = None,   # (B, N_d) view ordinals (IM)
         qwen_view_ids: Optional[torch.Tensor] = None,   # (B, T_q) view ordinals for the QWEN segment (-1 = text)
-        qwen_img_pos: Optional[torch.Tensor] = None,    # (B, T_q) patch ordinal within each view (-1 = text)
+        qwen_img_rc: Optional[torch.Tensor] = None,     # (B, T_q, 2) normalised (row, col) in its own view (-1 = text)
         # cond_keep_mask (collator): True = real CONTENT token (caption/image_pad); False = chat-
         # template boilerplate (im_start/im_end/vision_*/role/think). ANDed into cond_key_mask so
         # the flow cross-attn ignores boilerplate → cleaner cond (esp. text→3D).
@@ -1028,7 +1029,7 @@ class TrellisNativeVLMForConditionalGeneration(PreTrainedModel):
                     if (dino_keep_mask is not None and _fuse) else None,
                 dino_view_ids=dino_view_ids if _fuse else None,
                 qwen_view_ids=qwen_view_ids if _fuse else None,
-                qwen_img_pos=qwen_img_pos if _fuse else None,
+                qwen_img_rc=qwen_img_rc if _fuse else None,
                 dino_view_embed=self.dino_view_embed if _fuse else None,
                 mask_drop_prob=_mask_drop,
                 dino_drop_prob=float(getattr(self.config, "dino_drop_prob", 0.0))

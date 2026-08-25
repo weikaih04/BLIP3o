@@ -216,7 +216,8 @@ class UnifiedGeoTexFlow(nn.Module):
                  ss_flow: nn.Module = None,
                  all_trainable: bool = False,
                  cond_seg_embed: bool = False,
-                 cond_patch_pos: str = "off"):     # off | zero | dino_sig
+                 cond_patch_pos: str = "off",      # off | zero | dino_sig
+                 cond_patch_lattice: int = 32):
         """coupling: "union" (DEFAULT — MF-faithful bare single-softmax union,
         dit.py:137-148; user decision 2026-08-11: try MF first, measure) or
         "gated" (in-house mmdit_slat.py:190-196 two-softmax + per-head zero-init
@@ -497,22 +498,30 @@ class UnifiedGeoTexFlow(nn.Module):
         # Starting at the signature buys the head start; being learnable lets
         # training walk away from the borrowed correspondence if it is wrong.
         self.cond_patch_pos = None
-        self.cond_patch_span = None
         if cond_patch_pos != "off":
-            _C = tex_flow.cond_channels
-            from .pos_stamp import DPOS_NPZ, IMG_SPAN_FULL
+            _C, _P = tex_flow.cond_channels, int(cond_patch_lattice)
             if cond_patch_pos == "dino_sig":
+                # The signature is a 32x32 table. If the table resolution is set
+                # to anything else, interpolate it there — the same operation a
+                # ViT does to reuse a position embedding at a new input size, and
+                # the reason the resolution can be chosen freely without giving
+                # up the warm start.
                 import numpy as _np
+                from .pos_stamp import DPOS_NPZ
                 _p = torch.from_numpy(_np.load(DPOS_NPZ)["pos"].astype("float32"))
-                assert _p.shape == (IMG_SPAN_FULL.stop - IMG_SPAN_FULL.start, _C), \
-                    f"dino signature {tuple(_p.shape)} != span x C"
+                _S = int(round(_p.shape[0] ** 0.5))
+                assert _S * _S == _p.shape[0] and _p.shape[1] == _C, \
+                    f"dino signature {tuple(_p.shape)} is not (SxS, {_C})"
+                if _S != _P:
+                    _p = F.interpolate(_p.view(_S, _S, _C).permute(2, 0, 1)[None],
+                                       size=(_P, _P), mode="bilinear",
+                                       align_corners=False)[0].permute(1, 2, 0).reshape(_P * _P, _C)
             elif cond_patch_pos == "zero":
-                _p = torch.zeros(IMG_SPAN_FULL.stop - IMG_SPAN_FULL.start, _C)
+                _p = torch.zeros(_P * _P, _C)
             else:
                 raise ValueError(f"cond_patch_pos={cond_patch_pos!r}")
             # one per stream, same reasoning as the segment code
             self.cond_patch_pos = nn.Parameter(_p[None].repeat(3, 1, 1).clone())
-            self.cond_patch_span = (IMG_SPAN_FULL.start, IMG_SPAN_FULL.stop)
 
     # ── coupling A (DEFAULT): MF-faithful bare union softmax ────────────────
     def _union_attn(self, q_x, k_x, v_x, k_s, v_s, k_c=None, v_c=None,
@@ -1424,7 +1433,7 @@ def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: st
                          cond_mode: str = "cross_attn", coupling: str = "union",
                          bidirectional: bool = True, all_trainable: bool = True,
                          cond_seg_embed: bool = False,
-                         cond_patch_pos: str = "off",
+                         cond_patch_pos: str = "off", cond_patch_lattice: int = 32,
                          weights_file: str = "model.safetensors") -> UnifiedGeoTexFlow:
     """v10: the THREE-tower assembly, warm from the s3_t50 specialists.
 
@@ -1465,7 +1474,8 @@ def assemble_unified_tri(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: st
                              bidirectional=bidirectional, ss_flow=ss,
                              all_trainable=all_trainable,
                              cond_seg_embed=cond_seg_embed,
-                             cond_patch_pos=cond_patch_pos)
+                             cond_patch_pos=cond_patch_pos,
+                             cond_patch_lattice=cond_patch_lattice)
 
 
 def load_tri_connectors(shape_run_ckpt: str, tex_run_ckpt: str, ss_run_ckpt: str,

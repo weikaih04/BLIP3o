@@ -54,9 +54,10 @@ from .live_cond import V22_CKPT, PROMPT_I1, IMG_TOKEN, DINO_SIZE_I1, I1_QWEN_CAN
 # the two arms get the SAME conditioning bandwidth; that is the reason for this number
 # rather than any other. Set GEOTEX_IM_TOK_PER_VIEW=64 to reproduce the cache exactly.
 IM_QWEN_TOK_PER_VIEW = int(os.environ.get("GEOTEX_IM_TOK_PER_VIEW", "256"))
-# The canonical position lattice the per-patch cond code lives on. 32 because the
-# DINO position signature (make_dino_pos.py) is a 32x32 table and warm starts
-# restore it; a view of any other grid size is mapped onto it by scaling.
+# The position table's resolution. 32 because the DINO position signature
+# (make_dino_pos.py) is a 32x32 table and warm starts restore it. The ENCODER
+# does not know this number — it reports normalised coordinates and the consumer
+# samples its own table — so changing it does not change what the data means.
 PATCH_LATTICE = 32
 DINO_SIZE_IM = 320                    # -> 405 tok/view, 1620 for N=4
 IM_N_VIEWS = 4                        # v22_im4r ships one combo size
@@ -385,41 +386,39 @@ class TrainCondEncoder:
             raise RuntimeError("cannot resolve the Qwen image-pad token id")
         return int(tid)
 
-    def _qwen_img_pos(self, ids_row: torch.Tensor, grid: torch.Tensor,
-                      lattice: int = PATCH_LATTICE) -> torch.Tensor:
-        """Per-token index into a canonical `lattice` x `lattice` position table
-        (-1 = text/structural).
+    def _qwen_img_rc(self, ids_row: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        """Per-token NORMALISED position within its own view: (T, 2) float in
+        [0, 1], -1 for text/structural tokens.
 
-        THE MAPPING IS DONE HERE, where the true per-view (h, w) is known, rather
-        than inferred downstream. The consumer then does a pure gather with no
-        assumptions. Inferring the grid from the token count (side = sqrt(n))
-        works only for square views and fails silently otherwise.
+        Coordinates, not table indices, so the position-table resolution is a
+        pure implementation detail of the consumer. Tokens-per-view has already
+        moved once (64 -> 256) and will move again; anything that bakes a grid
+        size — a hardcoded span, a raw ordinal, even a fixed lattice index —
+        silently means something different the day it changes.
 
-        Why a shared lattice rather than the raw ordinal: i1 carries 1024 tokens
-        per view (32x32) and IM carries 256 (16x16). Indexing a table by the raw
-        ordinal would make IM's whole view reuse entries 0..255, which in the
-        DINO signature are the TOP EIGHT ROWS of a 32x32 image — the same code
-        would mean two different physical places. On the lattice, i1 lands 1:1
-        and IM samples every second cell: the same positions, coarser.
+        CELL CENTRES, (i + 0.5) / n, for the same reason the SS keys are re-roped
+        at 2c + 0.5: a token covers an extent, and its position is the middle of
+        that extent, not its low corner. Getting this wrong is a half-cell bias
+        on every token, which no test that only checks ranges would catch.
         """
-        qp = torch.full((ids_row.shape[0],), -1, dtype=torch.long, device=ids_row.device)
+        rc = torch.full((ids_row.shape[0], 2), -1.0, device=ids_row.device)
         pos = (ids_row == self.image_token_id).nonzero(as_tuple=False).flatten()
         if pos.numel() == 0:
-            return qp
+            return rc
         ms = getattr(self.proc.image_processor, "merge_size", 2)
         o = 0
         for g in grid:
-            gh, gw = int(g[1]) // ms, int(g[2]) // ms          # TRUE grid, not sqrt(n)
+            gh, gw = int(g[1]) // ms, int(g[2]) // ms      # TRUE grid from the processor
             c = int(g[0]) * gh * gw
             if c <= 0:
                 continue
             k = torch.arange(c, device=ids_row.device)
-            r, cc = (k % (gh * gw)) // gw, (k % (gh * gw)) % gw
-            rr = (r.float() * (lattice / max(gh, 1))).long().clamp(0, lattice - 1)
-            ccc = (cc.float() * (lattice / max(gw, 1))).long().clamp(0, lattice - 1)
-            qp[pos[o:o + c]] = rr * lattice + ccc
+            r = ((k % (gh * gw)) // gw).float()
+            cc = ((k % (gh * gw)) % gw).float()
+            rc[pos[o:o + c], 0] = (r + 0.5) / max(gh, 1)
+            rc[pos[o:o + c], 1] = (cc + 0.5) / max(gw, 1)
             o += c
-        return qp
+        return rc
 
     def _qwen_view_ids(self, ids_row: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         """Per-token view ordinal over the QWEN segment (-1 = text/structural).
@@ -507,7 +506,7 @@ class TrainCondEncoder:
             # switches on the qwen-side VIEW embedding, so reusing it here would
             # silently change i1's conditioning and break warm-start parity.
             if mod in ("i1", "im"):
-                rec["qwen_img_pos"] = self._qwen_img_pos(ids[i, :n], grids[i])
+                rec["qwen_img_rc"] = self._qwen_img_rc(ids[i, :n], grids[i])
             if dfeat is not None:
                 kv = nviews[i]
                 f = dfeat[o:o + kv]                            # (K, N_d, 1024)

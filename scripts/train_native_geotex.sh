@@ -207,6 +207,7 @@ torchrun --nproc_per_node="$NPROC" ${DIST_FLAGS:-} train_native.py \
   --geotex_ss_init "${SS_INIT:-}" --geotex_ss_loss_w "${SS_LOSS_W:-1.0}" \
   --geotex_cond_seg_embed "${COND_SEG:-False}" \
   --geotex_cond_patch_pos "${PATCH_POS:-off}" \
+  --geotex_cond_patch_lattice "${PATCH_LATTICE:-32}" \
   --geotex_p_solo "${P_SOLO:-0.20}" --geotex_p_lag "${P_LAG:-0.20}" \
   --geotex_k0_lo "${K0_LO:-3}" --geotex_k0_hi "${K0_HI:-11}" \
   --adaptive_grad_clip "${ADAPTIVE_CLIP:-True}" \
