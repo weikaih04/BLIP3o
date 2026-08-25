@@ -1106,6 +1106,11 @@ def compute_unified_geotex_loss(
                                    v_target.feats[rows_x].float())
     # ── SS flow loss. Unconditional call, masked by ROW SELECTION. ──
     ss_loss = None
+    # Snapshot the TEX term before anything else is folded into `loss`. The log
+    # key below is named tex_flow_loss and read as the tex curve; adding the SS
+    # term first made it report tex+ss, which on a batch whose slat rows are all
+    # masked reads as a nonzero tex loss with no tex supervision behind it.
+    tex_only = loss.detach()
     if ss_flow_present:
         ss_loss = _row_balanced_mse(v_ss_pred.float(), v_ss_target.float(), m_ss_sup)
         loss = loss + ss_loss_w * ss_loss
@@ -1115,7 +1120,7 @@ def compute_unified_geotex_loss(
     # set, so a sometimes-missing key hands every curve some other metric's number.
     # t_x_mean/corner2_frac use t_x_sampled — the scheduler's draw — so the schedule
     # stays verifiable; tex_valid_frac carries the data-availability signal separately.
-    logs = {"tex_flow_loss": loss.detach().item(),
+    logs = {"tex_flow_loss": tex_only.item(),
             "t_s_mean": t_s.mean().item(), "t_x_mean": t_x_sampled.mean().item(),
             "corner_frac": (t_s == 0).float().mean().item(),
             "corner2_frac": (t_x_sampled == 1).float().mean().item(),
