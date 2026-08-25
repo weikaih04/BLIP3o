@@ -364,13 +364,52 @@ def compute_cascade_flow_loss(
 # Unified Geo-Tex DiT training path (docs/UNIFIED_GEOTEX_DIT_DESIGN.md, P3)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _add_patch_pos(cond_q, cond_patch_pos, qwen_img_pos):
+    """Per-patch position code for the qwen image tokens, indexed by the token's
+    REAL position in its own view rather than a hardcoded span.
+
+    The first version used pos_stamp's [10, 1034) with a length guard, which
+    silently gave i1 rows a code and multi-image rows none — no crash, no log
+    line, two tasks trained on structurally different conditioning. Same reason
+    _qwen_view_ids refuses the cached 292-token layout: any fixed span is valid
+    at exactly one GEOTEX_IM_TOK_PER_VIEW.
+
+    Lives here rather than inside one branch of build_unified_cond because both
+    branches can carry image tokens — fuse_dino=False takes the plain branch and
+    would otherwise be the same silent skip in a different costume.
+
+    The table is a canonical PxP lattice. A view with n tokens is a
+    sqrt(n) x sqrt(n) grid mapped onto it by scaling, so i1 (32x32) lands 1:1 and
+    IM at 64 tok/view samples every 4th cell — the same physical positions at the
+    resolution that view has.
+    """
+    if cond_patch_pos is None or qwen_img_pos is None:
+        return cond_q
+    P = int(round(float(cond_patch_pos.shape[0]) ** 0.5))
+    assert P * P == cond_patch_pos.shape[0], \
+        f"patch table {cond_patch_pos.shape[0]} is not a square lattice"
+    qp = qwen_img_pos.to(cond_q.device)
+    m = qp >= 0
+    if not bool(m.any()):
+        return cond_q
+    # tokens per view = max ordinal + 1 (every view carries the same count)
+    side = (qp.max(1, keepdim=True).values + 1).clamp_min(1).float().sqrt().round().long().clamp_min(1)
+    o = qp.clamp_min(0)
+    r, c = o // side, o % side
+    sc = P / side.float()
+    idx = ((r.float() * sc).long().clamp(0, P - 1) * P
+           + (c.float() * sc).long().clamp(0, P - 1))
+    add = cond_patch_pos.to(cond_q.dtype)[idx.clamp(0, P * P - 1)]
+    return cond_q + add * m.unsqueeze(-1).to(cond_q.dtype)
+
+
 def build_unified_cond(
     connector,
     cond_hidden: torch.Tensor,
     cond_key_mask: torch.Tensor,
     cond_seg_embed=None,          # (2, C): [image-segment code, text-segment code]
-    cond_patch_pos=None,          # (span, C): per-patch code for the qwen image span
-    cond_patch_span=None,         # (start, stop) of that span in the FULL qwen seq
+    cond_patch_pos=None,          # (P*P, C): per-patch code on a canonical PxP lattice
+    qwen_img_pos=None,            # (B, T) patch ordinal within each view, -1 = not an image token
     *,
     mask_drop_prob: float = 0.0,
     dino_hidden: Optional[torch.Tensor] = None,
@@ -429,16 +468,7 @@ def build_unified_cond(
         dino_seg = dino_hidden.to(cond_q.dtype)
         if dino_view_embed is not None and dino_view_ids is not None:
             dino_seg = dino_seg + dino_view_embed[dino_view_ids].to(cond_q.dtype)
-        if cond_patch_pos is not None and cond_patch_span is not None:
-            # PER-PATCH POSITION for the qwen image tokens. Applied on the FULL
-            # sequence, before any keep-compaction, because the span indices
-            # (pos_stamp.IMG_SPAN_FULL) are defined against the full layout —
-            # the same reason DinoPosStamp carries two spans. A short sequence
-            # (multi-image, odd batches) is left alone rather than mis-indexed.
-            _a, _b = cond_patch_span
-            if cond_q.shape[1] >= _b:
-                cond_q = cond_q.clone()
-                cond_q[:, _a:_b] = cond_q[:, _a:_b] + cond_patch_pos.to(cond_q.dtype)
+        cond_q = _add_patch_pos(cond_q, cond_patch_pos, qwen_img_pos)
         if cond_seg_embed is not None:
             # SEGMENT CODE: "you are an image token" vs "you are a text token".
             # cond is cat([dino ; qwen]) fed to a cross-attn that ropes NOTHING,
@@ -492,6 +522,9 @@ def build_unified_cond(
                              key_mask=cond_key_mask)
         else:
             cond = connector(mask_drop(cond_hidden, mask_drop_prob), key_mask=cond_key_mask)
+        cond = _add_patch_pos(cond, cond_patch_pos, qwen_img_pos)
+        if cond_seg_embed is not None:
+            cond = cond + cond_seg_embed[1].to(cond.dtype)   # text-segment code
         if drops_out is not None:
             _z = torch.zeros(B, dtype=torch.bool, device=cond_hidden.device)
             drops_out.update(drop=drop_mask if drop_mask is not None else _z,
@@ -799,6 +832,7 @@ def compute_unified_geotex_loss(
                                       # optimization).
     # cond extras (same contract as the cascade path)
     dino_hidden=None, dino_key_mask=None, dino_view_ids=None, qwen_view_ids=None,
+    qwen_img_pos=None,
     dino_view_embed=None,
     mask_drop_prob: float = 0.1,
     dino_drop_prob: float = 0.0,
@@ -851,11 +885,10 @@ def compute_unified_geotex_loss(
                    # (recording has no RNG effect)
     _seg = getattr(unified_model, "cond_seg_embed", None)
     _pp = getattr(unified_model, "cond_patch_pos", None)
-    _ps = getattr(unified_model, "cond_patch_span", None)
     cond_x, key_x, _, _ = build_unified_cond(
         connector_tex, cond_hidden, cond_key_mask,
         cond_seg_embed=None if _seg is None else _seg[1],
-        cond_patch_pos=None if _pp is None else _pp[1], cond_patch_span=_ps,
+        cond_patch_pos=None if _pp is None else _pp[1], qwen_img_pos=qwen_img_pos,
         mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
         dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
         qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -888,7 +921,7 @@ def compute_unified_geotex_loss(
             cond_s, key_s, _, _ = build_unified_cond(
                 connector_geo, cond_hidden, cond_key_mask,
                 cond_seg_embed=None if _seg is None else _seg[0],
-                cond_patch_pos=None if _pp is None else _pp[0], cond_patch_span=_ps,
+                cond_patch_pos=None if _pp is None else _pp[0], qwen_img_pos=qwen_img_pos,
                 mask_drop_prob=0.0, dino_hidden=dino_hidden, dino_key_mask=dino_key_mask,
                 dino_drop_prob=0.0, qwen_drop_prob=0.0,
                 dino_view_ids=dino_view_ids, qwen_view_ids=qwen_view_ids,
@@ -912,7 +945,7 @@ def compute_unified_geotex_loss(
         cond_ss, key_ss, sdpa_ss, _ = build_unified_cond(
             connector_ss, cond_hidden, cond_key_mask,
             cond_seg_embed=None if _seg is None else _seg[2],
-            cond_patch_pos=None if _pp is None else _pp[2], cond_patch_span=_ps,
+            cond_patch_pos=None if _pp is None else _pp[2], qwen_img_pos=qwen_img_pos,
             mask_drop_prob=mask_drop_prob, dino_hidden=dino_hidden,
             dino_key_mask=dino_key_mask, dino_drop_prob=dino_drop_prob,
             qwen_drop_prob=qwen_drop_prob, dino_view_ids=dino_view_ids,
@@ -1126,6 +1159,11 @@ def compute_unified_geotex_loss(
         _pd = _pp.detach().float()
         for _i, _nm in enumerate(("geo", "tex", "ss")):
             logs[f"patchpos_{_nm}"] = float(_pd[_i].norm(dim=-1).mean()) / max(_dn2, 1e-6)
+        # COVERAGE, because the first version skipped multi-image rows in silence.
+        # This is the number that would have shown it: the fraction of rows whose
+        # qwen segment actually received a patch code.
+        logs["patchpos_cov"] = (0.0 if qwen_img_pos is None
+                                else float((qwen_img_pos >= 0).any(1).float().mean()))
 
     # ── S2b term 1: geo's OWN velocity loss ─────────────────────────────────
     # Without it, geo's only gradient is whatever leaks back through the tex

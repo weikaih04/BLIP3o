@@ -299,6 +299,15 @@ def _pack_live_conds(conds, dev):
             v = c["qwen_view_ids"]
             qv[i, :v.shape[0]] = v.cpu()
         out["qwen_view_ids"] = qv.to(dev)
+    if "qwen_img_pos" in conds[0]:
+        # Same -1 padding as qwen_view_ids: 0 is a REAL patch ordinal, so padding
+        # with it would tell the model every pad token is the top-left patch.
+        Tq = out["cond_hidden"].shape[1]
+        qp = torch.full((len(conds), Tq), -1, dtype=torch.long)
+        for i, c in enumerate(conds):
+            v = c["qwen_img_pos"]
+            qp[i, :v.shape[0]] = v.cpu()
+        out["qwen_img_pos"] = qp.to(dev)
     return out
 
 

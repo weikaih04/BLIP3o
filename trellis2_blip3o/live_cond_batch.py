@@ -381,6 +381,27 @@ class TrainCondEncoder:
             raise RuntimeError("cannot resolve the Qwen image-pad token id")
         return int(tid)
 
+    def _qwen_img_pos(self, ids_row: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        """Per-token patch ordinal within its own view (-1 = text/structural).
+
+        Derived from the real image_pad positions and each image's grid, for the
+        same reason _qwen_view_ids is: any hardcoded span is only valid at one
+        tokens-per-view setting and breaks the moment GEOTEX_IM_TOK_PER_VIEW
+        moves. i1 gives 0..1023 over one view; IM at 64 tok/view gives 0..63 per
+        view, four times.
+        """
+        qp = torch.full((ids_row.shape[0],), -1, dtype=torch.long, device=ids_row.device)
+        pos = (ids_row == self.image_token_id).nonzero(as_tuple=False).flatten()
+        if pos.numel() == 0:
+            return qp
+        ms = getattr(self.proc.image_processor, "merge_size", 2)
+        o = 0
+        for g in grid:
+            c = int(g[0] * g[1] * g[2]) // (ms * ms)
+            qp[pos[o:o + c]] = torch.arange(c, device=ids_row.device)
+            o += c
+        return qp
+
     def _qwen_view_ids(self, ids_row: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         """Per-token view ordinal over the QWEN segment (-1 = text/structural).
 
@@ -461,6 +482,13 @@ class TrainCondEncoder:
                                             "cond_keep_mask": k}
             if mod == "im":
                 rec["qwen_view_ids"] = self._qwen_view_ids(ids[i, :n], grids[i])
+            # Per-token patch index WITHIN its own view, -1 for text/structural.
+            # Emitted for every image mode, not just IM, and kept SEPARATE from
+            # qwen_view_ids on purpose: the presence of qwen_view_ids is what
+            # switches on the qwen-side VIEW embedding, so reusing it here would
+            # silently change i1's conditioning and break warm-start parity.
+            if mod in ("i1", "im"):
+                rec["qwen_img_pos"] = self._qwen_img_pos(ids[i, :n], grids[i])
             if dfeat is not None:
                 kv = nviews[i]
                 f = dfeat[o:o + kv]                            # (K, N_d, 1024)
